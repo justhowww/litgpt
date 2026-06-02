@@ -1,0 +1,24 @@
+{
+  "width": 640,
+  "height": 352,
+  "resize_mode": "none",
+  "fps": null,
+  "qp": 28,
+  "gop": 16,
+  "preset": "medium",
+  "video_extensions": [".mp4", ".mov", ".mkv", ".webm", ".avi"],
+  "ffmpeg": {
+    "binary": "ffmpeg",
+    "ffprobe_binary": "ffprobe",
+    "codec": "libx264",
+    "format": "h264",
+    "profile": "baseline",
+    "disable_audio": true,
+    "disable_bframes": true,
+    "refs": 1,
+    "scene_cut_threshold": 0,
+    "x264_params": {
+      "cabac": 0
+    }
+  }
+}
