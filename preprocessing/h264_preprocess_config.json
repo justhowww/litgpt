@@ -3,7 +3,10 @@
   "height": 352,
   "resize_mode": "none",
   "fps": null,
+  "rate_control": "qp",
+  "rate_control_comment": "qp is controlled for first byte-domain experiments, but real streaming encoders usually use bitrate/CRF-like rate control.",
   "qp": 28,
+  "crf": null,
   "gop": 16,
   "preset": "medium",
   "video_extensions": [".mp4", ".mov", ".mkv", ".webm", ".avi"],
@@ -13,12 +16,21 @@
     "codec": "libx264",
     "format": "h264",
     "profile": "baseline",
+    "level": null,
+    "level_comment": "null lets x264 infer level; fixed levels can be invalid when preserving source resolution/fps.",
+    "pix_fmt": "yuv420p",
     "disable_audio": true,
     "disable_bframes": true,
     "refs": 1,
     "scene_cut_threshold": 0,
+    "threads": 1,
+    "timeout_sec": 300,
     "x264_params": {
-      "cabac": 0
+      "cabac": 0,
+      "slices": 1,
+      "sliced-threads": 0,
+      "repeat-headers": 1,
+      "aud": 0
     }
   }
 }

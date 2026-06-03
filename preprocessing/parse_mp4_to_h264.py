@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -34,10 +35,14 @@ class FFmpegConfig:
     codec: str
     output_format: str
     profile: str
+    level: str | None
+    pix_fmt: str | None
     disable_audio: bool
     disable_bframes: bool
     refs: int
     scene_cut_threshold: int
+    threads: int | None
+    timeout_sec: int | None
     x264_params: dict[str, int | str]
 
 
@@ -47,7 +52,9 @@ class PreprocessConfig:
     height: int
     resize_mode: str
     fps: int | None
+    rate_control: str
     qp: int
+    crf: int | None
     gop: int
     preset: str
     video_extensions: tuple[str, ...]
@@ -80,10 +87,14 @@ def load_config(path: Path) -> PreprocessConfig:
         codec=ffmpeg_raw.get("codec", "libx264"),
         output_format=ffmpeg_raw.get("format", "h264"),
         profile=ffmpeg_raw.get("profile", "baseline"),
+        level=ffmpeg_raw.get("level"),
+        pix_fmt=ffmpeg_raw.get("pix_fmt"),
         disable_audio=ffmpeg_raw.get("disable_audio", True),
         disable_bframes=ffmpeg_raw.get("disable_bframes", True),
         refs=ffmpeg_raw.get("refs", 1),
         scene_cut_threshold=ffmpeg_raw.get("scene_cut_threshold", 0),
+        threads=ffmpeg_raw.get("threads"),
+        timeout_sec=ffmpeg_raw.get("timeout_sec"),
         x264_params=ffmpeg_raw.get("x264_params", {}),
     )
 
@@ -92,7 +103,9 @@ def load_config(path: Path) -> PreprocessConfig:
         height=raw["height"],
         resize_mode=raw.get("resize_mode", "crop_resize"),
         fps=raw["fps"],
+        rate_control=raw.get("rate_control", "qp"),
         qp=raw["qp"],
+        crf=raw.get("crf"),
         gop=raw["gop"],
         preset=raw["preset"],
         video_extensions=tuple(ext.lower() for ext in raw["video_extensions"]),
@@ -106,7 +119,9 @@ def override_config(config: PreprocessConfig, args: argparse.Namespace) -> Prepr
         "height": args.height if args.height is not None else config.height,
         "resize_mode": args.resize_mode if args.resize_mode is not None else config.resize_mode,
         "fps": args.fps if args.fps is not None else config.fps,
+        "rate_control": config.rate_control,
         "qp": args.qp if args.qp is not None else config.qp,
+        "crf": config.crf,
         "gop": args.gop if args.gop is not None else config.gop,
         "preset": args.preset if args.preset is not None else config.preset,
     }
@@ -124,14 +139,16 @@ def override_config(config: PreprocessConfig, args: argparse.Namespace) -> Prepr
 
 def discover_videos(input_dir: Path, extensions: tuple[str, ...]) -> Iterable[Path]:
     extension_set = set(extensions)
-    for root, _, files in os.walk(input_dir):
-        for name in sorted(files):
+    for root, dirs, files in os.walk(input_dir):
+        dirs.sort()
+        files.sort()
+        for name in files:
             path = Path(root) / name
             if path.suffix.lower() in extension_set:
                 yield path
 
 
-def probe_video(path: Path, ffprobe_binary: str) -> VideoProbe:
+def probe_video(path: Path, ffprobe_binary: str, timeout_sec: int | None = None) -> VideoProbe:
     cmd = [
         ffprobe_binary,
         "-v",
@@ -144,7 +161,7 @@ def probe_video(path: Path, ffprobe_binary: str) -> VideoProbe:
         "json",
         str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"ffprobe failed for {path}")
 
@@ -217,8 +234,26 @@ def build_encode_command(input_path: Path, output_path: Path, config: Preprocess
         ]
     )
 
+    if config.ffmpeg.level is not None:
+        cmd.extend(["-level:v", config.ffmpeg.level])
+
+    if config.ffmpeg.pix_fmt is not None:
+        cmd.extend(["-pix_fmt", config.ffmpeg.pix_fmt])
+
     if config.ffmpeg.disable_bframes:
         cmd.extend(["-bf", "0"])
+
+    if config.ffmpeg.threads is not None:
+        cmd.extend(["-threads", str(config.ffmpeg.threads)])
+
+    if config.rate_control == "qp":
+        rate_control_args = ["-x264-params", build_x264_params(config, include_qp=True)]
+    elif config.rate_control == "crf":
+        if config.crf is None:
+            raise ValueError("rate_control='crf' requires config.crf")
+        rate_control_args = ["-crf", str(config.crf), "-x264-params", build_x264_params(config, include_qp=False)]
+    else:
+        raise ValueError(f"unsupported rate_control: {config.rate_control}")
 
     cmd.extend(
         [
@@ -230,8 +265,7 @@ def build_encode_command(input_path: Path, output_path: Path, config: Preprocess
             str(config.gop),
             "-sc_threshold",
             str(config.ffmpeg.scene_cut_threshold),
-            "-x264-params",
-            build_x264_params(config),
+            *rate_control_args,
             "-preset",
             config.preset,
             "-f",
@@ -249,13 +283,30 @@ def build_encode_command(input_path: Path, output_path: Path, config: Preprocess
 
 def encode_video(input_path: Path, output_path: Path, config: PreprocessConfig) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        build_encode_command(input_path, output_path, config),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"ffmpeg failed for {input_path}")
+    with tempfile.NamedTemporaryFile(
+        dir=output_path.parent,
+        prefix=f".{output_path.stem}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        result = subprocess.run(
+            build_encode_command(input_path, tmp_path, config),
+            capture_output=True,
+            text=True,
+            timeout=config.ffmpeg.timeout_sec,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"ffmpeg failed for {input_path}")
+        if tmp_path.stat().st_size <= 0:
+            raise RuntimeError(f"ffmpeg produced empty output for {input_path}")
+        os.replace(tmp_path, output_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -283,13 +334,21 @@ def output_settings_to_manifest(config: PreprocessConfig) -> dict[str, Any]:
         "resize_mode": config.resize_mode,
         "fps": config.fps,
         "codec": "h264_baseline_cavlc",
+        "rate_control": config.rate_control,
         "qp": config.qp,
+        "crf": config.crf,
         "gop": config.gop,
         "preset": config.preset,
         "ffmpeg_codec": config.ffmpeg.codec,
         "profile": config.ffmpeg.profile,
+        "level": config.ffmpeg.level,
+        "pix_fmt": config.ffmpeg.pix_fmt,
         "refs": config.ffmpeg.refs,
-        "x264_params": {**config.ffmpeg.x264_params, "qp": config.qp},
+        "threads": config.ffmpeg.threads,
+        "x264_params": {
+            **config.ffmpeg.x264_params,
+            **({"qp": config.qp} if config.rate_control == "qp" else {}),
+        },
     }
 
 
@@ -300,6 +359,7 @@ def build_manifest_row(
     config: PreprocessConfig,
     status: str,
     source_probe: VideoProbe | None,
+    output_probe: VideoProbe | None,
     error: str | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
@@ -307,7 +367,8 @@ def build_manifest_row(
         "src_path": str(input_path),
         "h264_path": str(output_path),
         "source": probe_to_manifest(source_probe),
-        "output": output_settings_to_manifest(config),
+        "output_settings": output_settings_to_manifest(config),
+        "output_probe": probe_to_manifest(output_probe),
         "num_bytes": output_path.stat().st_size if output_path.exists() else 0,
         "status": status,
     }
@@ -331,6 +392,8 @@ def preprocess_videos(
 ) -> None:
     h264_dir = output_dir / "h264"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_corpus_metadata(output_dir / "corpus.json", config)
 
     count = 0
     with manifest_path.open("w", encoding="utf-8") as manifest:
@@ -342,11 +405,16 @@ def preprocess_videos(
             output_path = h264_dir / relative
             count += 1
             source_probe: VideoProbe | None = None
+            output_probe: VideoProbe | None = None
 
             try:
-                source_probe = probe_video(input_path, config.ffmpeg.ffprobe_binary)
-                if not (skip_existing and output_path.exists()):
+                source_probe = probe_video(input_path, config.ffmpeg.ffprobe_binary, config.ffmpeg.timeout_sec)
+                if skip_existing and output_path.exists():
+                    if output_path.stat().st_size <= 0:
+                        raise RuntimeError(f"existing output is empty: {output_path}")
+                else:
                     encode_video(input_path, output_path, config)
+                output_probe = probe_video(output_path, config.ffmpeg.ffprobe_binary, config.ffmpeg.timeout_sec)
                 row = build_manifest_row(
                     input_path,
                     output_path,
@@ -354,6 +422,7 @@ def preprocess_videos(
                     config,
                     status="ok",
                     source_probe=source_probe,
+                    output_probe=output_probe,
                 )
             except Exception as exc:
                 row = build_manifest_row(
@@ -363,6 +432,7 @@ def preprocess_videos(
                     config,
                     status="failed",
                     source_probe=source_probe,
+                    output_probe=output_probe,
                     error=str(exc),
                 )
 
@@ -394,10 +464,61 @@ def parse_optional_int(value: str | None) -> int | None:
     return int(value)
 
 
-def build_x264_params(config: PreprocessConfig) -> str:
+def build_x264_params(config: PreprocessConfig, include_qp: bool) -> str:
     params = dict(config.ffmpeg.x264_params)
-    params["qp"] = config.qp
+    if include_qp:
+        params["qp"] = config.qp
     return ":".join(f"{key}={value}" for key, value in params.items())
+
+
+def command_first_line(cmd: list[str], timeout_sec: int | None) -> str | None:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.splitlines()[0] if result.stdout else None
+
+
+def write_corpus_metadata(path: Path, config: PreprocessConfig) -> None:
+    payload = {
+        "config": {
+            "width": config.width,
+            "height": config.height,
+            "resize_mode": config.resize_mode,
+            "fps": config.fps,
+            "rate_control": config.rate_control,
+            "qp": config.qp,
+            "crf": config.crf,
+            "gop": config.gop,
+            "preset": config.preset,
+            "video_extensions": list(config.video_extensions),
+            "ffmpeg": {
+                "binary": config.ffmpeg.binary,
+                "ffprobe_binary": config.ffmpeg.ffprobe_binary,
+                "codec": config.ffmpeg.codec,
+                "format": config.ffmpeg.output_format,
+                "profile": config.ffmpeg.profile,
+                "level": config.ffmpeg.level,
+                "pix_fmt": config.ffmpeg.pix_fmt,
+                "disable_audio": config.ffmpeg.disable_audio,
+                "disable_bframes": config.ffmpeg.disable_bframes,
+                "refs": config.ffmpeg.refs,
+                "scene_cut_threshold": config.ffmpeg.scene_cut_threshold,
+                "threads": config.ffmpeg.threads,
+                "timeout_sec": config.ffmpeg.timeout_sec,
+                "x264_params": config.ffmpeg.x264_params,
+            },
+        },
+        "tool_versions": {
+            "ffmpeg": command_first_line([config.ffmpeg.binary, "-version"], config.ffmpeg.timeout_sec),
+            "ffprobe": command_first_line([config.ffmpeg.ffprobe_binary, "-version"], config.ffmpeg.timeout_sec),
+        },
+    }
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
 
 
 # -----------------------------------------------------------------------------
