@@ -96,16 +96,26 @@ class SliceSample:
 
 def load_manifest_rows(manifest_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    manifest_dir = manifest_path.parent
     with manifest_path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             row = json.loads(line)
             if row.get("status") == "ok" and row.get("h264_path"):
+                row = dict(row)
+                row["h264_path"] = str(resolve_manifest_path(row["h264_path"], manifest_dir))
                 rows.append(row)
     if not rows:
         raise ValueError(f"No usable rows found in manifest: {manifest_path}")
     return rows
+
+
+def resolve_manifest_path(path: str | Path, manifest_dir: Path) -> Path:
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return manifest_dir / path
 
 
 def parse_annexb_nals(data: bytes) -> list[NALUnit]:

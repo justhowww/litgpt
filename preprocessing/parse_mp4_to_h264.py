@@ -370,6 +370,7 @@ def build_manifest_row(
     input_path: Path,
     output_path: Path,
     input_dir: Path,
+    manifest_dir: Path,
     config: PreprocessConfig,
     status: str,
     source_probe: VideoProbe | None,
@@ -379,7 +380,7 @@ def build_manifest_row(
     row: dict[str, Any] = {
         "id": str(input_path.relative_to(input_dir).with_suffix("")),
         "src_path": str(input_path),
-        "h264_path": str(output_path),
+        "h264_path": path_for_manifest(output_path, manifest_dir),
         "source": probe_to_manifest(source_probe),
         "output_settings": output_settings_to_manifest(config),
         "output_probe": probe_to_manifest(output_probe),
@@ -429,7 +430,13 @@ def preprocess_videos(
                         raise RuntimeError(f"existing output is empty: {output_path}")
                     previous_row = previous_rows.get(str(output_path))
                     if previous_row is not None:
-                        row = update_reused_manifest_row(previous_row, input_path, output_path, status="skipped")
+                        row = update_reused_manifest_row(
+                            previous_row,
+                            input_path,
+                            output_path,
+                            manifest_path.parent,
+                            status="skipped",
+                        )
                         manifest.write(json.dumps(row) + "\n")
                         manifest.flush()
                         print(f"[{row['status']}] {input_path} -> {output_path}")
@@ -439,6 +446,7 @@ def preprocess_videos(
                             input_path,
                             output_path,
                             input_dir,
+                            manifest_path.parent,
                             config,
                             status="skipped",
                             source_probe=None,
@@ -469,6 +477,7 @@ def preprocess_videos(
                     input_path,
                     output_path,
                     input_dir,
+                    manifest_path.parent,
                     config,
                     status="ok",
                     source_probe=source_probe,
@@ -479,6 +488,7 @@ def preprocess_videos(
                     input_path,
                     output_path,
                     input_dir,
+                    manifest_path.parent,
                     config,
                     status="failed",
                     source_probe=source_probe,
@@ -526,6 +536,7 @@ def load_manifest_by_h264_path(manifest_path: Path) -> dict[str, dict[str, Any]]
         return {}
 
     rows: dict[str, dict[str, Any]] = {}
+    manifest_dir = manifest_path.parent
     with manifest_path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -536,18 +547,32 @@ def load_manifest_by_h264_path(manifest_path: Path) -> dict[str, dict[str, Any]]
                 continue
             h264_path = row.get("h264_path")
             if h264_path:
-                rows[h264_path] = row
+                rows[str(resolve_manifest_path(h264_path, manifest_dir))] = row
     return rows
 
 
-def update_reused_manifest_row(row: dict[str, Any], input_path: Path, output_path: Path, status: str) -> dict[str, Any]:
+def update_reused_manifest_row(row: dict[str, Any], input_path: Path, output_path: Path, manifest_dir: Path, status: str) -> dict[str, Any]:
     reused = dict(row)
     reused["src_path"] = str(input_path)
-    reused["h264_path"] = str(output_path)
+    reused["h264_path"] = path_for_manifest(output_path, manifest_dir)
     reused["num_bytes"] = output_path.stat().st_size
     reused["status"] = status
     reused.pop("error", None)
     return reused
+
+
+def resolve_manifest_path(path: str | Path, manifest_dir: Path) -> Path:
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return manifest_dir / path
+
+
+def path_for_manifest(path: Path, manifest_dir: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(manifest_dir.resolve()))
+    except ValueError:
+        return str(path)
 
 
 def command_first_line(cmd: list[str], timeout_sec: int | None) -> str | None:
