@@ -409,6 +409,7 @@ def preprocess_videos(
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_corpus_metadata(output_dir / "corpus.json", config)
+    previous_rows = load_manifest_by_h264_path(manifest_path)
 
     count = 0
     with manifest_path.open("w", encoding="utf-8") as manifest:
@@ -426,6 +427,13 @@ def preprocess_videos(
                 if skip_existing and output_path.exists():
                     if output_path.stat().st_size <= 0:
                         raise RuntimeError(f"existing output is empty: {output_path}")
+                    previous_row = previous_rows.get(str(output_path))
+                    if previous_row is not None:
+                        row = update_reused_manifest_row(previous_row, input_path, output_path, status="skipped")
+                        manifest.write(json.dumps(row) + "\n")
+                        manifest.flush()
+                        print(f"[{row['status']}] {input_path} -> {output_path}")
+                        continue
                     if fast_skip_existing:
                         row = build_manifest_row(
                             input_path,
@@ -511,6 +519,35 @@ def build_x264_params(config: PreprocessConfig, include_qp: bool) -> str:
     if include_qp:
         params["qp"] = config.qp
     return ":".join(f"{key}={value}" for key, value in params.items())
+
+
+def load_manifest_by_h264_path(manifest_path: Path) -> dict[str, dict[str, Any]]:
+    if not manifest_path.exists():
+        return {}
+
+    rows: dict[str, dict[str, Any]] = {}
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            h264_path = row.get("h264_path")
+            if h264_path:
+                rows[h264_path] = row
+    return rows
+
+
+def update_reused_manifest_row(row: dict[str, Any], input_path: Path, output_path: Path, status: str) -> dict[str, Any]:
+    reused = dict(row)
+    reused["src_path"] = str(input_path)
+    reused["h264_path"] = str(output_path)
+    reused["num_bytes"] = output_path.stat().st_size
+    reused["status"] = status
+    reused.pop("error", None)
+    return reused
 
 
 def command_first_line(cmd: list[str], timeout_sec: int | None) -> str | None:
