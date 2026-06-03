@@ -12,6 +12,7 @@ from litgpt.data.byte_data import (
     REGION_PREFIX,
     REGION_REF,
     REGION_TARGET,
+    SLICE_BOS_ID,
     SPAN_BOS_ID,
     ByteDataConfig,
     ByteDataModule,
@@ -53,6 +54,7 @@ def make_dataset(tmp_path, **kwargs) -> ByteSliceDataset:
 
 
 def test_parse_annexb_nals():
+    """Parses Annex-B start codes and preserves exact NAL byte ranges."""
     stream, parts = synthetic_stream()
     nals = parse_annexb_nals(stream)
 
@@ -62,6 +64,7 @@ def test_parse_annexb_nals():
 
 
 def test_ar_sample_layout_includes_metadata_and_reference(tmp_path):
+    """Builds AR samples as [B_meta, B_ref, SLICE_BOS, B_t[:-1]] -> B_t."""
     ds = make_dataset(tmp_path, p_fim=0.0, num_ref_slices=1)
     sample = ds[0]
     labels = sample["labels"]
@@ -72,7 +75,8 @@ def test_ar_sample_layout_includes_metadata_and_reference(tmp_path):
     assert input_ids.shape == labels.shape == region_ids.shape
     assert int(supervised.sum()) > 0
     assert input_ids[supervised.nonzero()[0].item() - 1].item() != SPAN_BOS_ID
-    assert labels[supervised].tolist() == input_ids[supervised].tolist()
+    assert input_ids[supervised][0].item() == SLICE_BOS_ID
+    assert input_ids[supervised][1:].tolist() == labels[supervised][:-1].tolist()
     assert REGION_META in region_ids.tolist()
     assert REGION_REF in region_ids.tolist()
     assert REGION_TARGET in region_ids.tolist()
@@ -82,6 +86,7 @@ def test_ar_sample_layout_includes_metadata_and_reference(tmp_path):
 
 
 def test_metadata_can_be_disabled(tmp_path):
+    """Allows ablations where SPS/PPS metadata is not fed as conditioning."""
     ds = make_dataset(tmp_path, p_fim=0.0, include_parameter_sets=False)
     sample = ds[0]
 
@@ -90,6 +95,7 @@ def test_metadata_can_be_disabled(tmp_path):
 
 
 def test_fim_sample_supervises_only_missing_span(tmp_path):
+    """Builds FIM samples that place loss only on the generated missing span."""
     ds = make_dataset(
         tmp_path,
         p_fim=1.0,
@@ -112,6 +118,7 @@ def test_fim_sample_supervises_only_missing_span(tmp_path):
 
 
 def test_reference_slices_are_dropped_whole_when_context_is_tight(tmp_path):
+    """Drops oversized reference slices as whole units instead of truncating them."""
     ds = make_dataset(tmp_path, p_fim=0.0, num_ref_slices=1, max_seq_length=64)
     sample = ds[0]
 
@@ -121,6 +128,7 @@ def test_reference_slices_are_dropped_whole_when_context_is_tight(tmp_path):
 
 
 def test_collate_pads_with_byte_constants(tmp_path):
+    """Pads batched tensors with byte-data constants understood by the model/loss."""
     ds = make_dataset(tmp_path, p_fim=0.0, num_ref_slices=1)
     sample_a = ds[0]
     sample_b = {
@@ -140,6 +148,7 @@ def test_collate_pads_with_byte_constants(tmp_path):
 
 
 def test_byte_data_module_smoke(tmp_path):
+    """Checks the LitGPT DataModule wrapper can produce a train batch."""
     stream, _ = synthetic_stream()
     manifest_path, _ = write_manifest(tmp_path, stream)
     config = ByteDataConfig(num_workers=0, val_fraction=0.5)
