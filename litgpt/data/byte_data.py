@@ -115,7 +115,21 @@ def resolve_manifest_path(path: str | Path, manifest_dir: Path) -> Path:
     path = Path(path)
     if path.is_absolute():
         return path
-    return manifest_dir / path
+
+    direct = manifest_dir / path
+    if direct.exists() or path.parts[:1] == ("h264",):
+        return direct
+
+    # Backward compatibility for manifests produced from a relative output_dir,
+    # e.g. "../corpus/h264/h264/part/clip.h264". The corpus invariant is that
+    # manifest.jsonl and the h264/ directory live at the same level, so recover
+    # the path suffix rooted at the last h264 component.
+    h264_positions = [i for i, part in enumerate(path.parts) if part == "h264"]
+    if h264_positions:
+        h264_suffix = Path(*path.parts[h264_positions[-1] :])
+        return manifest_dir / h264_suffix
+
+    return manifest_dir / "h264" / path
 
 
 def parse_annexb_nals(data: bytes) -> list[NALUnit]:

@@ -151,6 +151,25 @@ def test_relative_h264_paths_resolve_from_manifest_dir(tmp_path):
     )  # Resolved path can be opened and indexed by the dataset.
 
 
+def test_old_cwd_relative_h264_paths_use_manifest_h264_sibling(tmp_path):
+    """Supports old manifests written with cwd-relative output paths."""
+    stream, _ = synthetic_stream()
+    manifest_path, h264_path = write_manifest(tmp_path, stream)
+    stale_path = "../SHELL.metzler-prj/OpenVid-1M/h264/h264/clip.h264"
+    manifest_path.write_text(
+        json.dumps({"status": "ok", "h264_path": stale_path}) + "\n"
+    )
+
+    rows = load_manifest_rows(manifest_path)
+
+    assert (
+        rows[0]["h264_path"] == str(h264_path)
+    )  # Old cwd-relative path is recovered using manifest_dir/h264.
+    assert ByteSliceDataset(
+        rows, max_seq_length=256
+    )  # Recovered old-manifest path can be opened and indexed.
+
+
 def test_fim_sample_supervises_only_missing_span(tmp_path):
     """Builds FIM samples that place loss only on the generated missing span."""
     ds = make_dataset(
