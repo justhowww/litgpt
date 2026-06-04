@@ -413,7 +413,7 @@ def preprocess_videos(
     previous_rows = load_manifest_by_h264_path(manifest_path)
 
     count = 0
-    with manifest_path.open("w", encoding="utf-8") as manifest:
+    with manifest_path.open("a", encoding="utf-8") as manifest:
         for input_path in discover_videos(input_dir, config.video_extensions):
             if limit is not None and count >= limit:
                 break
@@ -430,6 +430,9 @@ def preprocess_videos(
                         raise RuntimeError(f"existing output is empty: {output_path}")
                     previous_row = previous_rows.get(str(output_path))
                     if previous_row is not None:
+                        if previous_row.get("status") in {"ok", "skipped"}:
+                            print(f"[skipped] {input_path} -> {output_path}")
+                            continue
                         row = update_reused_manifest_row(
                             previous_row,
                             input_path,
@@ -437,8 +440,7 @@ def preprocess_videos(
                             manifest_path.parent,
                             status="skipped",
                         )
-                        manifest.write(json.dumps(row) + "\n")
-                        manifest.flush()
+                        write_manifest_row(manifest, row)
                         print(f"[{row['status']}] {input_path} -> {output_path}")
                         continue
                     if fast_skip_existing:
@@ -452,8 +454,7 @@ def preprocess_videos(
                             source_probe=None,
                             output_probe=None,
                         )
-                        manifest.write(json.dumps(row) + "\n")
-                        manifest.flush()
+                        write_manifest_row(manifest, row)
                         print(f"[{row['status']}] {input_path} -> {output_path}")
                         continue
                     source_probe = probe_video(
@@ -496,8 +497,7 @@ def preprocess_videos(
                     error=str(exc),
                 )
 
-            manifest.write(json.dumps(row) + "\n")
-            manifest.flush()
+            write_manifest_row(manifest, row)
             print(f"[{row['status']}] {input_path} -> {output_path}")
 
 
@@ -529,6 +529,12 @@ def build_x264_params(config: PreprocessConfig, include_qp: bool) -> str:
     if include_qp:
         params["qp"] = config.qp
     return ":".join(f"{key}={value}" for key, value in params.items())
+
+
+def write_manifest_row(manifest, row: dict[str, Any]) -> None:
+    manifest.write(json.dumps(row) + "\n")
+    manifest.flush()
+    os.fsync(manifest.fileno())
 
 
 def load_manifest_by_h264_path(manifest_path: Path) -> dict[str, dict[str, Any]]:
