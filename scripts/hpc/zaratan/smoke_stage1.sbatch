@@ -17,7 +17,8 @@ source "${SCRIPT_DIR}/env.sh"
 : "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
 
 OUT_DIR=${OUT_DIR:-"${PROJECT_SCRATCH}/runs/byte-stage1-smoke"}
-BLOCK_SIZE=${BLOCK_SIZE:-8192}
+# Preliminary scan: 16K kept full context for 93.42% of samples with no target exclusion.
+BLOCK_SIZE=${BLOCK_SIZE:-16384}
 STEPS=${STEPS:-10}
 NUM_WORKERS=${NUM_WORKERS:-4}
 
@@ -40,4 +41,3 @@ srun python scripts/train_byte_stage1.py \
     --eval-interval 5 \
     --eval-iters 2 \
     --save-interval 5
-

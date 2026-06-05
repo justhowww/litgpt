@@ -19,7 +19,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--out-dir", type=Path, default=Path("out/byte-stage1"))
-    parser.add_argument("--block-size", type=int, default=8192)
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=16384,
+        help=(
+            "Model context length. The preliminary 5,940-sample scan retained "
+            "full metadata+reference+target context for 93.42%% of samples and "
+            "excluded 0%% of targets at 16K."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--num-nodes", type=int, default=1)

@@ -19,7 +19,7 @@ sbatch --account=metzler-prj \
 ```bash
 MANIFEST=/scratch/zt1/project/metzler-prj/user/$USER/data/OpenVid-1M/manifest.jsonl \
 OUT_DIR=/scratch/zt1/project/metzler-prj/user/$USER/runs/byte-stage1 \
-BLOCK_SIZE=8192 \
+BLOCK_SIZE=16384 \
 STEPS=10000 \
 sbatch --account=metzler-prj \
   scripts/hpc/zaratan/train_stage1.sbatch
