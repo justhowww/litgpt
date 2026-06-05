@@ -94,7 +94,9 @@ class SliceSample:
     nal_type: int
 
 
-def load_manifest_rows(manifest_path: Path) -> list[dict[str, Any]]:
+def load_manifest_rows(
+    manifest_path: Path, max_rows: int | None = None
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     manifest_dir = manifest_path.parent
     with manifest_path.open("r", encoding="utf-8") as f:
@@ -106,6 +108,8 @@ def load_manifest_rows(manifest_path: Path) -> list[dict[str, Any]]:
                 row = dict(row)
                 row["h264_path"] = str(resolve_manifest_path(row["h264_path"], manifest_dir))
                 rows.append(row)
+                if max_rows is not None and len(rows) >= max_rows:
+                    break
     if not rows:
         raise ValueError(f"No usable rows found in manifest: {manifest_path}")
     return rows
@@ -502,6 +506,7 @@ class ByteDataModule(DataModule):
 
     manifest_path: Path
     config: ByteDataConfig = field(default_factory=ByteDataConfig)
+    max_manifest_rows: int | None = None  # Optional corpus limit for smoke/debug runs.
 
     batch_size: int = field(default=1, init=False, repr=False)
     max_seq_length: int = field(
@@ -531,7 +536,7 @@ class ByteDataModule(DataModule):
         )
 
     def setup(self, stage: str = "") -> None:
-        rows = load_manifest_rows(self.manifest_path)
+        rows = load_manifest_rows(self.manifest_path, max_rows=self.max_manifest_rows)
         dataset = ByteSliceDataset(
             rows,
             max_seq_length=self.max_seq_length,

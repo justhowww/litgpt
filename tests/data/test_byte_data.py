@@ -155,6 +155,18 @@ def test_relative_h264_paths_resolve_from_manifest_dir(tmp_path):
     )  # Resolved path can be opened and indexed by the dataset.
 
 
+def test_manifest_row_limit_stops_debug_corpus_loading(tmp_path):
+    """Limits corpus indexing for fast smoke/debug runs."""
+    stream, _ = synthetic_stream()
+    manifest_path, h264_path = write_manifest(tmp_path, stream)
+    row = json.dumps({"status": "ok", "h264_path": str(h264_path)})
+    manifest_path.write_text("\n".join([row, row, row]) + "\n")
+
+    rows = load_manifest_rows(manifest_path, max_rows=2)
+
+    assert len(rows) == 2  # Loader stops after the requested number of usable rows.
+
+
 def test_old_cwd_relative_h264_paths_use_manifest_h264_sibling(tmp_path):
     """Supports old manifests written with cwd-relative output paths."""
     stream, _ = synthetic_stream()

@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fim-min-gap", type=int, default=64)
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--no-sps-pps-metadata", action="store_true")
+    parser.add_argument(
+        "--max-manifest-rows",
+        type=int,
+        default=100,
+        help="Maximum usable manifest rows to index; set to 0 for the full corpus.",
+    )
     parser.add_argument("--block-size-candidates", type=int, nargs="+", default=[4096, 8192, 16384, 32768])
     parser.add_argument("--block-size-samples", type=int, default=20000)
     return parser.parse_args()
@@ -201,7 +207,12 @@ def main() -> None:
         condition_on_sps_pps=not args.no_sps_pps_metadata,
         default_max_seq_length=args.max_seq_length,
     )
-    dm = ByteDataModule(manifest_path=args.manifest, config=config)
+    max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
+    dm = ByteDataModule(
+        manifest_path=args.manifest,
+        config=config,
+        max_manifest_rows=max_manifest_rows,
+    )
     dm.connect(batch_size=args.batch_size, max_seq_length=args.max_seq_length)
     dm.setup()
 
