@@ -14,6 +14,7 @@ from collections import Counter
 from pathlib import Path
 
 import torch
+from torch.utils.data import Subset
 
 from litgpt.data.byte_data import (
     IGNORE_INDEX,
@@ -26,6 +27,7 @@ from litgpt.data.byte_data import (
     VOCAB_SIZE,
     ByteDataConfig,
     ByteDataModule,
+    ByteSliceDataset,
 )
 
 
@@ -50,7 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--fim-min-gap", type=int, default=64)
     parser.add_argument("--fim-max-gap", type=int, default=1400)
-    parser.add_argument("--no-parameter-sets", action="store_true")
+    parser.add_argument("--no-sps-pps-metadata", action="store_true")
+    parser.add_argument("--block-size-candidates", type=int, nargs="+", default=[4096, 8192, 16384, 32768])
+    parser.add_argument("--block-size-samples", type=int, default=20000)
     return parser.parse_args()
 
 
@@ -95,6 +99,96 @@ def summarize_batch(batch: dict) -> None:
     assert int(supervised.sum()) > 0
 
 
+def summarize_block_size_candidates(dataset: ByteSliceDataset, indices: list[int], candidates: list[int]) -> None:
+    if not indices:
+        return
+
+    lengths: list[int] = []
+    targets: list[int] = []
+    refs: list[int] = []
+    metas: list[int] = []
+    candidate_stats = {
+        block_size: {"target_too_large": 0, "full_context": 0, "dropped_ref": 0}
+        for block_size in candidates
+    }
+
+    for idx in indices:
+        sample = dataset.samples[idx]
+        nals = dataset.nal_index[str(sample.h264_path)]
+        target_len = nals[sample.target_index].end - nals[sample.target_index].start
+        meta_len = sum(nals[i].end - nals[i].start for i in sample.meta_indices)
+        ref_lens = [nals[i].end - nals[i].start for i in sample.ref_indices]
+        ref_len = sum(ref_lens)
+        ideal_len = meta_len + ref_len + target_len
+
+        lengths.append(ideal_len)
+        targets.append(target_len)
+        refs.append(ref_len)
+        metas.append(meta_len)
+
+        for block_size in candidates:
+            stats = candidate_stats[block_size]
+            if target_len > block_size:
+                stats["target_too_large"] += 1
+                continue
+            if ideal_len <= block_size:
+                stats["full_context"] += 1
+                continue
+
+            budget = block_size - target_len
+            if meta_len >= budget:
+                stats["dropped_ref"] += int(bool(ref_lens))
+                continue
+
+            remaining = budget - meta_len
+            used = 0
+            kept_refs = 0
+            for ref_len_i in reversed(ref_lens):
+                if used + ref_len_i <= remaining:
+                    used += ref_len_i
+                    kept_refs += 1
+            stats["dropped_ref"] += len(ref_lens) - kept_refs
+
+    print("block size analysis samples:", len(indices))
+    print("ideal input length quantiles:", summarize_quantiles(lengths))
+    print("target length quantiles:", summarize_quantiles(targets))
+    print("ref length quantiles:", summarize_quantiles(refs))
+    print("metadata length quantiles:", summarize_quantiles(metas))
+    for block_size in candidates:
+        stats = candidate_stats[block_size]
+        n = len(indices)
+        print(
+            f"block_size={block_size}: "
+            f"full_context={stats['full_context'] / n:.2%}, "
+            f"target_too_large={stats['target_too_large'] / n:.2%}, "
+            f"avg_dropped_ref_slices={stats['dropped_ref'] / n:.3f}"
+        )
+
+
+def summarize_quantiles(values: list[int]) -> dict[str, int]:
+    values = sorted(values)
+    if not values:
+        return {}
+    return {
+        "p50": percentile(values, 0.50),
+        "p90": percentile(values, 0.90),
+        "p95": percentile(values, 0.95),
+        "p99": percentile(values, 0.99),
+        "max": values[-1],
+    }
+
+
+def percentile(values: list[int], q: float) -> int:
+    idx = min(len(values) - 1, max(0, round(q * (len(values) - 1))))
+    return values[idx]
+
+
+def get_indexed_dataset_and_indices(dataset) -> tuple[ByteSliceDataset, list[int]]:
+    if isinstance(dataset, Subset):
+        return dataset.dataset, list(dataset.indices)
+    return dataset, list(range(len(dataset)))
+
+
 def main() -> None:
     args = parse_args()
     config = ByteDataConfig(
@@ -104,7 +198,7 @@ def main() -> None:
         num_workers=args.num_workers,
         fim_min_gap=args.fim_min_gap,
         fim_max_gap=args.fim_max_gap,
-        include_parameter_sets=not args.no_parameter_sets,
+        condition_on_sps_pps=not args.no_sps_pps_metadata,
         default_max_seq_length=args.max_seq_length,
     )
     dm = ByteDataModule(manifest_path=args.manifest, config=config)
@@ -121,6 +215,13 @@ def main() -> None:
 
     sample = dm.train_dataset[0]
     summarize_sample(sample)
+
+    indexed_dataset, train_indices = get_indexed_dataset_and_indices(dm.train_dataset)
+    summarize_block_size_candidates(
+        indexed_dataset,
+        train_indices[: args.block_size_samples],
+        sorted(set(args.block_size_candidates)),
+    )
 
     batch = next(iter(dm.train_dataloader()))
     summarize_batch(batch)

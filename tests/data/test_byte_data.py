@@ -14,6 +14,7 @@ from litgpt.data.byte_data import (
     REGION_TARGET,
     SLICE_BOS_ID,
     SPAN_BOS_ID,
+    VOCAB_SIZE,
     ByteDataConfig,
     ByteDataModule,
     ByteSliceDataset,
@@ -21,6 +22,9 @@ from litgpt.data.byte_data import (
     load_manifest_rows,
     parse_annexb_nals,
 )
+from litgpt.config import Config
+from litgpt.model import GPT
+from litgpt.pretrain import get_model_inputs_and_targets
 
 
 def nal(
@@ -125,7 +129,7 @@ def test_ar_sample_layout_includes_metadata_and_reference(tmp_path):
 
 def test_metadata_can_be_disabled(tmp_path):
     """Allows ablations where SPS/PPS metadata is not fed as conditioning."""
-    ds = make_dataset(tmp_path, p_fim=0.0, include_parameter_sets=False)
+    ds = make_dataset(tmp_path, p_fim=0.0, condition_on_sps_pps=False)
     sample = ds[0]
 
     assert (
@@ -265,3 +269,50 @@ def test_byte_data_module_smoke(tmp_path):
     assert (
         batch["input_ids"].shape == batch["labels"].shape
     )  # Batch input/label tensors are token-aligned.
+
+
+def test_pretrain_batch_helper_preserves_byte_labels(tmp_path):
+    """Passes byte labels and auxiliary ids to the model without shifting."""
+    ds = make_dataset(tmp_path, p_fim=0.0)
+    batch = collate_byte_samples([ds[0]], max_seq_length=256)
+
+    model_inputs, targets = get_model_inputs_and_targets(batch, max_seq_length=256)
+
+    assert torch.equal(
+        model_inputs["idx"], batch["input_ids"]
+    )  # Byte input_ids are passed to GPT unchanged.
+    assert torch.equal(
+        targets, batch["labels"]
+    )  # Dataset-provided masked labels are not shifted a second time.
+    assert torch.equal(
+        model_inputs["region_ids"], batch["region_ids"]
+    )  # Region ids are forwarded to the model.
+    assert torch.equal(
+        model_inputs["offset_ids"], batch["offset_ids"]
+    )  # Original byte offsets are forwarded to the model.
+
+
+def test_gpt_accepts_region_and_offset_embeddings():
+    """Adds optional region/offset embeddings without changing output shape."""
+    config = Config(
+        block_size=16,
+        n_layer=1,
+        n_embd=16,
+        n_head=4,
+        vocab_size=VOCAB_SIZE,
+        padding_multiple=8,
+        use_region_id=True,
+        use_offset_id=True,
+    )
+    model = GPT(config)
+    input_ids = torch.tensor([[SLICE_BOS_ID, 0, 1, 2]])
+    region_ids = torch.tensor([[REGION_TARGET, REGION_TARGET, REGION_TARGET, REGION_TARGET]])
+    offset_ids = torch.tensor([[0, 1, 2, 3]])
+
+    logits = model(input_ids, region_ids=region_ids, offset_ids=offset_ids)
+
+    assert logits.shape == (
+        1,
+        4,
+        config.padded_vocab_size,
+    )  # Auxiliary embeddings preserve normal LM-logit dimensions.

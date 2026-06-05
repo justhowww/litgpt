@@ -33,6 +33,13 @@ class GPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
+        # Byte-domain extension: optional learned embeddings describe the role
+        # and original byte position of tokens in rearranged AR/FIM inputs.
+        if config.use_region_id:
+            self.transformer["region_wte"] = nn.Embedding(config.region_vocab_size, config.n_embd)
+        if config.use_offset_id:
+            assert config.offset_vocab_size is not None
+            self.transformer["offset_wte"] = nn.Embedding(config.offset_vocab_size, config.n_embd)
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
 
@@ -88,6 +95,8 @@ class GPT(nn.Module):
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
         lm_head_chunk_size: int = 0,
+        region_ids: torch.Tensor | None = None,
+        offset_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -153,6 +162,16 @@ class GPT(nn.Module):
             input_pos_maxp1 = None
 
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
+        # Byte-domain extension: add auxiliary structure embeddings before the
+        # unchanged transformer stack. Text models leave both options disabled.
+        if self.config.use_region_id:
+            if region_ids is None:
+                raise ValueError("region_ids must be provided when config.use_region_id=True")
+            x = x + self.transformer.region_wte(region_ids)
+        if self.config.use_offset_id:
+            if offset_ids is None:
+                raise ValueError("offset_ids must be provided when config.use_offset_id=True")
+            x = x + self.transformer.offset_wte(offset_ids.clamp_max(self.config.offset_vocab_size - 1))
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 

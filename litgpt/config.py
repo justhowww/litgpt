@@ -33,6 +33,12 @@ class Config:
     vocab_size: int = 50254
     padding_multiple: int = 512
     padded_vocab_size: int | None = None
+    # Byte-domain extension: optionally identify each token's semantic region
+    # and original byte offset after AR/FIM sample construction.
+    use_region_id: bool = False
+    region_vocab_size: int = 7
+    use_offset_id: bool = False
+    offset_vocab_size: int | None = None
     # Transformer block (structure, normalizations)
     norm_class_name: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
     norm_eps: float = 1e-5
@@ -129,6 +135,9 @@ class Config:
         else:
             # vocab size shouldn't be larger than padded vocab size
             self.vocab_size = min(self.vocab_size, self.padded_vocab_size)
+
+        if self.offset_vocab_size is None:
+            self.offset_vocab_size = self.block_size
 
         # compute the number of query groups
         if self.n_query_groups is not None:

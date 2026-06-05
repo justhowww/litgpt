@@ -72,6 +72,7 @@ def setup(
     tokenizer_dir: Path | None = None,
     logger_name: LoggerChoice = "tensorboard",
     seed: int = 42,
+    compile_model: bool = True,
 ):
     """Pretrain a model.
 
@@ -170,6 +171,7 @@ def setup(
         train=train,
         eval=eval,
         optimizer=optimizer,
+        compile_model=compile_model,
     )
 
 
@@ -187,6 +189,7 @@ def main(
     train: TrainArgs,
     eval: EvalArgs,
     optimizer: str | dict,
+    compile_model: bool = True,
     num_nodes: int = 1,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
@@ -210,7 +213,10 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    model = torch.compile(model)
+    # Byte-domain extension: compilation can be disabled for short smoke runs
+    # where compile time and graph errors obscure data/model integration issues.
+    if compile_model:
+        model = torch.compile(model)
     model = fabric.setup(model)
 
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
@@ -312,7 +318,14 @@ def fit(
     with torch.device("meta"):
         meta_model = GPT(model.config)
         x = torch.randint(0, 1, (train.micro_batch_size, meta_model.max_seq_length))
-        model_fwd = lambda: meta_model(x)  # noqa: F821
+        # Byte-domain extension: FLOP measurement must follow the same optional
+        # region/offset input signature as real training forwards.
+        model_kwargs = {}
+        if meta_model.config.use_region_id:
+            model_kwargs["region_ids"] = torch.zeros_like(x)
+        if meta_model.config.use_offset_id:
+            model_kwargs["offset_ids"] = torch.arange(meta_model.max_seq_length).expand_as(x)
+        model_fwd = lambda: meta_model(x, **model_kwargs)  # noqa: F821
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)  # noqa: F821
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
@@ -345,12 +358,13 @@ def fit(
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
 
-        input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
-        targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+        # Byte-domain extension: dict batches already contain aligned labels and
+        # auxiliary ids, while original text batches retain LitGPT's shift path.
+        model_inputs, targets = get_model_inputs_and_targets(train_data, model.max_seq_length)
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
+            logits = model(**model_inputs)
             loss = chunked_cross_entropy(logits, targets)
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
@@ -385,6 +399,12 @@ def fit(
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
             }
+            # Byte-domain extension: context and padding are masked, so record
+            # how many tokens actually contribute to cross-entropy.
+            if isinstance(train_data, dict):
+                supervised_tokens = (targets != -100).sum()
+                metrics["supervised_tokens"] = supervised_tokens
+                metrics["raw_tokens"] = model_inputs["idx"].numel()
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
@@ -435,9 +455,8 @@ def validate(
     for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
-        input_ids = batch[:, 0 : model.max_seq_length].contiguous().long()
-        targets = batch[:, 1 : (model.max_seq_length + 1)].contiguous().long()
-        logits = model(input_ids)
+        model_inputs, targets = get_model_inputs_and_targets(batch, model.max_seq_length)
+        logits = model(**model_inputs)
         loss = chunked_cross_entropy(logits, targets)
         losses.append(loss)
 
@@ -445,6 +464,23 @@ def validate(
     model.train()
     fabric.barrier()
     return val_loss
+
+
+def get_model_inputs_and_targets(batch, max_seq_length: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Adapt byte-domain dict batches without changing LitGPT tensor batches."""
+    if isinstance(batch, dict):
+        input_ids = batch["input_ids"][:, :max_seq_length].contiguous().long()
+        targets = batch["labels"][:, :max_seq_length].contiguous().long()
+        model_inputs = {"idx": input_ids}
+        if "region_ids" in batch:
+            model_inputs["region_ids"] = batch["region_ids"][:, :max_seq_length].contiguous().long()
+        if "offset_ids" in batch:
+            model_inputs["offset_ids"] = batch["offset_ids"][:, :max_seq_length].contiguous().long()
+        return model_inputs, targets
+
+    input_ids = batch[:, 0:max_seq_length].contiguous().long()
+    targets = batch[:, 1 : (max_seq_length + 1)].contiguous().long()
+    return {"idx": input_ids}, targets
 
 
 def get_dataloaders(

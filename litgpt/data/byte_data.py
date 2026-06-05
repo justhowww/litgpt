@@ -67,7 +67,7 @@ class ByteDataConfig:
     # NAL/slice header so early experiments focus on payload recovery. Future
     # evaluations should reduce this to 0 and explicitly test missing-header cases.
     slice_header_guard_bytes: int = 64
-    include_parameter_sets: bool = True  # Include latest SPS/PPS bytes as B_meta.
+    condition_on_sps_pps: bool = True  # Feed latest SPS/PPS NAL bytes as B_meta conditioning.
     default_max_seq_length: int = (
         32768  # Used when LitGPT connect() does not provide max_seq_length.
     )
@@ -199,7 +199,9 @@ class ByteSliceDataset(Dataset):
         fim_min_gap: int = 64,
         fim_max_gap: int = 1400,
         slice_header_guard_bytes: int = 64,
-        include_parameter_sets: bool = True,
+        condition_on_sps_pps: bool = True,
+        include_sps_pps_metadata: bool | None = None,
+        include_parameter_sets: bool | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
     ) -> None:
@@ -218,7 +220,11 @@ class ByteSliceDataset(Dataset):
         self.fim_min_gap = fim_min_gap
         self.fim_max_gap = fim_max_gap
         self.slice_header_guard_bytes = slice_header_guard_bytes
-        self.include_parameter_sets = include_parameter_sets
+        if include_parameter_sets is not None:
+            condition_on_sps_pps = include_parameter_sets
+        if include_sps_pps_metadata is not None:
+            condition_on_sps_pps = include_sps_pps_metadata
+        self.condition_on_sps_pps = condition_on_sps_pps
         self.seed = seed
         self.ignore_index = ignore_index
         self.samples, self.nal_index = self._build_index()
@@ -276,7 +282,7 @@ class ByteSliceDataset(Dataset):
     def _latest_parameter_set_indices(
         self, nals: list[NALUnit], target_index: int
     ) -> tuple[int, ...]:
-        if not self.include_parameter_sets:
+        if not self.condition_on_sps_pps:
             return ()
 
         latest: dict[int, int] = {}
@@ -535,7 +541,7 @@ class ByteDataModule(DataModule):
             fim_min_gap=self.config.fim_min_gap,
             fim_max_gap=self.config.fim_max_gap,
             slice_header_guard_bytes=self.config.slice_header_guard_bytes,
-            include_parameter_sets=self.config.include_parameter_sets,
+            condition_on_sps_pps=self.config.condition_on_sps_pps,
             seed=self.config.seed,
         )
         val_size = max(1, int(len(dataset) * self.config.val_fraction))
