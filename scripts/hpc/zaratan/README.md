@@ -44,14 +44,14 @@ bash scripts/hpc/zaratan/submit_stage1.sh
 
 ## Smoke job
 
-Submit direct jobs from the LitGPT repository root. Slurm uses
-`SLURM_SUBMIT_DIR` to find the repository's `env.sh`.
+Run the login-node wrapper so the corpus is copied before the GPU smoke job:
 
 ```bash
-MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
-sbatch --account=metzler-prj \
-  scripts/hpc/zaratan/smoke_stage1.sbatch
+bash scripts/hpc/zaratan/submit_smoke.sh
 ```
+
+The staged corpus is retained after smoke testing for the subsequent training
+run. `rsync` makes repeated staging incremental.
 
 ## Training job
 
