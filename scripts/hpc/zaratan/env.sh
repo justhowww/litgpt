@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
+REPO_ROOT=${REPO_ROOT:-"$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"}
 
 PROJECT_SCRATCH=${PROJECT_SCRATCH:-"/home/${USER}/scratch.metzler-prj"}
 CONDA_ROOT=${CONDA_ROOT:-"${PROJECT_SCRATCH}/miniforge3"}

@@ -5,6 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
 
 SOURCE_CORPUS=${SOURCE_CORPUS:-"/home/${USER}/SHELL.metzler-prj/OpenVid-1M/h264"}
 STAGED_CORPUS=${STAGED_CORPUS:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data/h264"}
@@ -33,7 +34,7 @@ rsync -a "${SOURCE_CORPUS}/manifest.jsonl" "${STAGED_CORPUS}/manifest.jsonl"
 job_id=$(
     sbatch --parsable \
         --account="${SBATCH_ACCOUNT}" \
-        --export="ALL,MANIFEST=${STAGED_CORPUS}/manifest.jsonl,OUT_DIR=${OUT_DIR}" \
+        --export="ALL,REPO_ROOT=${REPO_ROOT},MANIFEST=${STAGED_CORPUS}/manifest.jsonl,OUT_DIR=${OUT_DIR}" \
         "${JOB_SCRIPT}"
 )
 echo "Submitted training job ${job_id}"
@@ -50,4 +51,3 @@ if [[ "${CLEANUP_AFTER_SUCCESS}" == "1" ]]; then
 else
     echo "Staged corpus retained because CLEANUP_AFTER_SUCCESS=${CLEANUP_AFTER_SUCCESS}"
 fi
-

@@ -44,6 +44,9 @@ bash scripts/hpc/zaratan/submit_stage1.sh
 
 ## Smoke job
 
+Submit direct jobs from the LitGPT repository root. Slurm uses
+`SLURM_SUBMIT_DIR` to find the repository's `env.sh`.
+
 ```bash
 MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
 sbatch --account=metzler-prj \
@@ -73,6 +76,7 @@ Shared environment defaults are in `env.sh`. Override them without editing
 tracked files:
 
 ```bash
+REPO_ROOT=$PWD \
 CONDA_ROOT=/home/$USER/scratch.metzler-prj/miniforge3 \
 CONDA_ENV=litpt \
 MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \

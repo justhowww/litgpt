@@ -11,8 +11,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "${SCRIPT_DIR}/env.sh"
+# Slurm executes a spool copy of this file, so BASH_SOURCE does not point into
+# the repository. Resolve cluster helpers from the submitted repository root.
+REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
+source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 
 : "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
 
