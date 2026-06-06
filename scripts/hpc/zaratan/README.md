@@ -51,7 +51,8 @@ bash scripts/hpc/zaratan/submit_smoke.sh
 ```
 
 The staged corpus is retained after smoke testing for the subsequent training
-run. `rsync` makes repeated staging incremental.
+run. `rsync` makes repeated staging incremental. The smoke job indexes only
+100 manifest clips by default; override with `MAX_MANIFEST_ROWS`.
 
 Staging forces copied files into group `zt-metzler-prj`; otherwise `rsync -a`
 can preserve the source project's group and charge the wrong project quota.

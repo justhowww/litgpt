@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
+
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.config import Config
 from litgpt.data.byte_data import VOCAB_SIZE, ByteDataConfig, ByteDataModule
@@ -41,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-iters", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--max-manifest-rows",
+        type=int,
+        default=0,
+        help="Limit clips indexed by the DataModule; 0 uses the full manifest.",
+    )
     parser.add_argument("--n-layer", type=int, default=8)
     parser.add_argument("--n-embd", type=int, default=512)
     parser.add_argument("--n-head", type=int, default=8)
@@ -60,6 +68,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.
+    torch.set_float32_matmul_precision("high")
+
     use_region_id = not args.no_region_id
     use_offset_id = not args.no_offset_id
     max_tokens = args.steps * args.global_batch_size * args.block_size
@@ -83,7 +94,12 @@ def main() -> None:
         condition_on_sps_pps=not args.no_sps_pps_conditioning,
         default_max_seq_length=args.block_size,
     )
-    data = ByteDataModule(manifest_path=args.manifest, config=data_config)
+    max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
+    data = ByteDataModule(
+        manifest_path=args.manifest,
+        config=data_config,
+        max_manifest_rows=max_manifest_rows,
+    )
     train = TrainArgs(
         save_interval=args.save_interval,
         log_interval=1,
