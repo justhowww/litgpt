@@ -15,18 +15,34 @@ stage_corpus() {
     chgrp "${staged_group}" "${staged_corpus}"
     chmod g+s "${staged_corpus}"
 
+    # Repair a partial prior copy. Every directory must be setgid so temporary
+    # rsync files inherit the destination project group at creation time.
+    if [[ -d "${staged_corpus}/h264" ]]; then
+        chgrp -R "${staged_group}" "${staged_corpus}/h264"
+        find "${staged_corpus}/h264" -type d -exec chmod g+s {} +
+    fi
+
     echo "Staging H.264 files to compute-node-visible storage..."
-    # Archive mode normally preserves the source group, which can charge files
-    # to the wrong project quota. Force all staged files onto the Metzler group.
-    rsync -a --chown=":${staged_group}" --info=progress2 \
-        "${source_corpus}/h264/" "${staged_corpus}/h264/"
+    # Run rsync with the destination project as its effective group. --chown
+    # alone is too late because rsync creates temporary files before chowning.
+    local source_h264_q staged_h264_q
+    printf -v source_h264_q "%q" "${source_corpus}/h264/"
+    printf -v staged_h264_q "%q" "${staged_corpus}/h264/"
+    sg "${staged_group}" -c \
+        "rsync -a --no-group --chmod=Dg+s --info=progress2 ${source_h264_q} ${staged_h264_q}"
 
     if [[ -r "${source_corpus}/corpus.json" ]]; then
-        rsync -a --chown=":${staged_group}" \
-            "${source_corpus}/corpus.json" "${staged_corpus}/corpus.json"
+        local source_corpus_json_q staged_corpus_json_q
+        printf -v source_corpus_json_q "%q" "${source_corpus}/corpus.json"
+        printf -v staged_corpus_json_q "%q" "${staged_corpus}/corpus.json"
+        sg "${staged_group}" -c \
+            "rsync -a --no-group ${source_corpus_json_q} ${staged_corpus_json_q}"
     fi
 
     # Publish the manifest last so it describes the most complete staged snapshot.
-    rsync -a --chown=":${staged_group}" \
-        "${source_corpus}/manifest.jsonl" "${staged_corpus}/manifest.jsonl"
+    local source_manifest_q staged_manifest_q
+    printf -v source_manifest_q "%q" "${source_corpus}/manifest.jsonl"
+    printf -v staged_manifest_q "%q" "${staged_corpus}/manifest.jsonl"
+    sg "${staged_group}" -c \
+        "rsync -a --no-group ${source_manifest_q} ${staged_manifest_q}"
 }
