@@ -53,6 +53,10 @@ bash scripts/hpc/zaratan/submit_smoke.sh
 The staged corpus is retained after smoke testing for the subsequent training
 run. `rsync` makes repeated staging incremental.
 
+Staging forces copied files into group `zt-metzler-prj`; otherwise `rsync -a`
+can preserve the source project's group and charge the wrong project quota.
+Override with `STAGED_GROUP` if needed.
+
 ## Training job
 
 ```bash
