@@ -6,10 +6,46 @@ These wrappers keep Zaratan/Slurm configuration separate from the portable
 The manifest and its sibling `h264/` directory must be available from compute
 nodes, preferably under project scratch rather than `SHELL`.
 
+## Stage and submit
+
+The source corpus currently lives under storage that compute nodes cannot see.
+Run this command on a login node to copy it into `scratch.metzler-prj`, submit
+training, and delete only the staged corpus after successful training:
+
+```bash
+bash scripts/hpc/zaratan/submit_stage1.sh
+```
+
+Defaults:
+
+```text
+source: /home/$USER/SHELL.metzler-prj/OpenVid-1M/h264
+stage:  /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264
+output: /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1
+```
+
+The manifest is copied last, after the encoded files. If training fails, staged
+data is retained so the job can be resumed. Disable automatic cleanup with:
+
+```bash
+CLEANUP_AFTER_SUCCESS=0 bash scripts/hpc/zaratan/submit_stage1.sh
+```
+
+Paths and training settings can be overridden at submission:
+
+```bash
+SOURCE_CORPUS=/path/in/SHELL \
+STAGED_CORPUS=/path/in/scratch/data/h264 \
+OUT_DIR=/path/in/scratch/runs/byte-stage1 \
+BLOCK_SIZE=16384 \
+STEPS=10000 \
+bash scripts/hpc/zaratan/submit_stage1.sh
+```
+
 ## Smoke job
 
 ```bash
-MANIFEST=/scratch/zt1/project/metzler-prj/user/$USER/data/OpenVid-1M/manifest.jsonl \
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
 sbatch --account=metzler-prj \
   scripts/hpc/zaratan/smoke_stage1.sbatch
 ```
@@ -17,8 +53,8 @@ sbatch --account=metzler-prj \
 ## Training job
 
 ```bash
-MANIFEST=/scratch/zt1/project/metzler-prj/user/$USER/data/OpenVid-1M/manifest.jsonl \
-OUT_DIR=/scratch/zt1/project/metzler-prj/user/$USER/runs/byte-stage1 \
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
+OUT_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \
 sbatch --account=metzler-prj \
@@ -37,8 +73,8 @@ Shared environment defaults are in `env.sh`. Override them without editing
 tracked files:
 
 ```bash
-CONDA_ROOT=/scratch/path/to/miniforge3 \
+CONDA_ROOT=/home/$USER/scratch.metzler-prj/miniforge3 \
 CONDA_ENV=litpt \
-MANIFEST=/scratch/path/to/manifest.jsonl \
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
 sbatch --account=metzler-prj scripts/hpc/zaratan/smoke_stage1.sbatch
 ```
