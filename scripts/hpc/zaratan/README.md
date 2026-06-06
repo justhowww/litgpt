@@ -20,7 +20,7 @@ Defaults:
 
 ```text
 source: /home/$USER/SHELL.metzler-prj/OpenVid-1M/h264
-stage:  /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264
+stage:  /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data
 output: /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1
 ```
 
@@ -35,7 +35,7 @@ Paths and training settings can be overridden at submission:
 
 ```bash
 SOURCE_CORPUS=/path/in/SHELL \
-STAGED_CORPUS=/path/in/scratch/data/h264 \
+STAGED_CORPUS=/path/in/scratch/data \
 OUT_DIR=/path/in/scratch/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \
@@ -48,7 +48,7 @@ Submit direct jobs from the LitGPT repository root. Slurm uses
 `SLURM_SUBMIT_DIR` to find the repository's `env.sh`.
 
 ```bash
-MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
 sbatch --account=metzler-prj \
   scripts/hpc/zaratan/smoke_stage1.sbatch
 ```
@@ -56,7 +56,7 @@ sbatch --account=metzler-prj \
 ## Training job
 
 ```bash
-MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
 OUT_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \
@@ -79,6 +79,6 @@ tracked files:
 REPO_ROOT=$PWD \
 CONDA_ROOT=/home/$USER/scratch.metzler-prj/miniforge3 \
 CONDA_ENV=litpt \
-MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/h264/manifest.jsonl \
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
 sbatch --account=metzler-prj scripts/hpc/zaratan/smoke_stage1.sbatch
 ```
