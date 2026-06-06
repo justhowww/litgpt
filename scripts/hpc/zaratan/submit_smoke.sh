@@ -12,7 +12,7 @@ STAGED_CORPUS=${STAGED_CORPUS:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Dat
 OUT_DIR=${OUT_DIR:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1-smoke"}
 SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-"metzler-prj-cmsc"}
 
-# stage_corpus "${SOURCE_CORPUS}" "${STAGED_CORPUS}"
+stage_corpus "${SOURCE_CORPUS}" "${STAGED_CORPUS}"
 mkdir -p "${OUT_DIR}"
 
 sbatch_args=(--parsable)
