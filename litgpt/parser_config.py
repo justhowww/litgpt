@@ -1,7 +1,23 @@
 import sys
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from litgpt.utils import CLI
+
+
+def _yaml_safe(value: Any) -> Any:
+    """Convert captured Python values to objects accepted by yaml.safe_dump."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _yaml_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_yaml_safe(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
 
 
 def parser_commands() -> list[str]:
@@ -35,8 +51,16 @@ def save_hyperparameters(
     function: callable,
     checkpoint_dir: Path,
     known_commands: list[str] | None = None,
+    hparams: dict[str, Any] | None = None,
 ) -> None:
-    """Captures the CLI parameters passed to `function` without running `function` and saves them to the checkpoint."""
+    """Save explicit hyperparameters, or capture them from the standard LitGPT CLI."""
+    if hparams is not None:
+        # Custom launchers have their own CLI syntax, so reparsing sys.argv with
+        # LitGPT's standard parser would fail while writing a checkpoint.
+        with open(checkpoint_dir / "hyperparameters.yaml", "w", encoding="utf-8") as file:
+            yaml.safe_dump(_yaml_safe(hparams), file, sort_keys=False)
+        return
+
     from jsonargparse import capture_parser
 
     # TODO: Make this more robust

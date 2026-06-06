@@ -268,6 +268,19 @@ def test_save_hyperparameters(tmp_path):
     assert hparams["bar"] == 1
 
 
+def test_save_explicit_hyperparameters(tmp_path):
+    explicit = {"out_dir": tmp_path, "target_nal_types": (1, 5), "nested": {"enabled": True}}
+
+    save_hyperparameters(_test_function2, tmp_path, hparams=explicit)
+
+    with open(tmp_path / "hyperparameters.yaml", encoding="utf-8") as file:
+        hparams = yaml.safe_load(file)
+
+    assert hparams["out_dir"] == str(tmp_path)
+    assert hparams["target_nal_types"] == [1, 5]
+    assert hparams["nested"] == {"enabled": True}
+
+
 def _test_function2(out_dir: Path, foo: bool = False, bar: int = 1):
     assert False, "I only exist as a signature, but I should not run."
 

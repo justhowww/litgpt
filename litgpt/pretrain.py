@@ -172,6 +172,7 @@ def setup(
         eval=eval,
         optimizer=optimizer,
         compile_model=compile_model,
+        checkpoint_hparams=hparams,
     )
 
 
@@ -191,6 +192,7 @@ def main(
     optimizer: str | dict,
     compile_model: bool = True,
     num_nodes: int = 1,
+    checkpoint_hparams: dict | None = None,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -267,10 +269,17 @@ def main(
         tokenizer_dir=tokenizer_dir,
         train=train,
         eval=eval,
+        checkpoint_hparams=checkpoint_hparams,
     )
 
     # Save final checkpoint
-    save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
+    save_checkpoint(
+        fabric,
+        state,
+        tokenizer_dir,
+        out_dir / "final" / "lit_model.pth",
+        checkpoint_hparams=checkpoint_hparams,
+    )
 
     total_tokens = state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size
 
@@ -301,6 +310,7 @@ def fit(
     train: TrainArgs,
     eval: EvalArgs,
     num_nodes: int = 1,
+    checkpoint_hparams: dict | None = None,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -432,7 +442,13 @@ def fit(
             fabric.barrier()
 
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
-            save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
+            save_checkpoint(
+                fabric,
+                state,
+                tokenizer_dir,
+                out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth",
+                checkpoint_hparams=checkpoint_hparams,
+            )
 
     # Final validation
     if eval.final_validation:
@@ -532,13 +548,13 @@ def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) 
         reset_parameters(model)
 
 
-def save_checkpoint(fabric, state, tokenizer_dir, checkpoint_file):
+def save_checkpoint(fabric, state, tokenizer_dir, checkpoint_file, checkpoint_hparams=None):
     model = state["model"]
     checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
     fabric.print(f"Saving checkpoint to {str(checkpoint_file)!r}")
     fabric.save(checkpoint_file, state)
     if fabric.global_rank == 0:
-        save_hyperparameters(setup, checkpoint_file.parent)
+        save_hyperparameters(setup, checkpoint_file.parent, hparams=checkpoint_hparams)
         if tokenizer_dir is not None:
             copy_config_files(tokenizer_dir, checkpoint_file.parent)
         save_config(model.config, checkpoint_file.parent)
