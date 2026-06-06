@@ -46,3 +46,15 @@ stage_corpus() {
     sg "${staged_group}" -c \
         "rsync -a --no-group ${source_manifest_q} ${staged_manifest_q}"
 }
+
+# Allow both:
+#   source stage_corpus.sh; stage_corpus SOURCE DEST
+#   bash stage_corpus.sh SOURCE DEST
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    set -euo pipefail
+    if [[ $# -ne 2 ]]; then
+        echo "Usage: bash $0 SOURCE_CORPUS STAGED_CORPUS" >&2
+        exit 2
+    fi
+    stage_corpus "$1" "$2"
+fi
