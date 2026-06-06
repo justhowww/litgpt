@@ -283,13 +283,15 @@ def main(
 
     total_tokens = state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size
 
+    elapsed_train_time = time.perf_counter() - train_time
+
     # Print formatted output
     separator = "-" * 40
     fabric.print(separator)
     fabric.print("| Performance")
     fabric.print(f"| - Total tokens  : {total_tokens:,}")
-    fabric.print(f"| - Training Time : {(time.perf_counter() - train_time):.2f} s")
-    fabric.print(f"| - Tok/sec       : {total_tokens / train_time:.2f} tok/s")
+    fabric.print(f"| - Training Time : {elapsed_train_time:.2f} s")
+    fabric.print(f"| - Tok/sec       : {total_tokens / elapsed_train_time:.2f} tok/s")
     fabric.print("| " + "-" * 40)
 
     if fabric.device.type == "cuda":
