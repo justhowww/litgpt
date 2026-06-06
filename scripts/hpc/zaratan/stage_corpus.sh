@@ -6,6 +6,9 @@ stage_corpus() {
     local staged_corpus=$2
     local staged_group=${STAGED_GROUP:-zt-metzler-prj}
 
+    echo "Source corpus: ${source_corpus}"
+    echo "Staged corpus: ${staged_corpus}"
+
     if [[ ! -r "${source_corpus}/manifest.jsonl" || ! -d "${source_corpus}/h264" ]]; then
         echo "Expected manifest.jsonl and h264/ under SOURCE_CORPUS=${source_corpus}" >&2
         return 1
@@ -18,8 +21,10 @@ stage_corpus() {
     # Repair a partial prior copy. Every directory must be setgid so temporary
     # rsync files inherit the destination project group at creation time.
     if [[ -d "${staged_corpus}/h264" ]]; then
-        chgrp -R "${staged_group}" "${staged_corpus}/h264"
-        find "${staged_corpus}/h264" -type d -exec chmod g+s {} +
+        echo "Repairing destination directory permissions..."
+        find "${staged_corpus}/h264" -type d \
+            -exec chgrp "${staged_group}" {} + \
+            -exec chmod g+s {} +
     fi
 
     echo "Staging H.264 files to compute-node-visible storage..."
