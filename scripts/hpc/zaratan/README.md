@@ -64,15 +64,14 @@ MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
 OUT_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \
-sbatch --account=metzler-prj \
-  scripts/hpc/zaratan/train_stage1.sbatch
+sbatch scripts/hpc/zaratan/train_stage1.sbatch
 ```
 
 The scripts default to one A100. Override Slurm resources at submission time,
 for example:
 
 ```bash
-sbatch --account=metzler-prj --gpus=h100:1 --time=02:00:00 \
+sbatch --gpus=h100:1 --time=02:00:00 \
   scripts/hpc/zaratan/smoke_stage1.sbatch
 ```
 
@@ -84,5 +83,9 @@ REPO_ROOT=$PWD \
 CONDA_ROOT=/home/$USER/scratch.metzler-prj/miniforge3 \
 CONDA_ENV=litpt \
 MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
-sbatch --account=metzler-prj scripts/hpc/zaratan/smoke_stage1.sbatch
+sbatch scripts/hpc/zaratan/smoke_stage1.sbatch
 ```
+
+The submission wrappers default to Slurm account `metzler-prj-cmsc`. This is
+distinct from the filesystem group `zt-metzler-prj`. Override it with
+`SBATCH_ACCOUNT` if the allocation changes.
