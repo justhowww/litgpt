@@ -25,6 +25,8 @@ BLOCK_SIZE=${BLOCK_SIZE:-16384}
 STEPS=${STEPS:-10}
 NUM_WORKERS=${NUM_WORKERS:-4}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-100}
+RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-10}
+RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-1}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -45,4 +47,6 @@ srun python scripts/train_byte_stage1.py \
     --max-manifest-rows "${MAX_MANIFEST_ROWS}" \
     --eval-interval 5 \
     --eval-iters 2 \
+    --reconstruction-eval-interval "${RECONSTRUCTION_EVAL_INTERVAL}" \
+    --reconstruction-eval-samples "${RECONSTRUCTION_EVAL_SAMPLES}" \
     --save-interval 5

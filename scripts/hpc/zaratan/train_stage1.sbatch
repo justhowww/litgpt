@@ -27,6 +27,9 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
 REFERENCE_MODE=${REFERENCE_MODE:-normal}
+RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
+RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-5}
+RECONSTRUCTION_MAX_TARGET_BYTES=${RECONSTRUCTION_MAX_TARGET_BYTES:-2048}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -48,6 +51,9 @@ cmd=(
     --reference-mode "${REFERENCE_MODE}"
     --eval-interval 250
     --eval-iters 20
+    --reconstruction-eval-interval "${RECONSTRUCTION_EVAL_INTERVAL}"
+    --reconstruction-eval-samples "${RECONSTRUCTION_EVAL_SAMPLES}"
+    --reconstruction-max-target-bytes "${RECONSTRUCTION_MAX_TARGET_BYTES}"
     --save-interval 500
     --compile
     --resume

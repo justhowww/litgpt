@@ -116,3 +116,24 @@ Outputs live under
 `scratch.metzler-prj/OpenVid-1M_Data/data/runs/conditioning-ablations/`.
 After all evaluations finish, `summary.json` contains the checkpoint-by-condition
 loss matrix and verifies that every run used the same validation targets.
+
+## Reconstruction validation
+
+The full Stage 1 job runs a sparse decoder-level probe every 1,000 optimizer
+steps. By default it greedily reconstructs five fixed held-out slices of at
+most 2,048 bytes, reinserts each generated NAL into the original Annex-B
+stream, and logs decode rate, PSNR, and SSIM through the configured logger.
+The exact sample IDs are saved to `OUT_DIR/reconstruction_samples.json`.
+
+Override the probe cost at submission time:
+
+```bash
+RECONSTRUCTION_EVAL_INTERVAL=500 \
+RECONSTRUCTION_EVAL_SAMPLES=10 \
+RECONSTRUCTION_MAX_TARGET_BYTES=4096 \
+bash scripts/hpc/zaratan/submit_stage1.sh
+```
+
+Set `RECONSTRUCTION_EVAL_INTERVAL=0` to disable the probe. Decode failures,
+timeouts, invalid generated tokens, and unexpected probe errors are logged and
+do not terminate training.

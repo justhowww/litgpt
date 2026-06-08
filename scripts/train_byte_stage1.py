@@ -14,6 +14,7 @@ import torch
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.config import Config
 from litgpt.data.byte_data import REFERENCE_MODES, VOCAB_SIZE, ByteDataConfig, ByteDataModule
+from litgpt.eval.byte_reconstruction import ReconstructionEvalConfig
 from litgpt.pretrain import setup
 
 
@@ -42,6 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-iters", type=int, default=10)
+    parser.add_argument("--reconstruction-eval-interval", type=int, default=0)
+    parser.add_argument("--reconstruction-eval-samples", type=int, default=5)
+    parser.add_argument("--reconstruction-timeout-sec", type=int, default=30)
+    parser.add_argument("--reconstruction-max-target-bytes", type=int, default=2048)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--max-manifest-rows",
@@ -127,6 +132,16 @@ def main() -> None:
             "betas": (0.9, 0.95),
         },
     }
+    reconstruction_eval = (
+        ReconstructionEvalConfig(
+            interval=args.reconstruction_eval_interval,
+            num_samples=args.reconstruction_eval_samples,
+            timeout_sec=args.reconstruction_timeout_sec,
+            max_target_bytes=args.reconstruction_max_target_bytes,
+        )
+        if args.reconstruction_eval_interval > 0
+        else None
+    )
 
     setup(
         model_name="byte-stage1",
@@ -144,6 +159,7 @@ def main() -> None:
         logger_name=args.logger_name,
         seed=args.seed,
         compile_model=args.compile,
+        reconstruction_eval=reconstruction_eval,
     )
 
 

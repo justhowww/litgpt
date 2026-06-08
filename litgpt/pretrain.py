@@ -23,6 +23,12 @@ from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
+from litgpt.eval.byte_reconstruction import (
+    ReconstructionEvalConfig,
+    run_reconstruction_probe,
+    save_reconstruction_sample_manifest,
+    select_reconstruction_samples,
+)
 from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from litgpt.parser_config import save_hyperparameters
 from litgpt.types import LoggerChoice
@@ -73,6 +79,7 @@ def setup(
     logger_name: LoggerChoice = "tensorboard",
     seed: int = 42,
     compile_model: bool = True,
+    reconstruction_eval: ReconstructionEvalConfig | None = None,
 ):
     """Pretrain a model.
 
@@ -173,6 +180,7 @@ def setup(
         optimizer=optimizer,
         compile_model=compile_model,
         checkpoint_hparams=hparams,
+        reconstruction_eval=reconstruction_eval,
     )
 
 
@@ -193,6 +201,7 @@ def main(
     compile_model: bool = True,
     num_nodes: int = 1,
     checkpoint_hparams: dict | None = None,
+    reconstruction_eval: ReconstructionEvalConfig | None = None,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -226,6 +235,23 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
 
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
+    reconstruction_samples = (
+        select_reconstruction_samples(
+            val_dataloader.dataset,
+            reconstruction_eval.num_samples,
+            reconstruction_eval.max_target_bytes,
+        )
+        if reconstruction_eval is not None
+        else []
+    )
+    if reconstruction_eval is not None and fabric.global_rank == 0:
+        save_reconstruction_sample_manifest(
+            reconstruction_samples, out_dir / "reconstruction_samples.json"
+        )
+    if reconstruction_eval is not None and fabric.world_size != 1:
+        fabric.print("Byte reconstruction validation currently requires a single-device run; disabling it.")
+        reconstruction_eval = None
+        reconstruction_samples = []
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     if initial_checkpoint_dir:
@@ -270,6 +296,8 @@ def main(
         train=train,
         eval=eval,
         checkpoint_hparams=checkpoint_hparams,
+        reconstruction_eval=reconstruction_eval,
+        reconstruction_samples=reconstruction_samples,
     )
 
     # Save final checkpoint
@@ -313,6 +341,8 @@ def fit(
     eval: EvalArgs,
     num_nodes: int = 1,
     checkpoint_hparams: dict | None = None,
+    reconstruction_eval: ReconstructionEvalConfig | None = None,
+    reconstruction_samples: list | None = None,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -357,6 +387,7 @@ def fit(
     total_t0 = time.perf_counter()
 
     warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
+    last_reconstruction_step = -1
 
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
@@ -452,12 +483,62 @@ def fit(
                 checkpoint_hparams=checkpoint_hparams,
             )
 
+        if (
+            reconstruction_eval is not None
+            and reconstruction_samples
+            and not is_accumulating
+            and state["step_count"] % reconstruction_eval.interval == 0
+        ):
+            metrics = run_reconstruction_probe(
+                model,
+                reconstruction_samples,
+                reconstruction_eval,
+                fabric.device,
+            )
+            fabric.print(
+                "Reconstruction validation | "
+                f"decode rate: {metrics['reconstruction/decode_rate']:.2%} "
+                f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])})"
+                + (
+                    f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
+                    f"SSIM: {metrics['reconstruction/ssim_mean_valid']:.4f}"
+                    if "reconstruction/psnr_mean_valid" in metrics
+                    else ""
+                )
+            )
+            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+            last_reconstruction_step = state["step_count"]
+
     # Final validation
     if eval.final_validation:
         val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
         fabric.log_dict(metrics, step=state["iter_num"])
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+
+    if (
+        reconstruction_eval is not None
+        and reconstruction_samples
+        and last_reconstruction_step != state["step_count"]
+    ):
+        metrics = run_reconstruction_probe(
+            model,
+            reconstruction_samples,
+            reconstruction_eval,
+            fabric.device,
+        )
+        fabric.print(
+            "Final reconstruction validation | "
+            f"decode rate: {metrics['reconstruction/decode_rate']:.2%} "
+            f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])})"
+            + (
+                f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
+                f"SSIM: {metrics['reconstruction/ssim_mean_valid']:.4f}"
+                if "reconstruction/psnr_mean_valid" in metrics
+                else ""
+            )
+        )
+        fabric.log_dict(metrics, step=state["iter_num"])
 
 
 @torch.no_grad()
