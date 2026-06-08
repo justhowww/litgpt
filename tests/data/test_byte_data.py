@@ -103,6 +103,21 @@ def test_parse_annexb_nals():
     )  # NAL start/end offsets preserve the final NAL exactly.
 
 
+def test_parse_annexb_nals_mixed_start_code_lengths():
+    """Distinguishes adjacent three-byte and four-byte Annex-B start codes."""
+    first = nal(0x67, b"sps", start_code=b"\x00\x00\x01")
+    second = nal(0x68, b"pps", start_code=b"\x00\x00\x00\x01")
+    stream = first + second
+
+    nals = parse_annexb_nals(stream)
+
+    assert len(nals) == 2  # Both NAL units are discovered.
+    assert nals[0].start_code_len == 3  # Three-byte start code is preserved.
+    assert nals[1].start_code_len == 4  # Four-byte start code is preserved.
+    assert stream[nals[0].start : nals[0].end] == first  # First range is exact.
+    assert stream[nals[1].start : nals[1].end] == second  # Second range is exact.
+
+
 def test_ar_sample_layout_includes_metadata_and_reference(tmp_path):
     """Builds AR samples as [B_meta, B_ref, SLICE_BOS, B_t[:-1]] -> B_t."""
     ds = make_dataset(tmp_path, p_fim=0.0, num_ref_slices=1)

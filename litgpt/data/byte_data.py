@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -161,17 +162,21 @@ def parse_annexb_nals(data: bytes) -> list[NALUnit]:
 
 
 def _iter_start_codes(data: bytes):
-    i = 0
-    n = len(data)
-    while i + 3 < n:
-        if data[i : i + 3] == b"\x00\x00\x01":
-            yield i, 3
-            i += 3
-        elif i + 4 < n and data[i : i + 4] == b"\x00\x00\x00\x01":
-            yield i, 4
-            i += 4
+    # bytes.find performs the bulk scan in optimized C. The previous
+    # byte-by-byte Python loop became the dominant cost when indexing tens of
+    # gigabytes of H.264 files at every training startup.
+    marker = b"\x00\x00\x01"
+    search_from = 0
+    while True:
+        marker_start = data.find(marker, search_from)
+        if marker_start < 0:
+            return
+
+        if marker_start > 0 and data[marker_start - 1] == 0:
+            yield marker_start - 1, 4
         else:
-            i += 1
+            yield marker_start, 3
+        search_from = marker_start + len(marker)
 
 
 def bytes_to_ids(data: bytes) -> Tensor:
@@ -332,9 +337,14 @@ class ByteSliceDataset(Dataset):
     def _build_index(self) -> tuple[list[SliceSample], dict[str, list[NALUnit]]]:
         samples: list[SliceSample] = []
         nal_index: dict[str, list[NALUnit]] = {}
-        for row in self.rows:
+        started_at = time.perf_counter()
+        last_report_at = started_at
+        indexed_bytes = 0
+        total_rows = len(self.rows)
+        for row_number, row in enumerate(self.rows, start=1):
             path = Path(row["h264_path"])
             data = path.read_bytes()
+            indexed_bytes += len(data)
             nals = parse_annexb_nals(data)
             nal_index[str(path)] = nals
             vcl_indices = [
@@ -353,6 +363,20 @@ class ByteSliceDataset(Dataset):
                 samples.append(
                     SliceSample(path, nal_idx, refs, meta_indices, nal.nal_type)
                 )
+
+            now = time.perf_counter()
+            if now - last_report_at >= 10 or row_number == total_rows:
+                elapsed = now - started_at
+                throughput = indexed_bytes / max(elapsed, 1e-9) / 1e6
+                print(
+                    "Indexing H.264 corpus: "
+                    f"{row_number:,}/{total_rows:,} files, "
+                    f"{indexed_bytes / 1e9:.2f} GB, "
+                    f"{len(samples):,} samples, "
+                    f"{throughput:.1f} MB/s",
+                    flush=True,
+                )
+                last_report_at = now
         return samples, nal_index
 
     def _latest_parameter_set_indices(

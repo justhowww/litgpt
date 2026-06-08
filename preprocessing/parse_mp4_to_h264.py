@@ -632,9 +632,21 @@ def write_corpus_metadata(path: Path, config: PreprocessConfig) -> None:
             ),
         },
     }
-    with path.open("w", encoding="utf-8") as f:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as f:
+        tmp_path = Path(f.name)
         json.dump(payload, f, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 # -----------------------------------------------------------------------------
