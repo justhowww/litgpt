@@ -90,3 +90,29 @@ sbatch scripts/hpc/zaratan/smoke_stage1.sbatch
 The submission wrappers default to Slurm account `metzler-prj-cmsc`. This is
 distinct from the filesystem group `zt-metzler-prj`. Override it with
 `SBATCH_ACCOUNT` if the allocation changes.
+
+## Conditioning viability experiments
+
+Evaluate an existing checkpoint under correct, removed, zeroed, and shuffled
+reference conditioning. The same job also fits and evaluates a train-target
+byte-unigram baseline:
+
+```bash
+MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
+CHECKPOINT_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1/final \
+sbatch scripts/hpc/zaratan/evaluate_conditioning.sbatch
+```
+
+The report is written to `CHECKPOINT_DIR/conditioning_eval.json`.
+
+Submit matched 1,000-step training runs for correct, removed, and shuffled
+references, followed by automatic evaluation of each final checkpoint:
+
+```bash
+STEPS=1000 bash scripts/hpc/zaratan/submit_conditioning_ablations.sh
+```
+
+Outputs live under
+`scratch.metzler-prj/OpenVid-1M_Data/data/runs/conditioning-ablations/`.
+After all evaluations finish, `summary.json` contains the checkpoint-by-condition
+loss matrix and verifies that every run used the same validation targets.

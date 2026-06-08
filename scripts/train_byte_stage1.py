@@ -13,7 +13,7 @@ import torch
 
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.config import Config
-from litgpt.data.byte_data import VOCAB_SIZE, ByteDataConfig, ByteDataModule
+from litgpt.data.byte_data import REFERENCE_MODES, VOCAB_SIZE, ByteDataConfig, ByteDataModule
 from litgpt.pretrain import setup
 
 
@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-embd", type=int, default=512)
     parser.add_argument("--n-head", type=int, default=8)
     parser.add_argument("--num-ref-slices", type=int, default=1)
+    parser.add_argument("--reference-mode", choices=REFERENCE_MODES, default="normal")
     parser.add_argument("--target-nal-types", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--p-fim", type=float, default=0.0)
     parser.add_argument("--no-sps-pps-conditioning", action="store_true")
@@ -89,6 +90,7 @@ def main() -> None:
     data_config = ByteDataConfig(
         p_fim=args.p_fim,
         num_ref_slices=args.num_ref_slices,
+        reference_mode=args.reference_mode,
         target_nal_types=tuple(args.target_nal_types),
         num_workers=args.num_workers,
         condition_on_sps_pps=not args.no_sps_pps_conditioning,

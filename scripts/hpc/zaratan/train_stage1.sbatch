@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=byte-stage1
+#SBATCH --account=metzler-prj-cmsc
 #SBATCH --partition=gpu
 #SBATCH --gpus=a100:1
 #SBATCH --nodes=1
@@ -25,6 +26,7 @@ STEPS=${STEPS:-10000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
+REFERENCE_MODE=${REFERENCE_MODE:-normal}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -43,6 +45,7 @@ cmd=(
     --micro-batch-size "${MICRO_BATCH_SIZE}"
     --precision bf16-mixed
     --num-workers "${NUM_WORKERS}"
+    --reference-mode "${REFERENCE_MODE}"
     --eval-interval 250
     --eval-iters 20
     --save-interval 500

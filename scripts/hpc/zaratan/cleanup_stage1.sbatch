@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=byte-data-cleanup
+#SBATCH --account=metzler-prj-cmsc
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1

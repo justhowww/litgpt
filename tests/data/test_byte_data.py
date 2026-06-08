@@ -65,6 +65,24 @@ def make_dataset(tmp_path, **kwargs) -> ByteSliceDataset:
     )
 
 
+def make_two_video_dataset(tmp_path, reference_mode: str) -> ByteSliceDataset:
+    rows = []
+    for name, delta in (("a", 0), ("b", 10)):
+        stream, _ = synthetic_stream()
+        stream = stream.replace(bytes(range(32, 72)), bytes(range(32 + delta, 72 + delta)))
+        h264_path = tmp_path / "h264" / f"{name}.h264"
+        h264_path.parent.mkdir(parents=True, exist_ok=True)
+        h264_path.write_bytes(stream)
+        rows.append({"status": "ok", "h264_path": str(h264_path)})
+    return ByteSliceDataset(
+        rows,
+        max_seq_length=256,
+        p_fim=0.0,
+        num_ref_slices=1,
+        reference_mode=reference_mode,
+    )
+
+
 def test_parse_annexb_nals():
     """Parses Annex-B start codes and preserves exact NAL byte ranges."""
     stream, parts = synthetic_stream()
@@ -138,6 +156,36 @@ def test_metadata_can_be_disabled(tmp_path):
     assert (
         sample["sample_meta"]["num_meta_nals"] == 0
     )  # Metadata count reflects the ablation setting.
+
+
+def test_reference_ablation_modes_preserve_target_supervision(tmp_path):
+    """Changes only reference conditioning while preserving the target labels."""
+    normal = make_two_video_dataset(tmp_path / "normal", "normal")[0]
+    no_ref = make_two_video_dataset(tmp_path / "no_ref", "no_ref")[0]
+    zero_ref = make_two_video_dataset(tmp_path / "zero_ref", "zero_ref")[0]
+    shuffled = make_two_video_dataset(tmp_path / "shuffled", "shuffled_ref")[0]
+
+    supervised = normal["labels"] != IGNORE_INDEX
+    expected_labels = normal["labels"][supervised]
+    assert torch.equal(
+        no_ref["labels"][no_ref["labels"] != IGNORE_INDEX], expected_labels
+    )  # Removing references does not change the supervised target bytes.
+    assert torch.equal(
+        zero_ref["labels"][zero_ref["labels"] != IGNORE_INDEX], expected_labels
+    )  # Zeroing references does not change the supervised target bytes.
+    assert torch.equal(
+        shuffled["labels"][shuffled["labels"] != IGNORE_INDEX], expected_labels
+    )  # Shuffling references does not change the supervised target bytes.
+    assert (
+        REGION_REF not in no_ref["region_ids"].tolist()
+    )  # no_ref removes the reference region entirely.
+    assert torch.all(
+        zero_ref["input_ids"][zero_ref["region_ids"] == REGION_REF] == 0
+    )  # zero_ref preserves reference positions but replaces every byte with zero.
+    assert (
+        shuffled["sample_meta"]["reference_source_path"]
+        != shuffled["sample_meta"]["h264_path"]
+    )  # shuffled_ref selects conditioning from a different video.
 
 
 def test_relative_h264_paths_resolve_from_manifest_dir(tmp_path):

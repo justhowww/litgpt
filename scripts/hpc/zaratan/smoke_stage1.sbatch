@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=byte-stage1-smoke
+#SBATCH --account=metzler-prj-cmsc
 #SBATCH --partition=gpu
 #SBATCH --gpus=a100:1
 #SBATCH --nodes=1

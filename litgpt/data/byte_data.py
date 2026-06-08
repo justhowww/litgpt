@@ -43,6 +43,8 @@ VCL_NAL_TYPES = {1, 5}  # H.264 VCL slices: 1 = non-IDR P slice, 5 = IDR/I slice
 PARAMETER_SET_NAL_TYPES = {7, 8}  # H.264 metadata NALs: 7 = SPS, 8 = PPS.
 TASKS = ("ar", "fim")
 TaskName = Literal["ar", "fim"]
+REFERENCE_MODES = ("normal", "no_ref", "zero_ref", "shuffled_ref")
+ReferenceMode = Literal["normal", "no_ref", "zero_ref", "shuffled_ref"]
 
 
 @dataclass
@@ -51,6 +53,11 @@ class ByteDataConfig:
 
     p_fim: float = 0.0  # Probability of FIM sample; otherwise sample is AR.
     num_ref_slices: int = 1  # Number of previous VCL slices included as B_ref.
+    # Conditioning ablation. "normal" uses the target's true prior slices;
+    # "no_ref" removes them; "zero_ref" preserves their lengths with zero
+    # bytes; "shuffled_ref" uses deterministic, similarly sized slices from
+    # another video.
+    reference_mode: ReferenceMode = "normal"
     # Target VCL NAL types. Default is P slices only (type 1) because early
     # bridge recovery should test the common inter-frame packet-loss case with
     # a real reference frame. Add IDR/I slices (type 5) later for harder
@@ -204,6 +211,7 @@ class ByteSliceDataset(Dataset):
         fim_max_gap: int = 1400,
         slice_header_guard_bytes: int = 64,
         condition_on_sps_pps: bool = True,
+        reference_mode: ReferenceMode = "normal",
         include_sps_pps_metadata: bool | None = None,
         include_parameter_sets: bool | None = None,
         seed: int = 42,
@@ -215,6 +223,8 @@ class ByteSliceDataset(Dataset):
             raise ValueError("max_seq_length must be at least 4")
         if num_ref_slices < 0:
             raise ValueError("num_ref_slices must be non-negative")
+        if reference_mode not in REFERENCE_MODES:
+            raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
 
         self.rows = rows
         self.max_seq_length = max_seq_length
@@ -229,9 +239,15 @@ class ByteSliceDataset(Dataset):
         if include_sps_pps_metadata is not None:
             condition_on_sps_pps = include_sps_pps_metadata
         self.condition_on_sps_pps = condition_on_sps_pps
+        self.reference_mode = reference_mode
         self.seed = seed
         self.ignore_index = ignore_index
         self.samples, self.nal_index = self._build_index()
+        self.shuffled_ref_indices = (
+            self._build_shuffled_ref_indices()
+            if self.reference_mode == "shuffled_ref"
+            else {}
+        )
 
         if not self.samples:
             raise ValueError(
@@ -249,13 +265,69 @@ class ByteSliceDataset(Dataset):
         nals = self.nal_index[str(sample.h264_path)]
 
         meta = self._read_nal_bytes(data, nals, sample.meta_indices)
-        ref_chunks = self._read_nal_byte_chunks(data, nals, sample.ref_indices)
+        ref_chunks, reference_source_path = self._get_reference_chunks(idx, data, nals, sample)
         target_nal = nals[sample.target_index]
         target = bytes_to_ids(data[target_nal.start : target_nal.end])
 
         if self.p_fim > 0 and rng.random() < self.p_fim:
-            return self._build_fim_item(meta, ref_chunks, target, target_nal, rng, sample)
-        return self._build_ar_item(meta, ref_chunks, target, sample)
+            return self._build_fim_item(
+                meta, ref_chunks, target, target_nal, rng, sample, reference_source_path
+            )
+        return self._build_ar_item(meta, ref_chunks, target, sample, reference_source_path)
+
+    def _get_reference_chunks(
+        self, idx: int, data: bytes, nals: list[NALUnit], sample: SliceSample
+    ) -> tuple[list[Tensor], Path | None]:
+        if self.reference_mode == "no_ref":
+            return [], None
+
+        true_chunks = self._read_nal_byte_chunks(data, nals, sample.ref_indices)
+        if self.reference_mode == "zero_ref":
+            return [torch.zeros_like(chunk) for chunk in true_chunks], sample.h264_path
+        if self.reference_mode == "normal":
+            return true_chunks, sample.h264_path
+
+        source = self.samples[self.shuffled_ref_indices[idx]]
+        source_data = source.h264_path.read_bytes()
+        source_nals = self.nal_index[str(source.h264_path)]
+        return (
+            self._read_nal_byte_chunks(source_data, source_nals, source.ref_indices),
+            source.h264_path,
+        )
+
+    def _build_shuffled_ref_indices(self) -> dict[int, int]:
+        """Map each target to a similarly sized reference from another video."""
+        buckets: dict[int, list[int]] = {}
+        for idx, sample in enumerate(self.samples):
+            ref_len = self._reference_length(sample)
+            buckets.setdefault(ref_len // 1024, []).append(idx)
+
+        all_indices = list(range(len(self.samples)))
+        mapping: dict[int, int] = {}
+        for idx, sample in enumerate(self.samples):
+            candidates = buckets[self._reference_length(sample) // 1024]
+            source_idx = self._next_other_video(idx, candidates)
+            if source_idx is None:
+                source_idx = self._next_other_video(idx, all_indices)
+            if source_idx is None:
+                raise ValueError("shuffled_ref requires samples from at least two videos")
+            mapping[idx] = source_idx
+        return mapping
+
+    def _reference_length(self, sample: SliceSample) -> int:
+        nals = self.nal_index[str(sample.h264_path)]
+        return sum(nals[i].end - nals[i].start for i in sample.ref_indices)
+
+    def _next_other_video(self, idx: int, candidates: list[int]) -> int | None:
+        if not candidates:
+            return None
+        start = (self.seed + idx) % len(candidates)
+        target_path = self.samples[idx].h264_path
+        for offset in range(len(candidates)):
+            candidate_idx = candidates[(start + offset) % len(candidates)]
+            if self.samples[candidate_idx].h264_path != target_path:
+                return candidate_idx
+        return None
 
     def _build_index(self) -> tuple[list[SliceSample], dict[str, list[NALUnit]]]:
         samples: list[SliceSample] = []
@@ -332,7 +404,12 @@ class ByteSliceDataset(Dataset):
         return meta, ref, len(ref_chunks) - len(kept)
 
     def _build_ar_item(
-        self, meta: Tensor, ref_chunks: list[Tensor], target: Tensor, sample: SliceSample
+        self,
+        meta: Tensor,
+        ref_chunks: list[Tensor],
+        target: Tensor,
+        sample: SliceSample,
+        reference_source_path: Path | None,
     ) -> dict[str, Any]:
         # Teacher forcing: [SLICE_BOS, B_t[:-1]] predicts B_t.
         meta, ref, dropped_ref_slices = self._fit_conditioning_to_budget(
@@ -359,6 +436,7 @@ class ByteSliceDataset(Dataset):
             sample,
             task="ar",
             dropped_ref_slices=dropped_ref_slices,
+            reference_source_path=reference_source_path,
         )
 
     def _build_fim_item(
@@ -369,6 +447,7 @@ class ByteSliceDataset(Dataset):
         target_nal: NALUnit,
         rng: random.Random,
         sample: SliceSample,
+        reference_source_path: Path | None,
     ) -> dict[str, Any]:
         prefix, missing, orphan, split_offset = self._sample_fim_parts(
             target, target_nal, rng
@@ -415,6 +494,7 @@ class ByteSliceDataset(Dataset):
             sample,
             task="fim",
             dropped_ref_slices=dropped_ref_slices,
+            reference_source_path=reference_source_path,
         )
 
     def _sample_fim_parts(
@@ -447,6 +527,7 @@ class ByteSliceDataset(Dataset):
         sample: SliceSample,
         task: TaskName,
         dropped_ref_slices: int,
+        reference_source_path: Path | None,
     ) -> dict[str, Any]:
         return {
             "input_ids": input_ids,
@@ -462,6 +543,10 @@ class ByteSliceDataset(Dataset):
                 "h264_path": str(sample.h264_path),
                 "target_index": sample.target_index,
                 "num_ref_slices": len(sample.ref_indices),
+                "reference_mode": self.reference_mode,
+                "reference_source_path": (
+                    str(reference_source_path) if reference_source_path is not None else None
+                ),
                 "dropped_ref_slices": dropped_ref_slices,
                 "num_meta_nals": len(sample.meta_indices),
                 "nal_type": sample.nal_type,
@@ -547,6 +632,7 @@ class ByteDataModule(DataModule):
             fim_max_gap=self.config.fim_max_gap,
             slice_header_guard_bytes=self.config.slice_header_guard_bytes,
             condition_on_sps_pps=self.config.condition_on_sps_pps,
+            reference_mode=self.config.reference_mode,
             seed=self.config.seed,
         )
         val_size = max(1, int(len(dataset) * self.config.val_fraction))
