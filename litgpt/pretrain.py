@@ -496,15 +496,7 @@ def fit(
                 fabric.device,
             )
             fabric.print(
-                "Reconstruction validation | "
-                f"decode rate: {metrics['reconstruction/decode_rate']:.2%} "
-                f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])})"
-                + (
-                    f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
-                    f"SSIM: {metrics['reconstruction/ssim_mean_valid']:.4f}"
-                    if "reconstruction/psnr_mean_valid" in metrics
-                    else ""
-                )
+                format_reconstruction_metrics("Reconstruction validation", metrics)
             )
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
             last_reconstruction_step = state["step_count"]
@@ -528,17 +520,26 @@ def fit(
             fabric.device,
         )
         fabric.print(
-            "Final reconstruction validation | "
-            f"decode rate: {metrics['reconstruction/decode_rate']:.2%} "
-            f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])})"
-            + (
-                f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
-                f"SSIM: {metrics['reconstruction/ssim_mean_valid']:.4f}"
-                if "reconstruction/psnr_mean_valid" in metrics
-                else ""
-            )
+            format_reconstruction_metrics("Final reconstruction validation", metrics)
         )
         fabric.log_dict(metrics, step=state["iter_num"])
+
+
+def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
+    message = (
+        f"{label} | decode rate: {metrics['reconstruction/decode_rate']:.2%} "
+        f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])}), "
+        f"invalid generation: {int(metrics['reconstruction/invalid_generation'])}, "
+        f"timeouts: {int(metrics['reconstruction/timeouts'])}, "
+        f"missing frames: {int(metrics['reconstruction/missing_target_frames'])}, "
+        f"unexpected failures: {int(metrics['reconstruction/unexpected_failures'])}"
+    )
+    if "reconstruction/psnr_mean_valid" in metrics:
+        message += (
+            f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
+            f"SSIM: {metrics['reconstruction/ssim_mean_valid']:.4f}"
+        )
+    return message
 
 
 @torch.no_grad()

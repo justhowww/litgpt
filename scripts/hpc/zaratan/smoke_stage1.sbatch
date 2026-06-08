@@ -27,6 +27,7 @@ NUM_WORKERS=${NUM_WORKERS:-4}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-100}
 RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-10}
 RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-1}
+LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -43,6 +44,7 @@ srun python scripts/train_byte_stage1.py \
     --global-batch-size 8 \
     --micro-batch-size 1 \
     --precision bf16-mixed \
+    --logger-name "${LOGGER_NAME}" \
     --num-workers "${NUM_WORKERS}" \
     --max-manifest-rows "${MAX_MANIFEST_ROWS}" \
     --eval-interval 5 \

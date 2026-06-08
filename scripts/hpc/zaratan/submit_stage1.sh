@@ -15,7 +15,7 @@ SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-"metzler-prj-cmsc"}
 JOB_SCRIPT=${JOB_SCRIPT:-"${SCRIPT_DIR}/train_stage1.sbatch"}
 CLEANUP_AFTER_SUCCESS=${CLEANUP_AFTER_SUCCESS:-1}
 
-stage_corpus "${SOURCE_CORPUS}" "${STAGED_CORPUS}"
+# stage_corpus "${SOURCE_CORPUS}" "${STAGED_CORPUS}"
 mkdir -p "${OUT_DIR}"
 
 sbatch_args=(--parsable)

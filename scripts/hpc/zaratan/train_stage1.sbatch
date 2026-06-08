@@ -30,6 +30,7 @@ REFERENCE_MODE=${REFERENCE_MODE:-normal}
 RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
 RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-5}
 RECONSTRUCTION_MAX_TARGET_BYTES=${RECONSTRUCTION_MAX_TARGET_BYTES:-2048}
+LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -47,6 +48,7 @@ cmd=(
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --micro-batch-size "${MICRO_BATCH_SIZE}"
     --precision bf16-mixed
+    --logger-name "${LOGGER_NAME}"
     --num-workers "${NUM_WORKERS}"
     --reference-mode "${REFERENCE_MODE}"
     --eval-interval 250

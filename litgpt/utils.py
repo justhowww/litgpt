@@ -574,9 +574,9 @@ def choose_logger(
     if logger_name == "tensorboard":
         return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", **kwargs)
     if logger_name == "wandb":
-        project = log_args.pop("project", name)
-        run = log_args.pop("run", os.environ.get("WANDB_RUN_NAME"))
-        group = log_args.pop("group", os.environ.get("WANDB_RUN_GROUP"))
+        project = log_args.pop("project", None) or os.environ.get("WANDB_PROJECT") or name
+        run = log_args.pop("run", None) or os.environ.get("WANDB_RUN_NAME")
+        group = log_args.pop("group", None) or os.environ.get("WANDB_RUN_GROUP")
         return WandbLogger(project=project, name=run, group=group, resume=resume, **kwargs)
     if logger_name == "mlflow":
         return MLFlowLogger(experiment_name=name, **kwargs)
