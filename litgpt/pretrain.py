@@ -268,7 +268,9 @@ def main(
     resume = find_resume_path(resume, out_dir)
     if resume:
         fabric.print(f"Resuming training from {resume}")
-        fabric.load(resume, state)
+        # Stage-1 checkpoints are trusted local artifacts and contain optimizer
+        # and DataLoader state, which PyTorch 2.6's weights-only loader rejects.
+        fabric.load(resume, state, weights_only=False)
 
     train_time = time.perf_counter()
 
