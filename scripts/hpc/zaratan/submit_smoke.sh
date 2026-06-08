@@ -13,7 +13,7 @@ OUT_DIR=${OUT_DIR:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data/runs/
 SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-"metzler-prj-cmsc"}
 
 echo "Starting corpus staging..."
-stage_corpus "${SOURCE_CORPUS}" "${STAGED_CORPUS}"
+# stage_corpus "${SOURCE_CORPUS}" "${STAGED_CORPUS}"
 echo "Corpus staging complete."
 mkdir -p "${OUT_DIR}"
 
