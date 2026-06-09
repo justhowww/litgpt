@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=byte-stage1
+#SBATCH --job-name=byte-stage1-h100
 #SBATCH --account=metzler-prj-cmsc
 #SBATCH --partition=gpu
-#SBATCH --gpus=a100:1
+#SBATCH --gpus=h100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -12,15 +12,14 @@
 
 set -euo pipefail
 
-# Slurm executes a spool copy of this file, so BASH_SOURCE does not point into
-# the repository. Resolve cluster helpers from the submitted repository root.
+# H100 variant of train_stage1.sbatch. Training hyperparameters intentionally
+# match the A100 job so checkpoints and curves remain comparable.
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 
 : "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
 
 OUT_DIR=${OUT_DIR:-"${PROJECT_SCRATCH}/runs/byte-stage1"}
-# Preliminary scan: 16K kept full context for 93.42% of samples with no target exclusion.
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 STEPS=${STEPS:-10000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
@@ -61,8 +60,8 @@ cmd=(
     --resume
 )
 
-# Prevent two queued hardware variants from resuming and writing the same
-# checkpoint directory if they become runnable at the same time.
+# The A100 and H100 jobs may share OUT_DIR to continue the same experiment.
+# Only one is allowed to hold the checkpoint writer lock.
 flock -n "${OUT_DIR}/.training.lock" srun "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2
     exit 1
