@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-eval-samples", type=int, default=5)
     parser.add_argument("--reconstruction-timeout-sec", type=int, default=30)
     parser.add_argument("--reconstruction-max-target-bytes", type=int, default=2048)
+    parser.add_argument(
+        "--ffmpeg-binary",
+        default="ffmpeg",
+        help="FFmpeg executable used by reconstruction validation.",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--max-manifest-rows",
@@ -148,6 +153,7 @@ def main() -> None:
             num_samples=args.reconstruction_eval_samples,
             timeout_sec=args.reconstruction_timeout_sec,
             max_target_bytes=args.reconstruction_max_target_bytes,
+            ffmpeg_binary=args.ffmpeg_binary,
         )
         if args.reconstruction_eval_interval > 0
         else None

@@ -36,6 +36,7 @@ RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
 RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-5}
 RECONSTRUCTION_MAX_TARGET_BYTES=${RECONSTRUCTION_MAX_TARGET_BYTES:-2048}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
+FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -44,6 +45,10 @@ fi
 if [[ ! -r "${NAL_INDEX}" ]]; then
     echo "NAL index is not readable: ${NAL_INDEX}" >&2
     echo "Build it with scripts/hpc/zaratan/submit_byte_nal_index.sh before training." >&2
+    exit 1
+fi
+if [[ ! -x "${FFMPEG_BINARY}" ]]; then
+    echo "FFmpeg executable is not available: ${FFMPEG_BINARY}" >&2
     exit 1
 fi
 
@@ -67,6 +72,7 @@ cmd=(
     --reconstruction-eval-interval "${RECONSTRUCTION_EVAL_INTERVAL}"
     --reconstruction-eval-samples "${RECONSTRUCTION_EVAL_SAMPLES}"
     --reconstruction-max-target-bytes "${RECONSTRUCTION_MAX_TARGET_BYTES}"
+    --ffmpeg-binary "${FFMPEG_BINARY}"
     --save-interval 500
     --compile
     --resume
