@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 
+import pytest
 import torch
 
 from litgpt.data.byte_data import (
@@ -19,12 +21,15 @@ from litgpt.data.byte_data import (
     ByteDataModule,
     ByteSliceDataset,
     collate_byte_samples,
+    default_nal_index_path,
+    load_nal_index,
     load_manifest_rows,
     parse_annexb_nals,
 )
 from litgpt.config import Config
 from litgpt.model import GPT
 from litgpt.pretrain import get_model_inputs_and_targets
+from scripts.build_byte_nal_index import build_index
 
 
 def nal(
@@ -344,6 +349,46 @@ def test_byte_data_module_smoke(tmp_path):
     assert (
         batch["input_ids"].shape == batch["labels"].shape
     )  # Batch input/label tensors are token-aligned.
+
+
+def test_data_module_uses_persistent_nal_index_without_reading_streams(
+    tmp_path, monkeypatch
+):
+    """Loads NAL offsets from SQLite instead of rescanning every H.264 file."""
+    stream, _ = synthetic_stream()
+    manifest_path, _ = write_manifest(tmp_path, stream)
+    index_path = default_nal_index_path(manifest_path)
+    build_index(manifest_path, index_path, workers=1, rebuild=True)
+
+    def fail_read_bytes(self):
+        raise AssertionError(f"Dataset setup rescanned H.264 bytes from {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    config = ByteDataConfig(num_workers=0, val_fraction=0.5)
+    dm = ByteDataModule(
+        manifest_path=manifest_path,
+        config=config,
+        nal_index_path=index_path,
+    )
+    dm.connect(batch_size=1, max_seq_length=256)
+
+    dm.setup()
+
+    assert dm.train_dataset is not None  # Cached offsets produce the train split.
+    assert dm.val_dataset is not None  # Cached offsets produce the validation split.
+
+
+def test_stale_nal_index_is_rejected_when_manifest_changes(tmp_path):
+    """Requires rebuilding the cache after the corpus manifest is modified."""
+    stream, _ = synthetic_stream()
+    manifest_path, _ = write_manifest(tmp_path, stream)
+    index_path = default_nal_index_path(manifest_path)
+    build_index(manifest_path, index_path, workers=1, rebuild=True)
+    rows = load_manifest_rows(manifest_path)
+    manifest_path.write_text(manifest_path.read_text() + "\n")
+
+    with pytest.raises(RuntimeError, match="Stale NAL index"):
+        load_nal_index(index_path, manifest_path, rows)
 
 
 def test_pretrain_batch_helper_preserves_byte_labels(tmp_path):

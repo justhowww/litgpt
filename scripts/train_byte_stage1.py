@@ -21,6 +21,15 @@ from litgpt.pretrain import setup
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
+    parser.add_argument(
+        "--nal-index-path",
+        type=Path,
+        default=None,
+        help=(
+            "Precomputed SQLite NAL index. When omitted, the data module uses "
+            "nal_index.sqlite next to the manifest if it exists."
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("out/byte-stage1"))
     parser.add_argument(
         "--block-size",
@@ -106,6 +115,7 @@ def main() -> None:
         manifest_path=args.manifest,
         config=data_config,
         max_manifest_rows=max_manifest_rows,
+        nal_index_path=args.nal_index_path,
     )
     train = TrainArgs(
         save_interval=args.save_interval,

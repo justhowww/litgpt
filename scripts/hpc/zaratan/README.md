@@ -6,6 +6,24 @@ These wrappers keep Zaratan/Slurm configuration separate from the portable
 The manifest and its sibling `h264/` directory must be available from compute
 nodes, preferably under project scratch rather than `SHELL`.
 
+## Build the NAL index
+
+Build the persistent NAL-offset cache once on a CPU node before submitting
+training:
+
+```bash
+bash scripts/hpc/zaratan/submit_byte_nal_index.sh
+```
+
+The default output is
+`/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/nal_index.sqlite`.
+The build commits every 100 files, so rerunning the same command resumes after
+an interruption. Set `REBUILD_INDEX=1` only when a full rebuild is required.
+
+Training validates the index against the manifest and exits before allocating
+model memory if the cache is missing, incomplete, or stale. A limited
+`--max-manifest-rows` debug run reads only those files' rows from SQLite.
+
 ## Stage and submit
 
 The source corpus currently lives under storage that compute nodes cannot see.
@@ -62,6 +80,7 @@ Override with `STAGED_GROUP` if needed.
 
 ```bash
 MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
+NAL_INDEX=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/nal_index.sqlite \
 OUT_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \

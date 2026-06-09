@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,8 @@ REGION_PAD = 6  # Region id for padded batch positions.
 
 VCL_NAL_TYPES = {1, 5}  # H.264 VCL slices: 1 = non-IDR P slice, 5 = IDR/I slice.
 PARAMETER_SET_NAL_TYPES = {7, 8}  # H.264 metadata NALs: 7 = SPS, 8 = PPS.
+NAL_INDEX_VERSION = 1
+DEFAULT_NAL_INDEX_NAME = "nal_index.sqlite"
 TASKS = ("ar", "fim")
 TaskName = Literal["ar", "fim"]
 REFERENCE_MODES = ("normal", "no_ref", "zero_ref", "shuffled_ref")
@@ -144,6 +147,88 @@ def resolve_manifest_path(path: str | Path, manifest_dir: Path) -> Path:
     return manifest_dir / "h264" / path
 
 
+def default_nal_index_path(manifest_path: Path) -> Path:
+    return manifest_path.with_name(DEFAULT_NAL_INDEX_NAME)
+
+
+def load_nal_index(
+    index_path: Path, manifest_path: Path, rows: list[dict[str, Any]]
+) -> dict[str, list[NALUnit]]:
+    """Load precomputed NAL offsets after validating the source manifest."""
+    manifest_stat = manifest_path.stat()
+    wanted_paths = {str(Path(row["h264_path"])) for row in rows}
+    nal_index: dict[str, list[NALUnit]] = {path: [] for path in wanted_paths}
+
+    with sqlite3.connect(index_path) as connection:
+        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+        expected = {
+            "version": str(NAL_INDEX_VERSION),
+            "manifest_path": str(manifest_path.resolve()),
+            "manifest_size": str(manifest_stat.st_size),
+            "manifest_mtime_ns": str(manifest_stat.st_mtime_ns),
+        }
+        mismatches = [
+            key for key, value in expected.items() if metadata.get(key) != value
+        ]
+        if mismatches:
+            raise RuntimeError(
+                f"Stale NAL index {index_path}; metadata differs for "
+                f"{', '.join(mismatches)}. Rebuild the index."
+            )
+
+        indexed_file_count = connection.execute(
+            "SELECT COUNT(*) FROM files"
+        ).fetchone()[0]
+        indexed_paths = {
+            path for (path,) in connection.execute("SELECT path FROM files")
+        }
+        missing = wanted_paths - indexed_paths
+        if missing:
+            example = next(iter(missing))
+            raise RuntimeError(
+                f"NAL index {index_path} is missing {len(missing):,} manifest files, "
+                f"for example {example}. Resume the index build."
+            )
+
+        base_query = """
+            SELECT files.path, nals.start, nals.end, nals.start_code_len, nals.nal_type
+            FROM nals
+            JOIN files ON files.id = nals.file_id
+        """
+        if len(wanted_paths) == indexed_file_count:
+            queries = [
+                (base_query + " ORDER BY files.id, nals.nal_index", ())
+            ]
+        else:
+            wanted_list = list(wanted_paths)
+            queries = []
+            for start in range(0, len(wanted_list), 900):
+                path_chunk = wanted_list[start : start + 900]
+                placeholders = ",".join("?" for _ in path_chunk)
+                queries.append(
+                    (
+                        base_query
+                        + f" WHERE files.path IN ({placeholders})"
+                        + " ORDER BY files.id, nals.nal_index",
+                        path_chunk,
+                    )
+                )
+
+        for query, parameters in queries:
+            for path, start, end, start_code_len, nal_type in connection.execute(
+                query, parameters
+            ):
+                nal_index[path].append(
+                    NALUnit(start, end, start_code_len, nal_type)
+                )
+
+    print(
+        f"Loaded cached H.264 NAL index: {len(nal_index):,} files from {index_path}",
+        flush=True,
+    )
+    return nal_index
+
+
 def parse_annexb_nals(data: bytes) -> list[NALUnit]:
     starts = list(_iter_start_codes(data))
     nals: list[NALUnit] = []
@@ -219,6 +304,7 @@ class ByteSliceDataset(Dataset):
         reference_mode: ReferenceMode = "normal",
         include_sps_pps_metadata: bool | None = None,
         include_parameter_sets: bool | None = None,
+        nal_index: dict[str, list[NALUnit]] | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
     ) -> None:
@@ -247,7 +333,7 @@ class ByteSliceDataset(Dataset):
         self.reference_mode = reference_mode
         self.seed = seed
         self.ignore_index = ignore_index
-        self.samples, self.nal_index = self._build_index()
+        self.samples, self.nal_index = self._build_index(nal_index)
         self.shuffled_ref_indices = (
             self._build_shuffled_ref_indices()
             if self.reference_mode == "shuffled_ref"
@@ -334,19 +420,30 @@ class ByteSliceDataset(Dataset):
                 return candidate_idx
         return None
 
-    def _build_index(self) -> tuple[list[SliceSample], dict[str, list[NALUnit]]]:
+    def _build_index(
+        self, cached_nal_index: dict[str, list[NALUnit]] | None
+    ) -> tuple[list[SliceSample], dict[str, list[NALUnit]]]:
         samples: list[SliceSample] = []
-        nal_index: dict[str, list[NALUnit]] = {}
+        nal_index = cached_nal_index if cached_nal_index is not None else {}
         started_at = time.perf_counter()
         last_report_at = started_at
         indexed_bytes = 0
         total_rows = len(self.rows)
         for row_number, row in enumerate(self.rows, start=1):
             path = Path(row["h264_path"])
-            data = path.read_bytes()
-            indexed_bytes += len(data)
-            nals = parse_annexb_nals(data)
-            nal_index[str(path)] = nals
+            path_key = str(path)
+            if cached_nal_index is None:
+                data = path.read_bytes()
+                indexed_bytes += len(data)
+                nals = parse_annexb_nals(data)
+                nal_index[path_key] = nals
+            else:
+                try:
+                    nals = nal_index[path_key]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Cached NAL index has no entry for {path}"
+                    ) from exc
             vcl_indices = [
                 i for i, nal in enumerate(nals) if nal.nal_type in VCL_NAL_TYPES
             ]
@@ -365,7 +462,9 @@ class ByteSliceDataset(Dataset):
                 )
 
             now = time.perf_counter()
-            if now - last_report_at >= 10 or row_number == total_rows:
+            if cached_nal_index is None and (
+                now - last_report_at >= 10 or row_number == total_rows
+            ):
                 elapsed = now - started_at
                 throughput = indexed_bytes / max(elapsed, 1e-9) / 1e6
                 print(
@@ -616,6 +715,7 @@ class ByteDataModule(DataModule):
     manifest_path: Path
     config: ByteDataConfig = field(default_factory=ByteDataConfig)
     max_manifest_rows: int | None = None  # Optional corpus limit for smoke/debug runs.
+    nal_index_path: Path | None = None  # Defaults to manifest_dir/nal_index.sqlite when present.
 
     batch_size: int = field(default=1, init=False, repr=False)
     max_seq_length: int = field(
@@ -627,6 +727,8 @@ class ByteDataModule(DataModule):
     def __post_init__(self) -> None:
         super().__init__()
         self.manifest_path = Path(self.manifest_path)
+        if self.nal_index_path is not None:
+            self.nal_index_path = Path(self.nal_index_path)
 
     def connect(
         self,
@@ -646,6 +748,14 @@ class ByteDataModule(DataModule):
 
     def setup(self, stage: str = "") -> None:
         rows = load_manifest_rows(self.manifest_path, max_rows=self.max_manifest_rows)
+        index_path = self.nal_index_path or default_nal_index_path(self.manifest_path)
+        nal_index = (
+            load_nal_index(index_path, self.manifest_path, rows)
+            if index_path.is_file()
+            else None
+        )
+        if self.nal_index_path is not None and nal_index is None:
+            raise FileNotFoundError(f"NAL index does not exist: {index_path}")
         dataset = ByteSliceDataset(
             rows,
             max_seq_length=self.max_seq_length,
@@ -657,6 +767,7 @@ class ByteDataModule(DataModule):
             slice_header_guard_bytes=self.config.slice_header_guard_bytes,
             condition_on_sps_pps=self.config.condition_on_sps_pps,
             reference_mode=self.config.reference_mode,
+            nal_index=nal_index,
             seed=self.config.seed,
         )
         val_size = max(1, int(len(dataset) * self.config.val_fraction))

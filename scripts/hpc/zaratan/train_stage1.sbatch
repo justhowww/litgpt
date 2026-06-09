@@ -24,6 +24,7 @@ source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 : "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
 
 OUT_DIR=${OUT_DIR:-"${PROJECT_SCRATCH}/runs/byte-stage1"}
+NAL_INDEX=${NAL_INDEX:-"$(dirname "${MANIFEST}")/nal_index.sqlite"}
 # Preliminary scan: 16K kept full context for 93.42% of samples with no target exclusion.
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 STEPS=${STEPS:-10000}
@@ -40,12 +41,18 @@ if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
     exit 1
 fi
+if [[ ! -r "${NAL_INDEX}" ]]; then
+    echo "NAL index is not readable: ${NAL_INDEX}" >&2
+    echo "Build it with scripts/hpc/zaratan/submit_byte_nal_index.sh before training." >&2
+    exit 1
+fi
 
 mkdir -p "${OUT_DIR}"
 
 cmd=(
     python scripts/train_byte_stage1.py
     "${MANIFEST}"
+    --nal-index-path "${NAL_INDEX}"
     --out-dir "${OUT_DIR}"
     --block-size "${BLOCK_SIZE}"
     --steps "${STEPS}"
