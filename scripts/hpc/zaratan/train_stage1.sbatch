@@ -12,6 +12,10 @@
 
 set -euo pipefail
 
+# Ensure nested srun steps inherit this batch environment rather than any
+# restrictive export mode attached to the allocation.
+export SLURM_EXPORT_ENV=ALL
+
 # Slurm executes a spool copy of this file, so BASH_SOURCE does not point into
 # the repository. Resolve cluster helpers from the submitted repository root.
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}

@@ -12,6 +12,10 @@
 
 set -euo pipefail
 
+# Ensure nested srun steps inherit this batch environment rather than any
+# restrictive export mode attached to the allocation.
+export SLURM_EXPORT_ENV=ALL
+
 # H100 variant of train_stage1.sbatch. Training hyperparameters intentionally
 # match the A100 job so checkpoints and curves remain comparable.
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
