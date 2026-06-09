@@ -334,8 +334,10 @@ def run_reconstruction_probe(
     ssim_values: list[float] = []
 
     for sample in samples:
+        stage = "read_stream"
         try:
             stream = sample.h264_path.read_bytes()
+            stage = "decode_reference"
             reference, reference_status = decode_frame(
                 stream, sample.frame_index, config.ffmpeg_binary, config.timeout_sec
             )
@@ -344,11 +346,14 @@ def run_reconstruction_probe(
                 missing_frames += int(reference_status != "timeout")
                 continue
 
+            stage = "generate_target"
             generated = generate_target_slice(model, sample, device)
             if generated is None:
                 invalid_generation += 1
                 continue
+            stage = "replace_target"
             reconstructed_stream = replace_target_nal(stream, sample, generated)
+            stage = "decode_reconstruction"
             reconstruction, status = decode_frame(
                 reconstructed_stream,
                 sample.frame_index,
@@ -360,13 +365,23 @@ def run_reconstruction_probe(
                 missing_frames += int(status != "timeout")
                 continue
 
+            stage = "compute_metrics"
             decoded += 1
             psnr_values.append(image_psnr(reference, reconstruction))
             ssim_values.append(image_ssim(reference, reconstruction))
-        except Exception:
+        except Exception as exc:
             # Reconstruction validation is diagnostic and must never terminate
-            # a long training run. The aggregate counter makes failures visible.
+            # a long training run. Print the concrete failure because the
+            # aggregate counter alone cannot distinguish model failures from a
+            # broken evaluator.
             unexpected_failures += 1
+            if unexpected_failures <= 3:
+                print(
+                    "Reconstruction probe error "
+                    f"[{stage}] {sample.h264_path} frame={sample.frame_index}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
     metrics = {
         "reconstruction/attempted": float(attempted),

@@ -104,7 +104,7 @@ def write_file_index(
 def build_index(
     manifest_path: Path, index_path: Path, workers: int, rebuild: bool
 ) -> None:
-    rows = load_manifest_rows(manifest_path)
+    rows = load_manifest_rows(manifest_path, report_progress=True)
     paths = list(dict.fromkeys(str(Path(row["h264_path"])) for row in rows))
     index_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -106,12 +106,15 @@ class SliceSample:
 
 
 def load_manifest_rows(
-    manifest_path: Path, max_rows: int | None = None
+    manifest_path: Path,
+    max_rows: int | None = None,
+    report_progress: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     manifest_dir = manifest_path.parent
+    started_at = time.perf_counter()
     with manifest_path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             if not line.strip():
                 continue
             row = json.loads(line)
@@ -121,8 +124,21 @@ def load_manifest_rows(
                 rows.append(row)
                 if max_rows is not None and len(rows) >= max_rows:
                     break
+            if report_progress and line_number % 10_000 == 0:
+                elapsed = time.perf_counter() - started_at
+                print(
+                    f"Reading manifest: {line_number:,} rows, "
+                    f"{len(rows):,} usable, {elapsed:.1f}s",
+                    flush=True,
+                )
     if not rows:
         raise ValueError(f"No usable rows found in manifest: {manifest_path}")
+    if report_progress:
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"Manifest loaded: {len(rows):,} usable rows in {elapsed:.1f}s",
+            flush=True,
+        )
     return rows
 
 
@@ -132,7 +148,10 @@ def resolve_manifest_path(path: str | Path, manifest_dir: Path) -> Path:
         return path
 
     direct = manifest_dir / path
-    if direct.exists() or path.parts[:1] == ("h264",):
+    # Normal corpus paths begin with h264/. Check this syntactically before
+    # touching the filesystem; calling exists() for every manifest row causes
+    # a metadata-bound scan over large corpora before indexing even starts.
+    if path.parts[:1] == ("h264",) or direct.exists():
         return direct
 
     # Backward compatibility for manifests produced from a relative output_dir,
