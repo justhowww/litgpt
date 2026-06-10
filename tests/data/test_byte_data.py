@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from litgpt.data.byte_data import (
+    FIM_BEGIN_ID,
+    FIM_END_ID,
+    FIM_HOLE_ID,
     IGNORE_INDEX,
     PAD_ID,
     REGION_BRIDGE,
@@ -25,6 +28,7 @@ from litgpt.data.byte_data import (
     load_nal_index,
     load_manifest_rows,
     parse_annexb_nals,
+    vocab_size_for_fim_format,
 )
 from litgpt.config import Config
 from litgpt.model import GPT
@@ -287,6 +291,47 @@ def test_fim_sample_supervises_only_missing_span(tmp_path):
     assert torch.all(
         labels[~supervised] == IGNORE_INDEX
     )  # Conditioning tokens are excluded from loss.
+
+
+def test_psm_fim_layout_uses_explicit_prefix_suffix_middle_markers(tmp_path):
+    """Builds DeepSeek-style Prefix-Suffix-Middle ordering with masked loss."""
+    ds = make_dataset(
+        tmp_path,
+        p_fim=1.0,
+        fim_format="psm",
+        num_ref_slices=1,
+        fim_min_gap=4,
+        fim_max_gap=4,
+        slice_header_guard_bytes=2,
+    )
+    sample = ds[0]
+    input_ids = sample["input_ids"]
+    labels = sample["labels"]
+    supervised = labels != IGNORE_INDEX
+
+    begin_pos = input_ids.tolist().index(FIM_BEGIN_ID)
+    hole_pos = input_ids.tolist().index(FIM_HOLE_ID)
+    end_pos = input_ids.tolist().index(FIM_END_ID)
+
+    assert (
+        begin_pos < hole_pos < end_pos
+    )  # PSM markers appear in causal generation order.
+    assert (
+        input_ids[supervised][0].item() == FIM_END_ID
+    )  # FIM_END predicts the first missing byte.
+    assert (
+        input_ids[supervised][1:].tolist() == labels[supervised][:-1].tolist()
+    )  # Missing bytes use the same one-token teacher-forcing shift.
+    assert int(supervised.sum()) == 4  # Marker changes do not change gap supervision.
+    assert (
+        sample["sample_meta"]["fim_format"] == "psm"
+    )  # Sample metadata records the selected FIM representation.
+    assert (
+        vocab_size_for_fim_format("bridge") == VOCAB_SIZE
+    )  # Existing checkpoints remain shape-compatible.
+    assert (
+        vocab_size_for_fim_format("psm") == 262
+    )  # PSM enables all three additional markers.
 
 
 def test_reference_slices_are_dropped_whole_when_context_is_tight(tmp_path):

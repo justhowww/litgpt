@@ -18,6 +18,7 @@ from litgpt.data.byte_data import (
     IGNORE_INDEX,
     REGION_BRIDGE,
     REGION_TARGET,
+    SEQ_EOS_ID,
     VCL_NAL_TYPES,
     ByteSliceDataset,
 )
@@ -51,6 +52,9 @@ class ReconstructionSample:
     replacement_end: int | None = None
     generation_region_id: int = REGION_TARGET
     generation_offset_start: int = 0
+    # When set, greedy decoding stops as soon as this token is produced (the
+    # learned SEQ_EOS marker). target_length then acts as a generation cap.
+    stop_token: int | None = None
 
 
 def select_reconstruction_samples(
@@ -70,13 +74,16 @@ def select_reconstruction_samples(
     if not isinstance(base_dataset, ByteSliceDataset):
         return []
 
+    use_eos = bool(getattr(base_dataset, "use_eos", False))
     selected: list[ReconstructionSample] = []
     for idx in indices:
         item = base_dataset[idx]
         if item["sample_meta"]["task"] != task:
             continue
         supervised = item["labels"] != IGNORE_INDEX
-        target_length = int(supervised.sum())
+        # When use_eos is on the final supervised label is SEQ_EOS, which is not
+        # a real byte; exclude it from the reconstructed span length.
+        target_length = int(supervised.sum()) - (1 if use_eos else 0)
         if target_length <= 0 or target_length > max_target_bytes:
             continue
         first_target_input = int(supervised.nonzero()[0])
@@ -114,6 +121,7 @@ def select_reconstruction_samples(
                 generation_offset_start=(
                     replacement_start + 1 if task == "fim" else prompt_end
                 ),
+                stop_token=SEQ_EOS_ID if use_eos else None,
             )
         )
         if len(selected) >= num_samples:
@@ -166,9 +174,19 @@ def generate_target_slice(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
     prompt_length = prompt.size(1)
-    max_sequence_length = prompt_length + sample.target_length - 1
-    if max_sequence_length > raw_model.max_seq_length:
+    # Generation must at least fit the oracle-length span.
+    if prompt_length + sample.target_length - 1 > raw_model.max_seq_length:
         return None
+    # With a learned EOS the model decides when to stop, so allow headroom past
+    # the oracle length; this lets the probe observe over-runs, not just early
+    # stops. Without EOS the oracle length is an exact count (unchanged).
+    if sample.stop_token is not None:
+        max_new = min(
+            2 * sample.target_length,
+            raw_model.max_seq_length - prompt_length + 1,
+        )
+    else:
+        max_new = sample.target_length
 
     generated: list[int] = []
     cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
@@ -192,12 +210,15 @@ def generate_target_slice(
                 region_ids=region_ids,
                 offset_ids=offset_ids,
             )
-        for generated_idx in range(sample.target_length):
+        for generated_idx in range(max_new):
             token = int(logits[0, -1, : raw_model.config.vocab_size].argmax())
+            if sample.stop_token is not None and token == sample.stop_token:
+                # Model chose to terminate the span on its own.
+                break
             if token >= BYTE_VOCAB_SIZE:
                 return None
             generated.append(token)
-            if generated_idx == sample.target_length - 1:
+            if generated_idx == max_new - 1:
                 break
 
             position = prompt_length + generated_idx
@@ -371,6 +392,9 @@ def run_reconstruction_probe(
     unexpected_failures = 0
     psnr_values: list[float] = []
     ssim_values: list[float] = []
+    # (generated_length, oracle_length) pairs, recorded only for EOS samples so
+    # the model's own stopping behavior can be scored independently of PSNR.
+    stop_records: list[tuple[int, int]] = []
 
     for sample in samples:
         stage = "read_stream"
@@ -390,6 +414,8 @@ def run_reconstruction_probe(
             if generated is None:
                 invalid_generation += 1
                 continue
+            if sample.stop_token is not None:
+                stop_records.append((len(generated), sample.target_length))
             stage = "replace_target"
             reconstructed_stream = replace_target_nal(stream, sample, generated)
             stage = "decode_reconstruction"
@@ -431,6 +457,12 @@ def run_reconstruction_probe(
         "reconstruction/missing_target_frames": float(missing_frames),
         "reconstruction/unexpected_failures": float(unexpected_failures),
     }
+    if stop_records:
+        abs_errs = [abs(gen_len - oracle) for gen_len, oracle in stop_records]
+        metrics["reconstruction/gen_len_abs_err_mean"] = sum(abs_errs) / len(abs_errs)
+        metrics["reconstruction/stop_exact_rate"] = sum(
+            gen_len == oracle for gen_len, oracle in stop_records
+        ) / len(stop_records)
     if psnr_values:
         finite_psnr = [value for value in psnr_values if math.isfinite(value)]
         metrics["reconstruction/psnr_mean_valid"] = (

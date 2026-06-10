@@ -1,0 +1,36 @@
+#!/bin/bash
+# Submit Stage 2 PSM (+EOS) mixed AR/FIM pretraining from scratch on Zaratan.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)
+
+STAGED_CORPUS=${STAGED_CORPUS:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data"}
+FIM_FORMAT=${FIM_FORMAT:-psm}
+USE_EOS=${USE_EOS:-1}
+if [[ "${USE_EOS}" == "1" ]]; then
+    EOS_TAG="-eos"
+else
+    EOS_TAG=""
+fi
+MODEL_NAME=${MODEL_NAME:-"byte-stage2-fim-psm${EOS_TAG}"}
+OUT_DIR=${OUT_DIR:-"${STAGED_CORPUS}/runs/byte-stage2-fim-psm${EOS_TAG}"}
+SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-"metzler-prj-cmsc"}
+JOB_SCRIPT=${JOB_SCRIPT:-"${SCRIPT_DIR}/train_a100.sbatch"}
+
+MANIFEST=${MANIFEST:-"${STAGED_CORPUS}/manifest.jsonl"}
+NAL_INDEX=${NAL_INDEX:-"${STAGED_CORPUS}/nal_index.sqlite"}
+export REPO_ROOT MANIFEST NAL_INDEX OUT_DIR FIM_FORMAT MODEL_NAME USE_EOS
+
+mkdir -p "${OUT_DIR}"
+
+job_id=$(
+    sbatch \
+        --parsable \
+        --export=ALL \
+        --account="${SBATCH_ACCOUNT}" \
+        "${JOB_SCRIPT}"
+)
+echo "Submitted Stage 2 PSM FIM job ${job_id} (USE_EOS=${USE_EOS})"
+echo "Output directory: ${OUT_DIR}"

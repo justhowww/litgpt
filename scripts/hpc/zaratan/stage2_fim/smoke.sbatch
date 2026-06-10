@@ -25,6 +25,8 @@ OUT_DIR=${OUT_DIR:-"$(dirname "${MANIFEST}")/runs/byte-stage2-fim-smoke"}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-100}
 P_FIM=${P_FIM:-0.5}
+FIM_FORMAT=${FIM_FORMAT:-bridge}
+MODEL_NAME=${MODEL_NAME:-byte-stage2-fim-smoke}
 FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
 
 if [[ ! -x "${FFMPEG_BINARY}" ]]; then
@@ -36,7 +38,7 @@ mkdir -p "${OUT_DIR}"
 
 srun python scripts/train_byte_stage1.py \
     "${MANIFEST}" \
-    --model-name byte-stage2-fim-smoke \
+    --model-name "${MODEL_NAME}" \
     --nal-index-path "${NAL_INDEX}" \
     --out-dir "${OUT_DIR}" \
     --block-size "${BLOCK_SIZE}" \
@@ -48,6 +50,7 @@ srun python scripts/train_byte_stage1.py \
     --num-workers 4 \
     --max-manifest-rows "${MAX_MANIFEST_ROWS}" \
     --p-fim "${P_FIM}" \
+    --fim-format "${FIM_FORMAT}" \
     --eval-interval 5 \
     --eval-iters 2 \
     --reconstruction-task both \

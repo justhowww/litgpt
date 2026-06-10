@@ -23,6 +23,7 @@ from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
+from litgpt.data.byte_data import IGNORE_INDEX, REGION_BRIDGE, REGION_TARGET
 from litgpt.eval.byte_reconstruction import (
     ReconstructionEvalConfig,
     run_reconstruction_probe,
@@ -359,7 +360,7 @@ def fit(
     optimizer = state["optimizer"]
 
     if eval.initial_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+        val_loss, _ = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         val_loss = f"{val_loss:.3f}"
     else:
         fabric.print("Verifying settings ...")
@@ -476,12 +477,19 @@ def fit(
 
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
             t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+            val_loss, task_losses = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
             val_loss = val_loss.item()
             td = time.perf_counter() - t0
 
-            fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
+            task_summary = "".join(f", {name}: {tl:.4f}" for name, tl in task_losses.items())
+            fabric.print(
+                f"iter {state['iter_num']}: val loss {val_loss:.4f}{task_summary}, "
+                f"val time: {td * 1000:.2f} ms"
+            )
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+            for name, tl in task_losses.items():
+                metrics[f"val_loss_{name}"] = tl
+                metrics[f"val_ppl_{name}"] = math.exp(tl)
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
             fabric.barrier()
 
@@ -523,8 +531,11 @@ def fit(
 
     # Final validation
     if eval.final_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+        val_loss, task_losses = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+        for name, tl in task_losses.items():
+            metrics[f"val_loss_{name}"] = tl
+            metrics[f"val_ppl_{name}"] = math.exp(tl)
         fabric.log_dict(metrics, step=state["iter_num"])
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
@@ -572,6 +583,11 @@ def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
         f"missing frames: {int(metrics['reconstruction/missing_target_frames'])}, "
         f"unexpected failures: {int(metrics['reconstruction/unexpected_failures'])}"
     )
+    if "reconstruction/stop_exact_rate" in metrics:
+        message += (
+            f", stop exact: {metrics['reconstruction/stop_exact_rate']:.2%}, "
+            f"len abs err: {metrics['reconstruction/gen_len_abs_err_mean']:.1f}"
+        )
     if "reconstruction/psnr_mean_valid" in metrics:
         message += (
             f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
@@ -583,13 +599,20 @@ def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
 @torch.no_grad()
 def validate(
     fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int, verbose: bool = True
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, float]]:
     fabric.barrier()
     if verbose:
         fabric.print("Validating ...")
     model.eval()
 
     losses = []
+    # Token-weighted per-task loss. AR target bytes carry REGION_TARGET and FIM
+    # span bytes carry REGION_BRIDGE, and each sample is wholly one task, so
+    # masking the labels by region splits the loss exactly. Skipped for text
+    # batches, which have no region_ids.
+    task_regions = {"ar": REGION_TARGET, "fim": REGION_BRIDGE}
+    task_loss_sum = {name: 0.0 for name in task_regions}
+    task_tok_count = {name: 0 for name in task_regions}
     for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
@@ -598,10 +621,24 @@ def validate(
         loss = chunked_cross_entropy(logits, targets)
         losses.append(loss)
 
+        region_ids = model_inputs.get("region_ids")
+        if region_ids is not None:
+            for name, region in task_regions.items():
+                masked = torch.where(region_ids == region, targets, torch.full_like(targets, IGNORE_INDEX))
+                count = int((masked != IGNORE_INDEX).sum())
+                if count > 0:
+                    task_loss_sum[name] += float(chunked_cross_entropy(logits, masked)) * count
+                    task_tok_count[name] += count
+
     val_loss = torch.stack(losses).mean()
+    task_losses = {
+        name: task_loss_sum[name] / task_tok_count[name]
+        for name in task_regions
+        if task_tok_count[name] > 0
+    }
     model.train()
     fabric.barrier()
-    return val_loss
+    return val_loss, task_losses
 
 
 def get_model_inputs_and_targets(batch, max_seq_length: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:

@@ -30,7 +30,13 @@ BYTE_VOCAB_SIZE = 256  # Raw byte ids are exactly 0..255.
 PAD_ID = 256  # Padding id for variable-length batches; never a real byte.
 SLICE_BOS_ID = 257  # Starts AR generation of the full target slice B_t.
 SPAN_BOS_ID = 258  # Starts FIM generation of the missing span B_miss.
-VOCAB_SIZE = 259  # Model vocab size: 256 byte ids + 3 control ids.
+FIM_BEGIN_ID = 259  # Starts a PSM-formatted target after metadata/reference context.
+FIM_HOLE_ID = 260  # Marks where the missing span was removed and the suffix begins.
+FIM_END_ID = 261  # Ends the known suffix and starts missing-span generation.
+SEQ_EOS_ID = 262  # Optional end-of-target marker; only emitted when use_eos=True.
+VOCAB_SIZE = 259  # Bridge/AR vocab: bytes + PAD, SLICE_BOS, and SPAN_BOS.
+PSM_VOCAB_SIZE = 262  # PSM vocab additionally includes BEGIN, HOLE, and END.
+EOS_VOCAB_SIZE = 263  # Adds SEQ_EOS on top of the PSM markers; shared by both formats.
 IGNORE_INDEX = -100  # Cross-entropy ignore label for conditioning-only positions.
 
 REGION_REF = 0  # Previous VCL slice bytes used as reference/context.
@@ -49,6 +55,18 @@ TASKS = ("ar", "fim")
 TaskName = Literal["ar", "fim"]
 REFERENCE_MODES = ("normal", "no_ref", "zero_ref", "shuffled_ref")
 ReferenceMode = Literal["normal", "no_ref", "zero_ref", "shuffled_ref"]
+FIM_FORMATS = ("bridge", "psm")
+FIMFormat = Literal["bridge", "psm"]
+
+
+def vocab_size_for_fim_format(fim_format: FIMFormat, use_eos: bool = False) -> int:
+    if fim_format not in FIM_FORMATS:
+        raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
+    # SEQ_EOS shares a single id across formats, so enabling it lifts both the
+    # bridge and PSM vocabularies to the same size.
+    if use_eos:
+        return EOS_VOCAB_SIZE
+    return PSM_VOCAB_SIZE if fim_format == "psm" else VOCAB_SIZE
 
 
 @dataclass
@@ -56,6 +74,13 @@ class ByteDataConfig:
     """Hyperparameters controlling byte-domain sample construction."""
 
     p_fim: float = 0.0  # Probability of FIM sample; otherwise sample is AR.
+    # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
+    # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
+    fim_format: FIMFormat = "bridge"
+    # When True, append SEQ_EOS after each AR target / FIM span so the model
+    # learns to terminate. Default False keeps the oracle-length convention
+    # where generation length is supplied externally.
+    use_eos: bool = False
     num_ref_slices: int = 1  # Number of previous VCL slices included as B_ref.
     # Conditioning ablation. "normal" uses the target's true prior slices;
     # "no_ref" removes them; "zero_ref" preserves their lengths with zero
@@ -305,8 +330,10 @@ class ByteSliceDataset(Dataset):
 
     FIM layout:
         B_t       = [B_pre, B_miss, B_orph]
-        input_ids = [B_meta, B_ref, B_pre, B_orph, SPAN_BOS, B_miss[:-1]]
-        labels    = [-100 ...,                                      B_miss]
+        bridge    = [B_meta, B_ref, B_pre, B_orph, SPAN_BOS, B_miss[:-1]]
+        psm       = [B_meta, B_ref, FIM_BEGIN, B_pre, FIM_HOLE, B_orph,
+                     FIM_END, B_miss[:-1]]
+        labels    = [-100 ..., B_miss]
     """
 
     def __init__(
@@ -314,6 +341,8 @@ class ByteSliceDataset(Dataset):
         rows: list[dict[str, Any]],
         max_seq_length: int,
         p_fim: float = 0.0,
+        fim_format: FIMFormat = "bridge",
+        use_eos: bool = False,
         num_ref_slices: int = 1,
         target_nal_types: tuple[int, ...] = (1,),
         fim_min_gap: int = 64,
@@ -329,6 +358,8 @@ class ByteSliceDataset(Dataset):
     ) -> None:
         if not 0.0 <= p_fim <= 1.0:
             raise ValueError("p_fim must be in [0, 1]")
+        if fim_format not in FIM_FORMATS:
+            raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
         if num_ref_slices < 0:
@@ -339,6 +370,8 @@ class ByteSliceDataset(Dataset):
         self.rows = rows
         self.max_seq_length = max_seq_length
         self.p_fim = p_fim
+        self.fim_format = fim_format
+        self.use_eos = use_eos
         self.num_ref_slices = num_ref_slices
         self.target_nal_types = set(target_nal_types)
         self.fim_min_gap = fim_min_gap
@@ -472,7 +505,10 @@ class ByteSliceDataset(Dataset):
                     continue
                 if pos < self.num_ref_slices:
                     continue
-                if nal.end - nal.start > self.max_seq_length:
+                format_overhead = (
+                    2 if self.p_fim > 0 and self.fim_format == "psm" else 0
+                )
+                if nal.end - nal.start + format_overhead > self.max_seq_length:
                     continue
                 refs = tuple(vcl_indices[pos - self.num_ref_slices : pos])
                 meta_indices = self._latest_parameter_set_indices(nals, nal_idx)
@@ -545,6 +581,12 @@ class ByteSliceDataset(Dataset):
         ref = torch.cat(kept) if kept else torch.empty(0, dtype=torch.long)
         return meta, ref, len(ref_chunks) - len(kept)
 
+    def _with_eos(self, content: Tensor) -> Tensor:
+        """Append SEQ_EOS to a generated span when use_eos is enabled."""
+        if not self.use_eos:
+            return content
+        return torch.cat((content, torch.tensor([SEQ_EOS_ID], dtype=torch.long)))
+
     def _build_ar_item(
         self,
         meta: Tensor,
@@ -553,20 +595,24 @@ class ByteSliceDataset(Dataset):
         sample: SliceSample,
         reference_source_path: Path | None,
     ) -> dict[str, Any]:
-        # Teacher forcing: [SLICE_BOS, B_t[:-1]] predicts B_t.
+        # Teacher forcing: [SLICE_BOS, target_tail[:-1]] predicts target_tail,
+        # where target_tail is B_t optionally followed by SEQ_EOS.
+        eos_overhead = 1 if self.use_eos else 0
         meta, ref, dropped_ref_slices = self._fit_conditioning_to_budget(
-            meta, ref_chunks, target.numel()
+            meta, ref_chunks, target.numel() + eos_overhead
         )
-        input_ids = torch.cat(
-            (meta, ref, torch.tensor([SLICE_BOS_ID], dtype=torch.long), target[:-1])
+        target_tail = self._with_eos(target)
+        gen_in = torch.cat(
+            (torch.tensor([SLICE_BOS_ID], dtype=torch.long), target_tail[:-1])
         )
+        input_ids = torch.cat((meta, ref, gen_in))
         labels = torch.full_like(input_ids, self.ignore_index)
-        labels[-target.numel() :] = target
+        labels[-target_tail.numel() :] = target_tail
         region_ids = torch.cat(
             (
                 torch.full((meta.numel(),), REGION_META, dtype=torch.long),
                 torch.full((ref.numel(),), REGION_REF, dtype=torch.long),
-                torch.full((target.numel(),), REGION_TARGET, dtype=torch.long),
+                torch.full((gen_in.numel(),), REGION_TARGET, dtype=torch.long),
             )
         )
         offset_ids = torch.arange(input_ids.numel(), dtype=torch.long)
@@ -594,40 +640,108 @@ class ByteSliceDataset(Dataset):
         prefix, missing, orphan, split_offset = self._sample_fim_parts(
             target, target_nal, rng
         )
-        # prefix + orphan + bridge_in has the same length as target.
+        format_overhead = 2 if self.fim_format == "psm" else 0
+        eos_overhead = 1 if self.use_eos else 0
         meta, ref, dropped_ref_slices = self._fit_conditioning_to_budget(
-            meta, ref_chunks, target.numel()
+            meta, ref_chunks, target.numel() + format_overhead + eos_overhead
         )
+        # missing_tail is B_miss optionally followed by SEQ_EOS; teacher forcing
+        # feeds [marker, missing_tail[:-1]] and supervises missing_tail.
+        missing_tail = self._with_eos(missing)
 
-        # Teacher forcing: [SPAN_BOS, B_miss[:-1]] predicts B_miss.
-        bridge_in = torch.cat(
-            (torch.tensor([SPAN_BOS_ID], dtype=torch.long), missing[:-1])
-        )
-        input_ids = torch.cat((meta, ref, prefix, orphan, bridge_in))
+        if self.fim_format == "psm":
+            prefix_marker = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
+            suffix_marker = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
+            middle_in = torch.cat(
+                (torch.tensor([FIM_END_ID], dtype=torch.long), missing_tail[:-1])
+            )
+            input_ids = torch.cat(
+                (
+                    meta,
+                    ref,
+                    prefix_marker,
+                    prefix,
+                    suffix_marker,
+                    orphan,
+                    middle_in,
+                )
+            )
+            region_ids = torch.cat(
+                (
+                    torch.full((meta.numel(),), REGION_META, dtype=torch.long),
+                    torch.full((ref.numel(),), REGION_REF, dtype=torch.long),
+                    torch.full(
+                        (prefix_marker.numel() + prefix.numel(),),
+                        REGION_PREFIX,
+                        dtype=torch.long,
+                    ),
+                    torch.full(
+                        (suffix_marker.numel() + orphan.numel(),),
+                        REGION_ORPHAN,
+                        dtype=torch.long,
+                    ),
+                    torch.full(
+                        (middle_in.numel(),), REGION_BRIDGE, dtype=torch.long
+                    ),
+                )
+            )
+            offset_ids = torch.cat(
+                (
+                    torch.arange(meta.numel(), dtype=torch.long),
+                    torch.arange(ref.numel(), dtype=torch.long),
+                    torch.tensor([0], dtype=torch.long),
+                    torch.arange(prefix.numel(), dtype=torch.long),
+                    torch.tensor(
+                        [prefix.numel() + missing.numel()], dtype=torch.long
+                    ),
+                    torch.arange(
+                        prefix.numel() + missing.numel(),
+                        target.numel(),
+                        dtype=torch.long,
+                    ),
+                    torch.arange(
+                        split_offset,
+                        split_offset + middle_in.numel(),
+                        dtype=torch.long,
+                    ),
+                )
+            )
+        else:
+            # Teacher forcing: [SPAN_BOS, missing_tail[:-1]] predicts missing_tail.
+            middle_in = torch.cat(
+                (torch.tensor([SPAN_BOS_ID], dtype=torch.long), missing_tail[:-1])
+            )
+            input_ids = torch.cat((meta, ref, prefix, orphan, middle_in))
+            region_ids = torch.cat(
+                (
+                    torch.full((meta.numel(),), REGION_META, dtype=torch.long),
+                    torch.full((ref.numel(),), REGION_REF, dtype=torch.long),
+                    torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
+                    torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
+                    torch.full(
+                        (middle_in.numel(),), REGION_BRIDGE, dtype=torch.long
+                    ),
+                )
+            )
+            offset_ids = torch.cat(
+                (
+                    torch.arange(meta.numel(), dtype=torch.long),
+                    torch.arange(ref.numel(), dtype=torch.long),
+                    torch.arange(prefix.numel(), dtype=torch.long),
+                    torch.arange(
+                        prefix.numel() + missing.numel(),
+                        target.numel(),
+                        dtype=torch.long,
+                    ),
+                    torch.arange(
+                        split_offset,
+                        split_offset + middle_in.numel(),
+                        dtype=torch.long,
+                    ),
+                )
+            )
         labels = torch.full_like(input_ids, self.ignore_index)
-        labels[-missing.numel() :] = missing
-        region_ids = torch.cat(
-            (
-                torch.full((meta.numel(),), REGION_META, dtype=torch.long),
-                torch.full((ref.numel(),), REGION_REF, dtype=torch.long),
-                torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
-                torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
-                torch.full((bridge_in.numel(),), REGION_BRIDGE, dtype=torch.long),
-            )
-        )
-        offset_ids = torch.cat(
-            (
-                torch.arange(meta.numel(), dtype=torch.long),
-                torch.arange(ref.numel(), dtype=torch.long),
-                torch.arange(prefix.numel(), dtype=torch.long),
-                torch.arange(
-                    prefix.numel() + missing.numel(), target.numel(), dtype=torch.long
-                ),
-                torch.arange(
-                    split_offset, split_offset + bridge_in.numel(), dtype=torch.long
-                ),
-            )
-        )
+        labels[-missing_tail.numel() :] = missing_tail
         return self._pack_item(
             input_ids,
             labels,
@@ -682,6 +796,7 @@ class ByteSliceDataset(Dataset):
             },
             "sample_meta": {
                 "task": task,
+                "fim_format": self.fim_format,
                 "h264_path": str(sample.h264_path),
                 "target_index": sample.target_index,
                 "num_ref_slices": len(sample.ref_indices),
@@ -779,6 +894,8 @@ class ByteDataModule(DataModule):
             rows,
             max_seq_length=self.max_seq_length,
             p_fim=self.config.p_fim,
+            fim_format=self.config.fim_format,
+            use_eos=self.config.use_eos,
             num_ref_slices=self.config.num_ref_slices,
             target_nal_types=self.config.target_nal_types,
             fim_min_gap=self.config.fim_min_gap,

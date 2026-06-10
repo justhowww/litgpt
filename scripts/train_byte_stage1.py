@@ -13,7 +13,13 @@ import torch
 
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.config import Config
-from litgpt.data.byte_data import REFERENCE_MODES, VOCAB_SIZE, ByteDataConfig, ByteDataModule
+from litgpt.data.byte_data import (
+    FIM_FORMATS,
+    REFERENCE_MODES,
+    ByteDataConfig,
+    ByteDataModule,
+    vocab_size_for_fim_format,
+)
 from litgpt.eval.byte_reconstruction import ReconstructionEvalConfig
 from litgpt.pretrain import setup
 
@@ -82,6 +88,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-mode", choices=REFERENCE_MODES, default="normal")
     parser.add_argument("--target-nal-types", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--p-fim", type=float, default=0.0)
+    parser.add_argument("--fim-format", choices=FIM_FORMATS, default="bridge")
+    parser.add_argument(
+        "--use-eos",
+        action="store_true",
+        help="Append SEQ_EOS after each AR target / FIM span so the model learns "
+        "to terminate. Default off uses oracle lengths for generation.",
+    )
     parser.add_argument("--fim-min-gap", type=int, default=64)
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
@@ -111,13 +124,15 @@ def main() -> None:
         n_layer=args.n_layer,
         n_embd=args.n_embd,
         n_head=args.n_head,
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size_for_fim_format(args.fim_format, args.use_eos),
         padding_multiple=8,
         use_region_id=use_region_id,
         use_offset_id=use_offset_id,
     )
     data_config = ByteDataConfig(
         p_fim=args.p_fim,
+        fim_format=args.fim_format,
+        use_eos=args.use_eos,
         num_ref_slices=args.num_ref_slices,
         reference_mode=args.reference_mode,
         target_nal_types=tuple(args.target_nal_types),

@@ -1,10 +1,12 @@
 #!/bin/bash
-# Stage 2 H100 run. Hyperparameters match train_a100.sbatch.
+# Stage 2 PSM (+EOS) run: mixed AR/FIM pretraining from random initialization
+# using the explicit Prefix-Suffix-Middle representation, with a learned EOS
+# terminator on both AR targets and FIM spans.
 
-#SBATCH --job-name=byte-fim-h100
+#SBATCH --job-name=byte-fim-psm
 #SBATCH --account=metzler-prj-cmsc
 #SBATCH --partition=gpu
-#SBATCH --gpus=h100:1
+#SBATCH --gpus=a100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -21,7 +23,6 @@ source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 : "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
 : "${NAL_INDEX:?Set NAL_INDEX to the persistent SQLite NAL index}"
 
-OUT_DIR=${OUT_DIR:-"$(dirname "${MANIFEST}")/runs/byte-stage2-fim"}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 STEPS=${STEPS:-100000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
@@ -29,8 +30,17 @@ MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
 REFERENCE_MODE=${REFERENCE_MODE:-normal}
 P_FIM=${P_FIM:-0.5}
-FIM_FORMAT=${FIM_FORMAT:-bridge}
-MODEL_NAME=${MODEL_NAME:-byte-stage2-fim}
+FIM_FORMAT=${FIM_FORMAT:-psm}
+# EOS is enabled by default for this experiment; set USE_EOS=0 for a PSM-only
+# baseline (which writes to a distinct, untagged directory).
+USE_EOS=${USE_EOS:-1}
+if [[ "${USE_EOS}" == "1" ]]; then
+    EOS_TAG="-eos"
+else
+    EOS_TAG=""
+fi
+MODEL_NAME=${MODEL_NAME:-byte-stage2-fim-psm${EOS_TAG}}
+OUT_DIR=${OUT_DIR:-"$(dirname "${MANIFEST}")/runs/byte-stage2-fim-psm${EOS_TAG}"}
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
@@ -85,6 +95,9 @@ cmd=(
     --compile
     --resume
 )
+if [[ "${USE_EOS}" == "1" ]]; then
+    cmd+=(--use-eos)
+fi
 
 flock -n "${OUT_DIR}/.training.lock" srun "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2

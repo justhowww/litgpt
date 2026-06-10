@@ -29,6 +29,8 @@ MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
 REFERENCE_MODE=${REFERENCE_MODE:-normal}
 P_FIM=${P_FIM:-0.5}
+FIM_FORMAT=${FIM_FORMAT:-bridge}
+MODEL_NAME=${MODEL_NAME:-byte-stage2-fim}
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
@@ -56,7 +58,7 @@ mkdir -p "${OUT_DIR}"
 cmd=(
     python scripts/train_byte_stage1.py
     "${MANIFEST}"
-    --model-name byte-stage2-fim
+    --model-name "${MODEL_NAME}"
     --nal-index-path "${NAL_INDEX}"
     --out-dir "${OUT_DIR}"
     --block-size "${BLOCK_SIZE}"
@@ -68,6 +70,7 @@ cmd=(
     --num-workers "${NUM_WORKERS}"
     --reference-mode "${REFERENCE_MODE}"
     --p-fim "${P_FIM}"
+    --fim-format "${FIM_FORMAT}"
     --fim-min-gap "${FIM_MIN_GAP}"
     --fim-max-gap "${FIM_MAX_GAP}"
     --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"

@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import Subset
 
 from litgpt.data.byte_data import (
+    FIM_FORMATS,
     IGNORE_INDEX,
     REGION_BRIDGE,
     REGION_META,
@@ -24,10 +25,10 @@ from litgpt.data.byte_data import (
     REGION_PREFIX,
     REGION_REF,
     REGION_TARGET,
-    VOCAB_SIZE,
     ByteDataConfig,
     ByteDataModule,
     ByteSliceDataset,
+    vocab_size_for_fim_format,
 )
 
 
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-seq-length", type=int, default=32768)
     parser.add_argument("--p-fim", type=float, default=0.0)
+    parser.add_argument("--fim-format", choices=FIM_FORMATS, default="bridge")
     parser.add_argument("--num-ref-slices", type=int, default=1)
     parser.add_argument("--target-nal-types", type=int, nargs="+", default=[1])
     parser.add_argument("--num-workers", type=int, default=0)
@@ -64,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def summarize_sample(sample: dict) -> None:
+def summarize_sample(sample: dict, vocab_size: int) -> None:
     input_ids = sample["input_ids"]
     labels = sample["labels"]
     region_ids = sample["region_ids"]
@@ -81,12 +83,12 @@ def summarize_sample(sample: dict) -> None:
 
     assert input_ids.shape == labels.shape
     assert input_ids.shape == region_ids.shape
-    assert int(input_ids.max()) < VOCAB_SIZE
+    assert int(input_ids.max()) < vocab_size
     assert int(input_ids.min()) >= 0
     assert int(supervised.sum()) > 0
 
 
-def summarize_batch(batch: dict) -> None:
+def summarize_batch(batch: dict, vocab_size: int) -> None:
     input_ids = batch["input_ids"]
     labels = batch["labels"]
     region_ids = batch["region_ids"]
@@ -100,7 +102,7 @@ def summarize_batch(batch: dict) -> None:
 
     assert input_ids.shape == labels.shape
     assert input_ids.shape == region_ids.shape
-    assert int(input_ids.max()) < VOCAB_SIZE
+    assert int(input_ids.max()) < vocab_size
     assert int(input_ids.min()) >= 0
     assert int(supervised.sum()) > 0
 
@@ -199,6 +201,7 @@ def main() -> None:
     args = parse_args()
     config = ByteDataConfig(
         p_fim=args.p_fim,
+        fim_format=args.fim_format,
         num_ref_slices=args.num_ref_slices,
         target_nal_types=tuple(args.target_nal_types),
         num_workers=args.num_workers,
@@ -225,7 +228,8 @@ def main() -> None:
     assert val_len > 0
 
     sample = dm.train_dataset[0]
-    summarize_sample(sample)
+    vocab_size = vocab_size_for_fim_format(args.fim_format)
+    summarize_sample(sample, vocab_size)
 
     indexed_dataset, train_indices = get_indexed_dataset_and_indices(dm.train_dataset)
     summarize_block_size_candidates(
@@ -235,7 +239,7 @@ def main() -> None:
     )
 
     batch = next(iter(dm.train_dataloader()))
-    summarize_batch(batch)
+    summarize_batch(batch, vocab_size)
 
     print("byte dataset smoke check passed")
 
