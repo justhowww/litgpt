@@ -5,14 +5,14 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
-source "${SCRIPT_DIR}/stage_corpus.sh"
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)
+source "${SCRIPT_DIR}/../stage_corpus.sh"
 
 SOURCE_CORPUS=${SOURCE_CORPUS:-"/home/${USER}/SHELL.metzler-prj/OpenVid-1M/h264"}
 STAGED_CORPUS=${STAGED_CORPUS:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data"}
 OUT_DIR=${OUT_DIR:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1"}
 SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-"metzler-prj-cmsc"}
-JOB_SCRIPT=${JOB_SCRIPT:-"${SCRIPT_DIR}/train_stage1.sbatch"}
+JOB_SCRIPT=${JOB_SCRIPT:-"${SCRIPT_DIR}/train_a100.sbatch"}
 # CLEANUP=0 is the concise public override. Keep CLEANUP_AFTER_SUCCESS as the
 # backward-compatible name used by existing scripts.
 CLEANUP_AFTER_SUCCESS=${CLEANUP_AFTER_SUCCESS:-${CLEANUP:-1}}
@@ -42,7 +42,7 @@ if [[ "${CLEANUP_AFTER_SUCCESS}" == "1" ]]; then
     cleanup_job_id=$(
         sbatch "${sbatch_args[@]}" \
             --dependency="afterok:${job_id}" \
-            "${SCRIPT_DIR}/cleanup_stage1.sbatch"
+            "${SCRIPT_DIR}/cleanup.sbatch"
     )
     echo "Scheduled cleanup job ${cleanup_job_id} after successful training"
 else

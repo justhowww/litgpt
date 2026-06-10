@@ -27,7 +27,7 @@ for mode in normal no_ref shuffled_ref; do
     mkdir -p "${out_dir}"
     train_job_id=$(sbatch "${sbatch_args[@]}" \
         --export="ALL,REPO_ROOT=${REPO_ROOT},MANIFEST=${STAGED_CORPUS}/manifest.jsonl,OUT_DIR=${out_dir},REFERENCE_MODE=${mode},STEPS=${STEPS}" \
-        "${SCRIPT_DIR}/train_stage1.sbatch")
+        "${SCRIPT_DIR}/stage1_ar/train_a100.sbatch")
     echo "Submitted ${mode} training job ${train_job_id}"
 
     eval_job_id=$(sbatch "${sbatch_args[@]}" \

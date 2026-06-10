@@ -9,9 +9,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-export JOB_SCRIPT="${SCRIPT_DIR}/train_stage1_h100.sbatch"
+export JOB_SCRIPT="${SCRIPT_DIR}/train_h100.sbatch"
 # The H.264 corpus is already persistent on scratch and must not be removed
 # after training.
 export CLEANUP=${CLEANUP:-0}
 
-exec bash "${SCRIPT_DIR}/submit_stage1.sh"
+exec bash "${SCRIPT_DIR}/submit.sh"

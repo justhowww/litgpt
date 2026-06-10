@@ -4,8 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
-source "${SCRIPT_DIR}/stage_corpus.sh"
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)
+source "${SCRIPT_DIR}/../stage_corpus.sh"
 
 SOURCE_CORPUS=${SOURCE_CORPUS:-"/home/${USER}/SHELL.metzler-prj/OpenVid-1M/h264"}
 STAGED_CORPUS=${STAGED_CORPUS:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data"}
@@ -24,8 +24,8 @@ fi
 
 echo "Submitting smoke job..."
 job_id=$(sbatch "${sbatch_args[@]}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},MANIFEST=${STAGED_CORPUS}/manifest.jsonl,OUT_DIR=${OUT_DIR}" \
-    "${SCRIPT_DIR}/smoke_stage1.sbatch")
+    --export="ALL,REPO_ROOT=${REPO_ROOT},MANIFEST=${STAGED_CORPUS}/manifest.jsonl,NAL_INDEX=${STAGED_CORPUS}/nal_index.sqlite,OUT_DIR=${OUT_DIR}" \
+    "${SCRIPT_DIR}/smoke.sbatch")
 
 echo "Submitted smoke job ${job_id}"
 echo "Staged corpus retained for the full training run"

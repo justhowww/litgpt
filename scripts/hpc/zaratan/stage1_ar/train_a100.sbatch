@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=byte-stage1
+#SBATCH --job-name=byte-ar
 #SBATCH --account=metzler-prj-cmsc
 #SBATCH --partition=gpu
 #SBATCH --gpus=a100:1

@@ -3,6 +3,16 @@
 These wrappers keep Zaratan/Slurm configuration separate from the portable
 `scripts/train_byte_stage1.py` launcher.
 
+Experiment launchers are grouped by training stage:
+
+```text
+stage1_ar/   # AR smoke and convergence runs
+stage2_fim/  # mixed AR/FIM smoke and convergence runs
+```
+
+Shared corpus staging, encoding, environment, and NAL-index scripts remain in
+`scripts/hpc/zaratan/`.
+
 The manifest and its sibling `h264/` directory must be available from compute
 nodes, preferably under project scratch rather than `SHELL`.
 
@@ -31,7 +41,7 @@ Run this command on a login node to copy it into `scratch.metzler-prj`, submit
 training, and delete only the staged corpus after successful training:
 
 ```bash
-bash scripts/hpc/zaratan/submit_stage1.sh
+bash scripts/hpc/zaratan/stage1_ar/submit.sh
 ```
 
 Defaults:
@@ -46,7 +56,7 @@ The manifest is copied last, after the encoded files. If training fails, staged
 data is retained so the job can be resumed. Disable automatic cleanup with:
 
 ```bash
-CLEANUP_AFTER_SUCCESS=0 bash scripts/hpc/zaratan/submit_stage1.sh
+CLEANUP_AFTER_SUCCESS=0 bash scripts/hpc/zaratan/stage1_ar/submit.sh
 ```
 
 Paths and training settings can be overridden at submission:
@@ -57,7 +67,7 @@ STAGED_CORPUS=/path/in/scratch/data \
 OUT_DIR=/path/in/scratch/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \
-bash scripts/hpc/zaratan/submit_stage1.sh
+bash scripts/hpc/zaratan/stage1_ar/submit.sh
 ```
 
 ## Smoke job
@@ -65,7 +75,7 @@ bash scripts/hpc/zaratan/submit_stage1.sh
 Run the login-node wrapper so the corpus is copied before the GPU smoke job:
 
 ```bash
-bash scripts/hpc/zaratan/submit_smoke.sh
+bash scripts/hpc/zaratan/stage1_ar/submit_smoke.sh
 ```
 
 The staged corpus is retained after smoke testing for the subsequent training
@@ -84,7 +94,7 @@ NAL_INDEX=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/nal_index.sqlite 
 OUT_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage1 \
 BLOCK_SIZE=16384 \
 STEPS=10000 \
-sbatch scripts/hpc/zaratan/train_stage1.sbatch
+sbatch scripts/hpc/zaratan/stage1_ar/train_a100.sbatch
 ```
 
 The scripts default to one A100. Override Slurm resources at submission time,
@@ -92,7 +102,7 @@ for example:
 
 ```bash
 sbatch --gpus=h100:1 --time=02:00:00 \
-  scripts/hpc/zaratan/smoke_stage1.sbatch
+  scripts/hpc/zaratan/stage1_ar/smoke.sbatch
 ```
 
 Shared environment defaults are in `env.sh`. Override them without editing
@@ -103,7 +113,7 @@ REPO_ROOT=$PWD \
 CONDA_ROOT=/home/$USER/scratch.metzler-prj/miniforge3 \
 CONDA_ENV=litpt \
 MANIFEST=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
-sbatch scripts/hpc/zaratan/smoke_stage1.sbatch
+sbatch scripts/hpc/zaratan/stage1_ar/smoke.sbatch
 ```
 
 The submission wrappers default to Slurm account `metzler-prj-cmsc`. This is
@@ -150,9 +160,31 @@ Override the probe cost at submission time:
 RECONSTRUCTION_EVAL_INTERVAL=500 \
 RECONSTRUCTION_EVAL_SAMPLES=10 \
 RECONSTRUCTION_MAX_TARGET_BYTES=4096 \
-bash scripts/hpc/zaratan/submit_stage1.sh
+bash scripts/hpc/zaratan/stage1_ar/submit.sh
 ```
 
 Set `RECONSTRUCTION_EVAL_INTERVAL=0` to disable the probe. Decode failures,
 timeouts, invalid generated tokens, and unexpected probe errors are logged and
 do not terminate training.
+
+## Stage 2 mixed AR/FIM
+
+Run the integration smoke test first:
+
+```bash
+bash scripts/hpc/zaratan/stage2_fim/submit_smoke.sh
+```
+
+Submit the primary 50% AR / 50% FIM run to an H100:
+
+```bash
+P_FIM=0.5 \
+STEPS=100000 \
+bash scripts/hpc/zaratan/stage2_fim/submit_h100.sh
+```
+
+Stage 2 writes to
+`scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage2-fim/`, so it cannot
+resume or overwrite Stage 1 AR checkpoints. The current AR reconstruction
+probe is disabled for Stage 2 until a repair-specific FIM decoder probe is
+implemented.

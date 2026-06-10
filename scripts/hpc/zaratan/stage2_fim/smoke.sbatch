@@ -1,0 +1,48 @@
+#!/bin/bash
+# Short integration check for mixed AR/FIM sample construction and training.
+
+#SBATCH --job-name=byte-fim-smoke
+#SBATCH --account=metzler-prj-cmsc
+#SBATCH --partition=gpu
+#SBATCH --gpus=a100:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=00:15:00
+#SBATCH --output=slurm-%x-%j.out
+
+set -euo pipefail
+export SLURM_EXPORT_ENV=ALL
+
+REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
+source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
+
+: "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
+: "${NAL_INDEX:?Set NAL_INDEX to the persistent SQLite NAL index}"
+
+OUT_DIR=${OUT_DIR:-"$(dirname "${MANIFEST}")/runs/byte-stage2-fim-smoke"}
+BLOCK_SIZE=${BLOCK_SIZE:-16384}
+MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-100}
+P_FIM=${P_FIM:-0.5}
+
+mkdir -p "${OUT_DIR}"
+
+srun python scripts/train_byte_stage1.py \
+    "${MANIFEST}" \
+    --model-name byte-stage2-fim-smoke \
+    --nal-index-path "${NAL_INDEX}" \
+    --out-dir "${OUT_DIR}" \
+    --block-size "${BLOCK_SIZE}" \
+    --steps 10 \
+    --global-batch-size 8 \
+    --micro-batch-size 1 \
+    --precision bf16-mixed \
+    --logger-name tensorboard \
+    --num-workers 4 \
+    --max-manifest-rows "${MAX_MANIFEST_ROWS}" \
+    --p-fim "${P_FIM}" \
+    --eval-interval 5 \
+    --eval-iters 2 \
+    --reconstruction-eval-interval 0 \
+    --save-interval 5

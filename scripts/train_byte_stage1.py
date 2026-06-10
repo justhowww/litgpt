@@ -21,6 +21,7 @@ from litgpt.pretrain import setup
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
+    parser.add_argument("--model-name", default="byte-stage1")
     parser.add_argument(
         "--nal-index-path",
         type=Path,
@@ -75,6 +76,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-mode", choices=REFERENCE_MODES, default="normal")
     parser.add_argument("--target-nal-types", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--p-fim", type=float, default=0.0)
+    parser.add_argument("--fim-min-gap", type=int, default=64)
+    parser.add_argument("--fim-max-gap", type=int, default=1400)
+    parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
     parser.add_argument("--no-sps-pps-conditioning", action="store_true")
     parser.add_argument("--no-region-id", action="store_true")
     parser.add_argument("--no-offset-id", action="store_true")
@@ -96,7 +100,7 @@ def main() -> None:
     max_tokens = args.steps * args.global_batch_size * args.block_size
 
     model_config = Config(
-        name="byte-stage1",
+        name=args.model_name,
         block_size=args.block_size,
         n_layer=args.n_layer,
         n_embd=args.n_embd,
@@ -111,6 +115,9 @@ def main() -> None:
         num_ref_slices=args.num_ref_slices,
         reference_mode=args.reference_mode,
         target_nal_types=tuple(args.target_nal_types),
+        fim_min_gap=args.fim_min_gap,
+        fim_max_gap=args.fim_max_gap,
+        slice_header_guard_bytes=args.slice_header_guard_bytes,
         num_workers=args.num_workers,
         condition_on_sps_pps=not args.no_sps_pps_conditioning,
         default_max_seq_length=args.block_size,
@@ -160,7 +167,7 @@ def main() -> None:
     )
 
     setup(
-        model_name="byte-stage1",
+        model_name=args.model_name,
         model_config=model_config,
         out_dir=args.out_dir,
         precision=args.precision,

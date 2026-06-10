@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-: "${STAGED_CORPUS:?STAGED_CORPUS must be set by submit_stage1.sh}"
+: "${STAGED_CORPUS:?STAGED_CORPUS must be set by stage1_ar/submit.sh}"
 
 expected_root="/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data"
 staged_real=$(realpath -m "${STAGED_CORPUS}")
