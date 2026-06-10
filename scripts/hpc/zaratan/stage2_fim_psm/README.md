@@ -64,6 +64,7 @@ Decision tree:
 
 Note: do **not** judge EOS from the loss curves. EOS is ~1 token per
 64-1400-byte span, so a broken terminator barely moves average byte
-cross-entropy; the `stop_*` metrics are the real signal. The decoder probe caps
-generation at the oracle length (FIM span ≤ 1 packet; AR full frame), so it
-captures early stops; over-runs past the true length are not measured.
+cross-entropy; the `stop_*` metrics are the real signal. For EOS runs the probe
+lets generation run up to ~2x the true length, so `stop_*` captures both early
+and late termination — a model that never fires EOS hits the 2x cap and shows as
+a large length error, rather than masquerading as a correct stop.

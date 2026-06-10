@@ -53,8 +53,8 @@ class ReconstructionSample:
     generation_region_id: int = REGION_TARGET
     generation_offset_start: int = 0
     # When set, greedy decoding stops as soon as this token is produced (the
-    # learned SEQ_EOS marker). target_length is the backstop if it never fires:
-    # the FIM span (<= 1 packet) or, for AR, the full slice (frame) length.
+    # learned SEQ_EOS marker). For EOS samples generation may run up to ~2x the
+    # true length, so the stop metrics see both early and late termination.
     stop_token: int | None = None
 
 
@@ -175,13 +175,20 @@ def generate_target_slice(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
     prompt_length = prompt.size(1)
-    max_sequence_length = prompt_length + sample.target_length - 1
-    if max_sequence_length > raw_model.max_seq_length:
+    # Generation must at least fit the oracle-length span.
+    if prompt_length + sample.target_length - 1 > raw_model.max_seq_length:
         return None
-    # target_length is the generation backstop. With EOS the model may stop
-    # earlier (and we record where); the backstop is the FIM span (<= 1 packet)
-    # or, for AR, the full slice (frame) length. Over-runs past it are not seen.
-    max_new = sample.target_length
+    # With EOS, allow generation up to ~2x the true length so the stop metrics
+    # capture late and non-terminating cases, not just early stops; the model is
+    # expected to fire EOS well before the cap. Without EOS the oracle length is
+    # an exact count, so non-EOS baselines are unchanged.
+    if sample.stop_token is not None:
+        max_new = min(
+            2 * sample.target_length,
+            raw_model.max_seq_length - prompt_length + 1,
+        )
+    else:
+        max_new = sample.target_length
 
     generated: list[int] = []
     cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
@@ -453,11 +460,14 @@ def run_reconstruction_probe(
         "reconstruction/unexpected_failures": float(unexpected_failures),
     }
     if stop_records:
+        n = len(stop_records)
         abs_errs = [abs(gen_len - oracle) for gen_len, oracle in stop_records]
-        metrics["reconstruction/gen_len_abs_err_mean"] = sum(abs_errs) / len(abs_errs)
-        metrics["reconstruction/stop_exact_rate"] = sum(
-            gen_len == oracle for gen_len, oracle in stop_records
-        ) / len(stop_records)
+        metrics["reconstruction/gen_len_abs_err_mean"] = sum(abs_errs) / n
+        # Three-way split of where the model stopped relative to the true length;
+        # exact + early + late sum to 1.
+        metrics["reconstruction/stop_exact_rate"] = sum(g == o for g, o in stop_records) / n
+        metrics["reconstruction/stop_early_rate"] = sum(g < o for g, o in stop_records) / n
+        metrics["reconstruction/stop_late_rate"] = sum(g > o for g, o in stop_records) / n
     if psnr_values:
         finite_psnr = [value for value in psnr_values if math.isfinite(value)]
         metrics["reconstruction/psnr_mean_valid"] = (

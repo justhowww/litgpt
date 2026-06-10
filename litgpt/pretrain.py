@@ -585,7 +585,10 @@ def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
     )
     if "reconstruction/stop_exact_rate" in metrics:
         message += (
-            f", stop exact: {metrics['reconstruction/stop_exact_rate']:.2%}, "
+            f", stop exact/early/late: "
+            f"{metrics['reconstruction/stop_exact_rate']:.0%}/"
+            f"{metrics['reconstruction/stop_early_rate']:.0%}/"
+            f"{metrics['reconstruction/stop_late_rate']:.0%}, "
             f"len abs err: {metrics['reconstruction/gen_len_abs_err_mean']:.1f}"
         )
     if "reconstruction/psnr_mean_valid" in metrics:
