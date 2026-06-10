@@ -16,6 +16,7 @@ from torch.utils.data import Subset
 from litgpt.data.byte_data import (
     BYTE_VOCAB_SIZE,
     IGNORE_INDEX,
+    REGION_BRIDGE,
     REGION_TARGET,
     VCL_NAL_TYPES,
     ByteSliceDataset,
@@ -24,13 +25,14 @@ from litgpt.data.byte_data import (
 
 @dataclass(frozen=True)
 class ReconstructionEvalConfig:
-    """Controls the expensive autoregressive decode probe."""
+    """Controls the expensive AR or FIM decoder-level probe."""
 
     interval: int = 1000
     num_samples: int = 5
     timeout_sec: int = 30
     ffmpeg_binary: str = "ffmpeg"
     max_target_bytes: int = 2048
+    task: str = "ar"
 
 
 @dataclass(frozen=True)
@@ -44,12 +46,19 @@ class ReconstructionSample:
     prompt_region_ids: Tensor
     prompt_offset_ids: Tensor
     target_length: int
+    task: str = "ar"
+    replacement_start: int = 0
+    replacement_end: int | None = None
+    generation_region_id: int = REGION_TARGET
+    generation_offset_start: int = 0
 
 
 def select_reconstruction_samples(
-    dataset: object, num_samples: int, max_target_bytes: int
+    dataset: object, num_samples: int, max_target_bytes: int, task: str = "ar"
 ) -> list[ReconstructionSample]:
-    """Select a deterministic prefix of held-out AR samples."""
+    """Select a deterministic prefix of held-out AR or FIM samples."""
+    if task not in {"ar", "fim"}:
+        raise ValueError("Reconstruction task must be 'ar' or 'fim'")
     if num_samples <= 0:
         return []
     if isinstance(dataset, Subset):
@@ -64,7 +73,7 @@ def select_reconstruction_samples(
     selected: list[ReconstructionSample] = []
     for idx in indices:
         item = base_dataset[idx]
-        if item["sample_meta"]["task"] != "ar":
+        if item["sample_meta"]["task"] != task:
             continue
         supervised = item["labels"] != IGNORE_INDEX
         target_length = int(supervised.sum())
@@ -72,6 +81,12 @@ def select_reconstruction_samples(
             continue
         first_target_input = int(supervised.nonzero()[0])
         prompt_end = first_target_input + 1
+        replacement_start = (
+            int(item["offset_ids"][first_target_input]) if task == "fim" else 0
+        )
+        replacement_end = (
+            replacement_start + target_length if task == "fim" else None
+        )
 
         sample = base_dataset.samples[idx]
         nals = base_dataset.nal_index[str(sample.h264_path)]
@@ -90,6 +105,15 @@ def select_reconstruction_samples(
                 prompt_region_ids=item["region_ids"][:prompt_end].clone(),
                 prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
                 target_length=target_length,
+                task=task,
+                replacement_start=replacement_start,
+                replacement_end=replacement_end,
+                generation_region_id=(
+                    REGION_BRIDGE if task == "fim" else REGION_TARGET
+                ),
+                generation_offset_start=(
+                    replacement_start + 1 if task == "fim" else prompt_end
+                ),
             )
         )
         if len(selected) >= num_samples:
@@ -106,6 +130,9 @@ def save_reconstruction_sample_manifest(
             "target_nal_index": sample.target_nal_index,
             "frame_index": sample.frame_index,
             "target_length": sample.target_length,
+            "task": sample.task,
+            "replacement_start": sample.replacement_start,
+            "replacement_end": sample.replacement_end,
         }
         for sample in samples
     ]
@@ -131,7 +158,7 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
 def generate_target_slice(
     model: nn.Module, sample: ReconstructionSample, device: torch.device
 ) -> bytes | None:
-    """Greedily generate a full NAL using the ground-truth target length."""
+    """Greedily generate a full AR NAL or a FIM missing span."""
     raw_model = _unwrap_model(model)
     was_training = raw_model.training
     raw_model.eval()
@@ -184,8 +211,13 @@ def generate_target_slice(
                     token_tensor,
                     input_pos=torch.tensor([position], device=device),
                     input_pos_maxp1=position + 1,
-                    region_ids=torch.tensor([[REGION_TARGET]], device=device),
-                    offset_ids=torch.tensor([[position]], device=device),
+                    region_ids=torch.tensor(
+                        [[sample.generation_region_id]], device=device
+                    ),
+                    offset_ids=torch.tensor(
+                        [[sample.generation_offset_start + generated_idx]],
+                        device=device,
+                    ),
                 )
     finally:
         raw_model.clear_kv_cache()
@@ -194,6 +226,13 @@ def generate_target_slice(
 
 
 def replace_target_nal(stream: bytes, sample: ReconstructionSample, generated: bytes) -> bytes:
+    if sample.task == "fim":
+        replacement_end = sample.replacement_end
+        if replacement_end is None:
+            raise ValueError("FIM sample is missing replacement_end")
+        start = sample.target_start + sample.replacement_start
+        end = sample.target_start + replacement_end
+        return stream[:start] + generated + stream[end:]
     return stream[: sample.target_start] + generated + stream[sample.target_end :]
 
 

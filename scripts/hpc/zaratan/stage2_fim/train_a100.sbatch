@@ -32,7 +32,11 @@ P_FIM=${P_FIM:-0.5}
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
+RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
+RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-5}
+RECONSTRUCTION_MAX_TARGET_BYTES=${RECONSTRUCTION_MAX_TARGET_BYTES:-1400}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
+FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable: ${MANIFEST}" >&2
@@ -40,6 +44,10 @@ if [[ ! -r "${MANIFEST}" ]]; then
 fi
 if [[ ! -r "${NAL_INDEX}" ]]; then
     echo "NAL index is not readable: ${NAL_INDEX}" >&2
+    exit 1
+fi
+if [[ ! -x "${FFMPEG_BINARY}" ]]; then
+    echo "FFmpeg executable is not available: ${FFMPEG_BINARY}" >&2
     exit 1
 fi
 
@@ -65,14 +73,16 @@ cmd=(
     --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"
     --eval-interval 250
     --eval-iters 20
-    --reconstruction-eval-interval 0
+    --reconstruction-task fim
+    --reconstruction-eval-interval "${RECONSTRUCTION_EVAL_INTERVAL}"
+    --reconstruction-eval-samples "${RECONSTRUCTION_EVAL_SAMPLES}"
+    --reconstruction-max-target-bytes "${RECONSTRUCTION_MAX_TARGET_BYTES}"
+    --ffmpeg-binary "${FFMPEG_BINARY}"
     --save-interval 500
     --compile
     --resume
 )
 
-# FIM decoder evaluation is intentionally disabled until the repair-specific
-# probe is implemented. The existing reconstruction probe measures AR slices.
 flock -n "${OUT_DIR}/.training.lock" srun "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2
     exit 1

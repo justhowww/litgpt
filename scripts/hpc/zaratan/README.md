@@ -185,6 +185,6 @@ bash scripts/hpc/zaratan/stage2_fim/submit_h100.sh
 
 Stage 2 writes to
 `scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage2-fim/`, so it cannot
-resume or overwrite Stage 1 AR checkpoints. The current AR reconstruction
-probe is disabled for Stage 2 until a repair-specific FIM decoder probe is
-implemented.
+resume or overwrite Stage 1 AR checkpoints. Its decoder probe generates only
+the held-out missing span, reinserts it into the original target NAL, and logs
+FIM decode rate, PSNR, and SSIM every 1,000 steps.

@@ -25,6 +25,12 @@ OUT_DIR=${OUT_DIR:-"$(dirname "${MANIFEST}")/runs/byte-stage2-fim-smoke"}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-100}
 P_FIM=${P_FIM:-0.5}
+FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
+
+if [[ ! -x "${FFMPEG_BINARY}" ]]; then
+    echo "FFmpeg executable is not available: ${FFMPEG_BINARY}" >&2
+    exit 1
+fi
 
 mkdir -p "${OUT_DIR}"
 
@@ -44,5 +50,9 @@ srun python scripts/train_byte_stage1.py \
     --p-fim "${P_FIM}" \
     --eval-interval 5 \
     --eval-iters 2 \
-    --reconstruction-eval-interval 0 \
+    --reconstruction-task fim \
+    --reconstruction-eval-interval 10 \
+    --reconstruction-eval-samples 1 \
+    --reconstruction-max-target-bytes 1400 \
+    --ffmpeg-binary "${FFMPEG_BINARY}" \
     --save-interval 5

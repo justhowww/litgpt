@@ -240,6 +240,7 @@ def main(
             val_dataloader.dataset,
             reconstruction_eval.num_samples,
             reconstruction_eval.max_target_bytes,
+            reconstruction_eval.task,
         )
         if reconstruction_eval is not None
         else []
@@ -498,7 +499,10 @@ def fit(
                 fabric.device,
             )
             fabric.print(
-                format_reconstruction_metrics("Reconstruction validation", metrics)
+                format_reconstruction_metrics(
+                    f"{reconstruction_eval.task.upper()} reconstruction validation",
+                    metrics,
+                )
             )
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
             last_reconstruction_step = state["step_count"]
@@ -522,7 +526,10 @@ def fit(
             fabric.device,
         )
         fabric.print(
-            format_reconstruction_metrics("Final reconstruction validation", metrics)
+            format_reconstruction_metrics(
+                f"Final {reconstruction_eval.task.upper()} reconstruction validation",
+                metrics,
+            )
         )
         fabric.log_dict(metrics, step=state["iter_num"])
 
