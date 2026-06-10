@@ -25,6 +25,7 @@ BLOCK_SIZE=${BLOCK_SIZE:-16384}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-100}
 P_FIM=${P_FIM:-0.5}
 FIM_FORMAT=${FIM_FORMAT:-psm}
+FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 USE_EOS=${USE_EOS:-1}
 if [[ "${USE_EOS}" == "1" ]]; then
     EOS_TAG="-eos"
@@ -58,12 +59,13 @@ cmd=(
     --max-manifest-rows "${MAX_MANIFEST_ROWS}"
     --p-fim "${P_FIM}"
     --fim-format "${FIM_FORMAT}"
+    --fim-max-gap "${FIM_MAX_GAP}"
     --eval-interval 5
     --eval-iters 2
     --reconstruction-task both
     --reconstruction-eval-interval 10
     --reconstruction-eval-samples 1
-    --reconstruction-max-target-bytes 1400
+    --reconstruction-max-target-bytes "${FIM_MAX_GAP}"
     --ffmpeg-binary "${FFMPEG_BINARY}"
     --save-interval 5
 )

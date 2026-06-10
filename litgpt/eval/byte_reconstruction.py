@@ -53,7 +53,8 @@ class ReconstructionSample:
     generation_region_id: int = REGION_TARGET
     generation_offset_start: int = 0
     # When set, greedy decoding stops as soon as this token is produced (the
-    # learned SEQ_EOS marker). target_length then acts as a generation cap.
+    # learned SEQ_EOS marker). target_length is the backstop if it never fires:
+    # the FIM span (<= 1 packet) or, for AR, the full slice (frame) length.
     stop_token: int | None = None
 
 
@@ -174,19 +175,13 @@ def generate_target_slice(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
     prompt_length = prompt.size(1)
-    # Generation must at least fit the oracle-length span.
-    if prompt_length + sample.target_length - 1 > raw_model.max_seq_length:
+    max_sequence_length = prompt_length + sample.target_length - 1
+    if max_sequence_length > raw_model.max_seq_length:
         return None
-    # With a learned EOS the model decides when to stop, so allow headroom past
-    # the oracle length; this lets the probe observe over-runs, not just early
-    # stops. Without EOS the oracle length is an exact count (unchanged).
-    if sample.stop_token is not None:
-        max_new = min(
-            2 * sample.target_length,
-            raw_model.max_seq_length - prompt_length + 1,
-        )
-    else:
-        max_new = sample.target_length
+    # target_length is the generation backstop. With EOS the model may stop
+    # earlier (and we record where); the backstop is the FIM span (<= 1 packet)
+    # or, for AR, the full slice (frame) length. Over-runs past it are not seen.
+    max_new = sample.target_length
 
     generated: list[int] = []
     cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype

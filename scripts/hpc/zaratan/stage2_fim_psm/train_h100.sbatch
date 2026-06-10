@@ -40,6 +40,7 @@ fi
 MODEL_NAME=${MODEL_NAME:-byte-stage2-fim-psm${EOS_TAG}}
 OUT_DIR=${OUT_DIR:-"$(dirname "${MANIFEST}")/runs/byte-stage2-fim-psm${EOS_TAG}"}
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
+# Single-packet loss (~1 MTU/FU-A payload). Adjust for multi-packet schemes.
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
 RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
