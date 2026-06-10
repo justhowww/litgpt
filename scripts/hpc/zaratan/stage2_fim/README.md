@@ -13,6 +13,6 @@ P_FIM=0.5 STEPS=100000 \
 The default output directory is
 `scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage2-fim/`.
 
-Every 1,000 steps, the FIM decoder probe selects fixed validation gaps,
-generates only each missing span, reinserts it into the original NAL, and logs
-decode rate, PSNR, and SSIM.
+Every 1,000 steps, separate AR and FIM decoder probes run on fixed validation
+samples. TensorBoard records them under `reconstruction/ar/*` and
+`reconstruction/fim/*`.

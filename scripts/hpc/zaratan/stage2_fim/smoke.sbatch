@@ -50,7 +50,7 @@ srun python scripts/train_byte_stage1.py \
     --p-fim "${P_FIM}" \
     --eval-interval 5 \
     --eval-iters 2 \
-    --reconstruction-task fim \
+    --reconstruction-task both \
     --reconstruction-eval-interval 10 \
     --reconstruction-eval-samples 1 \
     --reconstruction-max-target-bytes 1400 \

@@ -73,7 +73,7 @@ cmd=(
     --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"
     --eval-interval 250
     --eval-iters 20
-    --reconstruction-task fim
+    --reconstruction-task both
     --reconstruction-eval-interval "${RECONSTRUCTION_EVAL_INTERVAL}"
     --reconstruction-eval-samples "${RECONSTRUCTION_EVAL_SAMPLES}"
     --reconstruction-max-target-bytes "${RECONSTRUCTION_MAX_TARGET_BYTES}"

@@ -57,9 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-eval-samples", type=int, default=5)
     parser.add_argument(
         "--reconstruction-task",
-        choices=("ar", "fim"),
+        choices=("ar", "fim", "both"),
         default="ar",
-        help="Generate full AR slices or only FIM missing spans during decoder evaluation.",
+        help="Evaluate AR slices, FIM missing spans, or both decoder tasks.",
     )
     parser.add_argument("--reconstruction-timeout-sec", type=int, default=30)
     parser.add_argument("--reconstruction-max-target-bytes", type=int, default=2048)

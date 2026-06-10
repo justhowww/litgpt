@@ -32,7 +32,7 @@ class ReconstructionEvalConfig:
     timeout_sec: int = 30
     ffmpeg_binary: str = "ffmpeg"
     max_target_bytes: int = 2048
-    task: str = "ar"
+    task: str = "ar"  # "ar", "fim", or "both"
 
 
 @dataclass(frozen=True)

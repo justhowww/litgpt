@@ -12,6 +12,7 @@ from litgpt.eval.byte_reconstruction import (
     replace_target_nal,
     select_reconstruction_samples,
 )
+from litgpt.pretrain import _namespace_reconstruction_metrics
 
 
 def nal(header: int, payload: bytes) -> bytes:
@@ -140,3 +141,19 @@ def test_parse_ppm_and_identical_image_metrics():
     assert image.shape == (1, 2, 3)  # PPM dimensions become HWC RGB.
     assert math.isinf(image_psnr(image, image))  # Identical frames have infinite PSNR.
     assert abs(image_ssim(image, image) - 1.0) < 1e-6  # Identical frames have perfect SSIM.
+
+
+def test_reconstruction_metrics_are_namespaced_by_task():
+    metrics = {
+        "reconstruction/decode_rate": 1.0,
+        "reconstruction/psnr_mean_valid": 37.0,
+    }
+
+    namespaced = _namespace_reconstruction_metrics(metrics, "fim")
+
+    assert (
+        namespaced["reconstruction/fim/decode_rate"] == 1.0
+    )  # FIM decode rate cannot overwrite the AR probe at the same step.
+    assert (
+        namespaced["reconstruction/fim/psnr_mean_valid"] == 37.0
+    )  # FIM visual quality retains its own TensorBoard series.

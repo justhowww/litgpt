@@ -186,5 +186,6 @@ bash scripts/hpc/zaratan/stage2_fim/submit_h100.sh
 Stage 2 writes to
 `scratch.metzler-prj/OpenVid-1M_Data/data/runs/byte-stage2-fim/`, so it cannot
 resume or overwrite Stage 1 AR checkpoints. Its decoder probe generates only
-the held-out missing span, reinserts it into the original target NAL, and logs
-FIM decode rate, PSNR, and SSIM every 1,000 steps.
+the held-out missing span for FIM and a complete target NAL for AR. Both probes
+log decode rate, PSNR, and SSIM every 1,000 steps under separate TensorBoard
+metric namespaces.

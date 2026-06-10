@@ -235,24 +235,32 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
 
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
-    reconstruction_samples = (
-        select_reconstruction_samples(
+    reconstruction_tasks = (
+        ("ar", "fim")
+        if reconstruction_eval is not None and reconstruction_eval.task == "both"
+        else ((reconstruction_eval.task,) if reconstruction_eval is not None else ())
+    )
+    reconstruction_samples = {
+        task: select_reconstruction_samples(
             val_dataloader.dataset,
             reconstruction_eval.num_samples,
             reconstruction_eval.max_target_bytes,
-            reconstruction_eval.task,
+            task,
         )
-        if reconstruction_eval is not None
-        else []
-    )
+        for task in reconstruction_tasks
+    }
     if reconstruction_eval is not None and fabric.global_rank == 0:
-        save_reconstruction_sample_manifest(
-            reconstruction_samples, out_dir / "reconstruction_samples.json"
-        )
+        for task, samples in reconstruction_samples.items():
+            manifest_name = (
+                f"reconstruction_samples_{task}.json"
+                if len(reconstruction_samples) > 1
+                else "reconstruction_samples.json"
+            )
+            save_reconstruction_sample_manifest(samples, out_dir / manifest_name)
     if reconstruction_eval is not None and fabric.world_size != 1:
         fabric.print("Byte reconstruction validation currently requires a single-device run; disabling it.")
         reconstruction_eval = None
-        reconstruction_samples = []
+        reconstruction_samples = {}
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     if initial_checkpoint_dir:
@@ -345,7 +353,7 @@ def fit(
     num_nodes: int = 1,
     checkpoint_hparams: dict | None = None,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
-    reconstruction_samples: list | None = None,
+    reconstruction_samples: dict[str, list] | None = None,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -492,19 +500,25 @@ def fit(
             and not is_accumulating
             and state["step_count"] % reconstruction_eval.interval == 0
         ):
-            metrics = run_reconstruction_probe(
-                model,
-                reconstruction_samples,
-                reconstruction_eval,
-                fabric.device,
-            )
-            fabric.print(
-                format_reconstruction_metrics(
-                    f"{reconstruction_eval.task.upper()} reconstruction validation",
-                    metrics,
+            for task, samples in reconstruction_samples.items():
+                if not samples:
+                    continue
+                metrics = run_reconstruction_probe(
+                    model,
+                    samples,
+                    reconstruction_eval,
+                    fabric.device,
                 )
-            )
-            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+                fabric.print(
+                    format_reconstruction_metrics(
+                        f"{task.upper()} reconstruction validation",
+                        metrics,
+                    )
+                )
+                fabric.log_dict(
+                    _namespace_reconstruction_metrics(metrics, task),
+                    step=state["iter_num"] - 1,
+                )
             last_reconstruction_step = state["step_count"]
 
     # Final validation
@@ -519,19 +533,34 @@ def fit(
         and reconstruction_samples
         and last_reconstruction_step != state["step_count"]
     ):
-        metrics = run_reconstruction_probe(
-            model,
-            reconstruction_samples,
-            reconstruction_eval,
-            fabric.device,
-        )
-        fabric.print(
-            format_reconstruction_metrics(
-                f"Final {reconstruction_eval.task.upper()} reconstruction validation",
-                metrics,
+        for task, samples in reconstruction_samples.items():
+            if not samples:
+                continue
+            metrics = run_reconstruction_probe(
+                model,
+                samples,
+                reconstruction_eval,
+                fabric.device,
             )
-        )
-        fabric.log_dict(metrics, step=state["iter_num"])
+            fabric.print(
+                format_reconstruction_metrics(
+                    f"Final {task.upper()} reconstruction validation",
+                    metrics,
+                )
+            )
+            fabric.log_dict(
+                _namespace_reconstruction_metrics(metrics, task),
+                step=state["iter_num"],
+            )
+
+
+def _namespace_reconstruction_metrics(
+    metrics: dict[str, float], task: str
+) -> dict[str, float]:
+    return {
+        key.replace("reconstruction/", f"reconstruction/{task}/", 1): value
+        for key, value in metrics.items()
+    }
 
 
 def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
