@@ -12,5 +12,8 @@ export EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-10}
 export FIM_FORMAT=psm
 export MODEL_NAME=${MODEL_NAME:-byte-stage2-fim-psm-eos-weight10-smoke}
 export OUT_DIR=${OUT_DIR:-"${STAGED_CORPUS}/runs/byte-stage2-fim-psm-eos-weight10-smoke"}
+export RECONSTRUCTION_ORACLE_LENGTH=1
+export RECONSTRUCTION_ERROR_EXPLODING=1
+export RECONSTRUCTION_FIM_BASELINES=1
 
 exec bash "${BASE_DIR}/submit_smoke.sh"

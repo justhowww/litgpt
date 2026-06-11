@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import random
 import subprocess
@@ -301,21 +301,21 @@ def decode_frame(
         command.extend(["-err_detect", "explode"])
     command.extend(
         [
-        "-f",
-        "h264",
-        "-i",
-        "pipe:0",
-        "-vf",
-        f"select=eq(n\\,{frame_index})",
-        "-vsync",
-        "0",
-        "-frames:v",
-        "1",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "ppm",
-        "pipe:1",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-vf",
+            f"select=eq(n\\,{frame_index})",
+            "-vsync",
+            "0",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
         ]
     )
     try:
@@ -550,7 +550,10 @@ def run_reconstruction_probe(
         ]
         metrics["reconstruction/gen_len_abs_err_mean"] = sum(abs_errs) / n
         metrics["reconstruction/stop_exact_rate"] = (
-            sum(stopped and generated == oracle for generated, oracle, stopped in stop_records)
+            sum(
+                stopped and generated == oracle
+                for generated, oracle, stopped in stop_records
+            )
             / n
         )
         metrics["reconstruction/stop_early_rate"] = (
@@ -626,8 +629,12 @@ def _ground_truth_replacement(
 def _deterministic_random_bytes(
     sample: ReconstructionSample, length: int
 ) -> bytes:
+    identity = (
+        f"{sample.h264_path}:{sample.target_nal_index}:"
+        f"{sample.replacement_start}"
+    )
     digest = hashlib.sha256(
-        f"{sample.h264_path}:{sample.target_nal_index}:{sample.replacement_start}".encode()
+        identity.encode()
     ).digest()
     rng = random.Random(int.from_bytes(digest[:8], "big"))
     return bytes(rng.randrange(BYTE_VOCAB_SIZE) for _ in range(length))

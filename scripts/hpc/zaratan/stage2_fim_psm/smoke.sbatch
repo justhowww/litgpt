@@ -28,6 +28,9 @@ FIM_FORMAT=${FIM_FORMAT:-psm}
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 USE_EOS=${USE_EOS:-1}
 EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1}
+RECONSTRUCTION_ORACLE_LENGTH=${RECONSTRUCTION_ORACLE_LENGTH:-0}
+RECONSTRUCTION_ERROR_EXPLODING=${RECONSTRUCTION_ERROR_EXPLODING:-0}
+RECONSTRUCTION_FIM_BASELINES=${RECONSTRUCTION_FIM_BASELINES:-0}
 if [[ "${USE_EOS}" == "1" ]]; then
     EOS_TAG="-eos"
 else
@@ -72,6 +75,15 @@ cmd=(
 )
 if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
+fi
+if [[ "${RECONSTRUCTION_ORACLE_LENGTH}" == "1" ]]; then
+    cmd+=(--reconstruction-oracle-length)
+fi
+if [[ "${RECONSTRUCTION_ERROR_EXPLODING}" == "1" ]]; then
+    cmd+=(--reconstruction-error-exploding)
+fi
+if [[ "${RECONSTRUCTION_FIM_BASELINES}" == "1" ]]; then
+    cmd+=(--reconstruction-fim-baselines)
 fi
 cmd+=(--eos-loss-weight "${EOS_LOSS_WEIGHT}")
 

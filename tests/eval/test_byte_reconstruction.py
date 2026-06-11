@@ -1,5 +1,6 @@
 import json
 import math
+from types import SimpleNamespace
 
 import torch
 
@@ -13,6 +14,7 @@ from litgpt.eval.byte_reconstruction import (
     ReconstructionSample,
     _deterministic_random_bytes,
     _ground_truth_replacement,
+    decode_frame,
     image_psnr,
     image_ssim,
     parse_ppm,
@@ -200,6 +202,29 @@ def test_parse_ppm_and_identical_image_metrics():
     assert image.shape == (1, 2, 3)  # PPM dimensions become HWC RGB.
     assert math.isinf(image_psnr(image, image))  # Identical frames have infinite PSNR.
     assert abs(image_ssim(image, image) - 1.0) < 1e-6  # Identical frames have perfect SSIM.
+
+
+def test_error_exploding_rejects_nonzero_ffmpeg_exit(monkeypatch):
+    ppm = b"P6\n1 1\n255\n" + bytes([0, 10, 20])
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1, stdout=ppm)
+
+    monkeypatch.setattr("litgpt.eval.byte_reconstruction.subprocess.run", fake_run)
+
+    normal_image, normal_status = decode_frame(b"stream", 0, "ffmpeg", 5)
+    strict_image, strict_status = decode_frame(
+        b"stream", 0, "ffmpeg", 5, error_exploding=True
+    )
+
+    assert normal_image is not None  # Normal mode accepts a frame produced with decoder warnings.
+    assert normal_status == "decoded"  # Normal mode reports the available frame as decoded.
+    assert strict_image is None  # Error-exploding mode rejects output from a failed FFmpeg process.
+    assert strict_status == "decoder_error"  # The strict failure remains distinguishable in probe metrics.
+    assert "-err_detect" not in commands[0]  # Normal decoding leaves FFmpeg concealment behavior unchanged.
+    assert commands[1][commands[1].index("-err_detect") + 1] == "explode"  # Strict mode requests error explosion.
 
 
 def test_reconstruction_metrics_are_namespaced_by_task():
