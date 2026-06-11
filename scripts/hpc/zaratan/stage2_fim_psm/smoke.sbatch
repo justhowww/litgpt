@@ -27,6 +27,7 @@ P_FIM=${P_FIM:-0.5}
 FIM_FORMAT=${FIM_FORMAT:-psm}
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 USE_EOS=${USE_EOS:-1}
+EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1}
 if [[ "${USE_EOS}" == "1" ]]; then
     EOS_TAG="-eos"
 else
@@ -72,5 +73,6 @@ cmd=(
 if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
 fi
+cmd+=(--eos-loss-weight "${EOS_LOSS_WEIGHT}")
 
 srun "${cmd[@]}"

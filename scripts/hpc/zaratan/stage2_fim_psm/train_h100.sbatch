@@ -32,6 +32,7 @@ FIM_FORMAT=${FIM_FORMAT:-psm}
 # EOS is enabled by default for this experiment; set USE_EOS=0 for a PSM-only
 # baseline (which writes to a distinct, untagged directory).
 USE_EOS=${USE_EOS:-1}
+EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1}
 if [[ "${USE_EOS}" == "1" ]]; then
     EOS_TAG="-eos"
 else
@@ -46,6 +47,9 @@ SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
 RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
 RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-5}
 RECONSTRUCTION_MAX_TARGET_BYTES=${RECONSTRUCTION_MAX_TARGET_BYTES:-1400}
+RECONSTRUCTION_ORACLE_LENGTH=${RECONSTRUCTION_ORACLE_LENGTH:-0}
+RECONSTRUCTION_ERROR_EXPLODING=${RECONSTRUCTION_ERROR_EXPLODING:-0}
+RECONSTRUCTION_FIM_BASELINES=${RECONSTRUCTION_FIM_BASELINES:-0}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
 
@@ -96,6 +100,16 @@ cmd=(
 )
 if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
+fi
+cmd+=(--eos-loss-weight "${EOS_LOSS_WEIGHT}")
+if [[ "${RECONSTRUCTION_ORACLE_LENGTH}" == "1" ]]; then
+    cmd+=(--reconstruction-oracle-length)
+fi
+if [[ "${RECONSTRUCTION_ERROR_EXPLODING}" == "1" ]]; then
+    cmd+=(--reconstruction-error-exploding)
+fi
+if [[ "${RECONSTRUCTION_FIM_BASELINES}" == "1" ]]; then
+    cmd+=(--reconstruction-fim-baselines)
 fi
 
 flock -n "${OUT_DIR}/.training.lock" srun "${cmd[@]}" || {

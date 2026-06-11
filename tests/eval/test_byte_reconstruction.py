@@ -11,6 +11,8 @@ from litgpt.data.byte_data import (
 )
 from litgpt.eval.byte_reconstruction import (
     ReconstructionSample,
+    _deterministic_random_bytes,
+    _ground_truth_replacement,
     image_psnr,
     image_ssim,
     parse_ppm,
@@ -158,6 +160,36 @@ def test_replace_target_nal_replaces_only_fim_gap(tmp_path):
     assert (
         rebuilt == b"outer-prefixABCwxyzHIJ-outer-suffix"
     )  # Prefix, orphan, and bytes outside the target NAL remain unchanged.
+
+
+def test_fim_baseline_bytes_use_the_exact_missing_interval(tmp_path):
+    path = tmp_path / "stream.h264"
+    path.write_bytes(b"outer-prefixABCDEFGHIJ-outer-suffix")
+    sample = ReconstructionSample(
+        h264_path=path,
+        target_start=12,
+        target_end=22,
+        target_nal_index=3,
+        frame_index=0,
+        prompt_ids=torch.tensor([SPAN_BOS_ID]),
+        prompt_region_ids=torch.tensor([REGION_BRIDGE]),
+        prompt_offset_ids=torch.tensor([3]),
+        target_length=4,
+        task="fim",
+        replacement_start=3,
+        replacement_end=7,
+    )
+
+    assert (
+        _ground_truth_replacement(path.read_bytes(), sample) == b"DEFG"
+    )  # Ground-truth baseline restores exactly the held-out gap.
+    assert (
+        _deterministic_random_bytes(sample, 4)
+        == _deterministic_random_bytes(sample, 4)
+    )  # Random baseline is reproducible across checkpoint evaluations.
+    assert (
+        len(_deterministic_random_bytes(sample, 4)) == 4
+    )  # Random baseline preserves the oracle missing-span length.
 
 
 def test_parse_ppm_and_identical_image_metrics():

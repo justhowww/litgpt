@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import random
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,9 @@ class ReconstructionEvalConfig:
     ffmpeg_binary: str = "ffmpeg"
     max_target_bytes: int = 2048
     task: str = "ar"  # "ar", "fim", or "both"
+    evaluate_oracle_length: bool = False
+    evaluate_error_exploding: bool = False
+    evaluate_fim_baselines: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,12 @@ class ReconstructionSample:
     # learned SEQ_EOS marker). For EOS samples generation may run up to ~2x the
     # true length, so the stop metrics see both early and late termination.
     stop_token: int | None = None
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    data: bytes
+    stopped: bool
 
 
 def select_reconstruction_samples(
@@ -165,9 +176,13 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
 
 @torch.inference_mode()
 def generate_target_slice(
-    model: nn.Module, sample: ReconstructionSample, device: torch.device
-) -> bytes | None:
-    """Greedily generate a full AR NAL or a FIM missing span."""
+    model: nn.Module,
+    sample: ReconstructionSample,
+    device: torch.device,
+    *,
+    oracle_length: bool = False,
+) -> GenerationResult | None:
+    """Generate bytes using either learned EOS stopping or an oracle byte count."""
     raw_model = _unwrap_model(model)
     was_training = raw_model.training
     raw_model.eval()
@@ -182,7 +197,7 @@ def generate_target_slice(
     # capture late and non-terminating cases, not just early stops; the model is
     # expected to fire EOS well before the cap. Without EOS the oracle length is
     # an exact count, so non-EOS baselines are unchanged.
-    if sample.stop_token is not None:
+    if sample.stop_token is not None and not oracle_length:
         max_new = min(
             2 * sample.target_length,
             raw_model.max_seq_length - prompt_length + 1,
@@ -191,6 +206,7 @@ def generate_target_slice(
         max_new = sample.target_length
 
     generated: list[int] = []
+    stopped = False
     cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
     raw_model.set_kv_cache(
         batch_size=1,
@@ -213,9 +229,16 @@ def generate_target_slice(
                 offset_ids=offset_ids,
             )
         for generated_idx in range(max_new):
-            token = int(logits[0, -1, : raw_model.config.vocab_size].argmax())
+            next_logits = logits[0, -1]
+            if oracle_length:
+                # Exclude control tokens so this probe isolates byte-content
+                # quality from the model's learned stopping behavior.
+                token = int(next_logits[:BYTE_VOCAB_SIZE].argmax())
+            else:
+                token = int(next_logits[: raw_model.config.vocab_size].argmax())
             if sample.stop_token is not None and token == sample.stop_token:
                 # Model chose to terminate the span on its own.
+                stopped = True
                 break
             if token >= BYTE_VOCAB_SIZE:
                 return None
@@ -245,7 +268,7 @@ def generate_target_slice(
     finally:
         raw_model.clear_kv_cache()
         raw_model.train(was_training)
-    return bytes(generated)
+    return GenerationResult(bytes(generated), stopped)
 
 
 def replace_target_nal(stream: bytes, sample: ReconstructionSample, generated: bytes) -> bytes:
@@ -264,13 +287,20 @@ def decode_frame(
     frame_index: int,
     ffmpeg_binary: str,
     timeout_sec: int,
+    *,
+    error_exploding: bool = False,
 ) -> tuple[Tensor | None, str]:
-    """Decode one frame as PPM; decoder warnings do not count as failure if a frame exists."""
+    """Decode one frame, optionally rejecting errors FFmpeg would normally tolerate."""
     command = [
         ffmpeg_binary,
         "-hide_banner",
         "-loglevel",
         "error",
+    ]
+    if error_exploding:
+        command.extend(["-err_detect", "explode"])
+    command.extend(
+        [
         "-f",
         "h264",
         "-i",
@@ -286,7 +316,8 @@ def decode_frame(
         "-vcodec",
         "ppm",
         "pipe:1",
-    ]
+        ]
+    )
     try:
         result = subprocess.run(
             command,
@@ -296,6 +327,8 @@ def decode_frame(
         )
     except subprocess.TimeoutExpired:
         return None, "timeout"
+    if error_exploding and result.returncode != 0:
+        return None, "decoder_error"
     if not result.stdout:
         return None, "no_frame"
     try:
@@ -386,61 +419,104 @@ def run_reconstruction_probe(
     config: ReconstructionEvalConfig,
     device: torch.device,
 ) -> dict[str, float]:
-    attempted = len(samples)
-    decoded = 0
-    invalid_generation = 0
-    timeouts = 0
-    missing_frames = 0
+    method_stats: dict[tuple[str, str], dict[str, object]] = {}
+    stop_records: list[tuple[int, int, bool]] = []
     unexpected_failures = 0
-    psnr_values: list[float] = []
-    ssim_values: list[float] = []
-    # (generated_length, oracle_length) pairs, recorded only for EOS samples so
-    # the model's own stopping behavior can be scored independently of PSNR.
-    stop_records: list[tuple[int, int]] = []
+    invalid_generation = 0
+
+    def stats_for(method: str, mode: str) -> dict[str, object]:
+        return method_stats.setdefault(
+            (method, mode),
+            {
+                "attempted": 0,
+                "decoded": 0,
+                "timeouts": 0,
+                "missing_frames": 0,
+                "psnr": [],
+                "ssim": [],
+            },
+        )
 
     for sample in samples:
         stage = "read_stream"
         try:
+            modes = ["normal"]
+            if config.evaluate_error_exploding:
+                modes.append("error_exploding")
+            for mode in modes:
+                stats_for("model_learned", mode)["attempted"] += 1
+
             stream = sample.h264_path.read_bytes()
             stage = "decode_reference"
             reference, reference_status = decode_frame(
                 stream, sample.frame_index, config.ffmpeg_binary, config.timeout_sec
             )
             if reference is None:
-                timeouts += int(reference_status == "timeout")
-                missing_frames += int(reference_status != "timeout")
+                for mode in modes:
+                    target_stats = stats_for("model_learned", mode)
+                    target_stats["timeouts"] += int(reference_status == "timeout")
+                    target_stats["missing_frames"] += int(
+                        reference_status != "timeout"
+                    )
                 continue
 
-            stage = "generate_target"
-            generated = generate_target_slice(model, sample, device)
-            if generated is None:
+            stage = "generate_learned"
+            learned = generate_target_slice(model, sample, device)
+            if learned is None:
                 invalid_generation += 1
-                continue
-            if sample.stop_token is not None:
-                stop_records.append((len(generated), sample.target_length))
-            stage = "replace_target"
-            reconstructed_stream = replace_target_nal(stream, sample, generated)
-            stage = "decode_reconstruction"
-            reconstruction, status = decode_frame(
-                reconstructed_stream,
-                sample.frame_index,
-                config.ffmpeg_binary,
-                config.timeout_sec,
-            )
-            if reconstruction is None:
-                timeouts += int(status == "timeout")
-                missing_frames += int(status != "timeout")
-                continue
+            elif sample.stop_token is not None:
+                stop_records.append(
+                    (len(learned.data), sample.target_length, learned.stopped)
+                )
 
-            stage = "compute_metrics"
-            decoded += 1
-            psnr_values.append(image_psnr(reference, reconstruction))
-            ssim_values.append(image_ssim(reference, reconstruction))
+            candidates: dict[str, bytes] = {}
+            if learned is not None:
+                candidates["model_learned"] = learned.data
+            if config.evaluate_oracle_length:
+                stage = "generate_oracle"
+                oracle = generate_target_slice(
+                    model, sample, device, oracle_length=True
+                )
+                if oracle is not None:
+                    candidates["model_oracle"] = oracle.data
+
+            if sample.task == "fim" and config.evaluate_fim_baselines:
+                ground_truth = _ground_truth_replacement(stream, sample)
+                candidates["ground_truth"] = ground_truth
+                candidates["deleted_gap"] = b""
+                candidates["random_bytes"] = _deterministic_random_bytes(
+                    sample, sample.target_length
+                )
+
+            for method, replacement in candidates.items():
+                stage = f"replace_{method}"
+                reconstructed_stream = replace_target_nal(
+                    stream, sample, replacement
+                )
+                for mode in modes:
+                    candidate_stats = stats_for(method, mode)
+                    if method != "model_learned":
+                        candidate_stats["attempted"] += 1
+                    stage = f"decode_{method}_{mode}"
+                    reconstruction, status = decode_frame(
+                        reconstructed_stream,
+                        sample.frame_index,
+                        config.ffmpeg_binary,
+                        config.timeout_sec,
+                        error_exploding=mode == "error_exploding",
+                    )
+                    if reconstruction is None:
+                        candidate_stats["timeouts"] += int(status == "timeout")
+                        candidate_stats["missing_frames"] += int(status != "timeout")
+                        continue
+                    candidate_stats["decoded"] += 1
+                    candidate_stats["psnr"].append(
+                        image_psnr(reference, reconstruction)
+                    )
+                    candidate_stats["ssim"].append(
+                        image_ssim(reference, reconstruction)
+                    )
         except Exception as exc:
-            # Reconstruction validation is diagnostic and must never terminate
-            # a long training run. Print the concrete failure because the
-            # aggregate counter alone cannot distinguish model failures from a
-            # broken evaluator.
             unexpected_failures += 1
             if unexpected_failures <= 3:
                 print(
@@ -450,30 +526,108 @@ def run_reconstruction_probe(
                     flush=True,
                 )
 
+    learned_normal = stats_for("model_learned", "normal")
+    attempted = int(learned_normal["attempted"])
+    decoded = int(learned_normal["decoded"])
     metrics = {
         "reconstruction/attempted": float(attempted),
         "reconstruction/decoded": float(decoded),
         "reconstruction/decode_rate": decoded / attempted if attempted else 0.0,
         "reconstruction/invalid_generation": float(invalid_generation),
-        "reconstruction/timeouts": float(timeouts),
-        "reconstruction/missing_target_frames": float(missing_frames),
+        "reconstruction/timeouts": float(learned_normal["timeouts"]),
+        "reconstruction/missing_target_frames": float(
+            learned_normal["missing_frames"]
+        ),
         "reconstruction/unexpected_failures": float(unexpected_failures),
     }
+    metrics.update(_quality_metrics("reconstruction/", learned_normal))
+
     if stop_records:
         n = len(stop_records)
-        abs_errs = [abs(gen_len - oracle) for gen_len, oracle in stop_records]
+        abs_errs = [
+            abs(generated_length - oracle_length)
+            for generated_length, oracle_length, _ in stop_records
+        ]
         metrics["reconstruction/gen_len_abs_err_mean"] = sum(abs_errs) / n
-        # Three-way split of where the model stopped relative to the true length;
-        # exact + early + late sum to 1.
-        metrics["reconstruction/stop_exact_rate"] = sum(g == o for g, o in stop_records) / n
-        metrics["reconstruction/stop_early_rate"] = sum(g < o for g, o in stop_records) / n
-        metrics["reconstruction/stop_late_rate"] = sum(g > o for g, o in stop_records) / n
-    if psnr_values:
-        finite_psnr = [value for value in psnr_values if math.isfinite(value)]
-        metrics["reconstruction/psnr_mean_valid"] = (
-            sum(finite_psnr) / len(finite_psnr) if finite_psnr else float("inf")
+        metrics["reconstruction/stop_exact_rate"] = (
+            sum(stopped and generated == oracle for generated, oracle, stopped in stop_records)
+            / n
         )
-        metrics["reconstruction/psnr_median_valid"] = float(torch.tensor(psnr_values).median())
-        metrics["reconstruction/ssim_mean_valid"] = sum(ssim_values) / len(ssim_values)
-        metrics["reconstruction/ssim_median_valid"] = float(torch.tensor(ssim_values).median())
+        metrics["reconstruction/stop_early_rate"] = (
+            sum(stopped and generated < oracle for generated, oracle, stopped in stop_records)
+            / n
+        )
+        metrics["reconstruction/stop_late_rate"] = (
+            sum(
+                (stopped and generated > oracle) or not stopped
+                for generated, oracle, stopped in stop_records
+            )
+            / n
+        )
+        metrics["reconstruction/stop_no_stop_rate"] = (
+            sum(not stopped for _, _, stopped in stop_records) / n
+        )
+
+    for (method, mode), method_values in method_stats.items():
+        prefix = f"reconstruction/{method}/{mode}/"
+        attempted = int(method_values["attempted"])
+        decoded = int(method_values["decoded"])
+        metrics[f"{prefix}attempted"] = float(attempted)
+        metrics[f"{prefix}decoded"] = float(decoded)
+        metrics[f"{prefix}decode_rate"] = (
+            decoded / attempted if attempted else 0.0
+        )
+        metrics[f"{prefix}timeouts"] = float(method_values["timeouts"])
+        metrics[f"{prefix}missing_target_frames"] = float(
+            method_values["missing_frames"]
+        )
+        metrics.update(_quality_metrics(prefix, method_values))
+    for mode in ("normal", "error_exploding"):
+        oracle_prefix = f"reconstruction/model_oracle/{mode}/"
+        concealment_prefix = f"reconstruction/deleted_gap/{mode}/"
+        for metric_name in ("psnr_mean_valid", "ssim_mean_valid"):
+            oracle_key = f"{oracle_prefix}{metric_name}"
+            concealment_key = f"{concealment_prefix}{metric_name}"
+            if oracle_key in metrics and concealment_key in metrics:
+                metrics[
+                    f"reconstruction/model_oracle_vs_deleted_gap/{mode}/{metric_name}_delta"
+                ] = metrics[oracle_key] - metrics[concealment_key]
     return metrics
+
+
+def _quality_metrics(prefix: str, stats: dict[str, object]) -> dict[str, float]:
+    psnr_values = stats["psnr"]
+    ssim_values = stats["ssim"]
+    if not psnr_values:
+        return {}
+    finite_psnr = [value for value in psnr_values if math.isfinite(value)]
+    return {
+        f"{prefix}psnr_mean_valid": (
+            sum(finite_psnr) / len(finite_psnr) if finite_psnr else float("inf")
+        ),
+        f"{prefix}psnr_median_valid": float(torch.tensor(psnr_values).median()),
+        f"{prefix}ssim_mean_valid": sum(ssim_values) / len(ssim_values),
+        f"{prefix}ssim_median_valid": float(torch.tensor(ssim_values).median()),
+    }
+
+
+def _ground_truth_replacement(
+    stream: bytes, sample: ReconstructionSample
+) -> bytes:
+    if sample.task == "fim":
+        if sample.replacement_end is None:
+            raise ValueError("FIM sample is missing replacement_end")
+        start = sample.target_start + sample.replacement_start
+        end = sample.target_start + sample.replacement_end
+        return stream[start:end]
+    return stream[sample.target_start : sample.target_end]
+
+
+def _deterministic_random_bytes(
+    sample: ReconstructionSample, length: int
+) -> bytes:
+    digest = hashlib.sha256(
+        f"{sample.h264_path}:{sample.target_nal_index}:{sample.replacement_start}".encode()
+    ).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    return bytes(rng.randrange(BYTE_VOCAB_SIZE) for _ in range(length))

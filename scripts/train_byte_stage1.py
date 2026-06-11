@@ -70,6 +70,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-timeout-sec", type=int, default=30)
     parser.add_argument("--reconstruction-max-target-bytes", type=int, default=2048)
     parser.add_argument(
+        "--reconstruction-oracle-length",
+        action="store_true",
+        help="Also generate exactly the known target length while excluding control tokens.",
+    )
+    parser.add_argument(
+        "--reconstruction-error-exploding",
+        action="store_true",
+        help="Also decode candidates with FFmpeg -err_detect explode.",
+    )
+    parser.add_argument(
+        "--reconstruction-fim-baselines",
+        action="store_true",
+        help="Evaluate ground-truth, deleted-gap, and deterministic-random FIM baselines.",
+    )
+    parser.add_argument(
         "--ffmpeg-binary",
         default="ffmpeg",
         help="FFmpeg executable used by reconstruction validation.",
@@ -95,6 +110,12 @@ def parse_args() -> argparse.Namespace:
         help="Append SEQ_EOS after each AR target / FIM span so the model learns "
         "to terminate. Default off uses oracle lengths for generation.",
     )
+    parser.add_argument(
+        "--eos-loss-weight",
+        type=float,
+        default=1.0,
+        help="Positive loss weight for SEQ_EOS targets. Requires --use-eos when not 1.",
+    )
     parser.add_argument("--fim-min-gap", type=int, default=64)
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
@@ -111,6 +132,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.eos_loss_weight <= 0:
+        raise ValueError("--eos-loss-weight must be positive")
+    if args.eos_loss_weight != 1.0 and not args.use_eos:
+        raise ValueError("--eos-loss-weight requires --use-eos")
     # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.
     torch.set_float32_matmul_precision("high")
 
@@ -183,6 +208,9 @@ def main() -> None:
             max_target_bytes=args.reconstruction_max_target_bytes,
             ffmpeg_binary=args.ffmpeg_binary,
             task=args.reconstruction_task,
+            evaluate_oracle_length=args.reconstruction_oracle_length,
+            evaluate_error_exploding=args.reconstruction_error_exploding,
+            evaluate_fim_baselines=args.reconstruction_fim_baselines,
         )
         if args.reconstruction_eval_interval > 0
         else None
@@ -205,6 +233,7 @@ def main() -> None:
         seed=args.seed,
         compile_model=args.compile,
         reconstruction_eval=reconstruction_eval,
+        eos_loss_weight=args.eos_loss_weight,
     )
 
 

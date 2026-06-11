@@ -23,7 +23,7 @@ from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
-from litgpt.data.byte_data import IGNORE_INDEX, REGION_BRIDGE, REGION_TARGET
+from litgpt.data.byte_data import IGNORE_INDEX, REGION_BRIDGE, REGION_TARGET, SEQ_EOS_ID
 from litgpt.eval.byte_reconstruction import (
     ReconstructionEvalConfig,
     run_reconstruction_probe,
@@ -81,6 +81,7 @@ def setup(
     seed: int = 42,
     compile_model: bool = True,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
+    eos_loss_weight: float = 1.0,
 ):
     """Pretrain a model.
 
@@ -182,6 +183,7 @@ def setup(
         compile_model=compile_model,
         checkpoint_hparams=hparams,
         reconstruction_eval=reconstruction_eval,
+        eos_loss_weight=eos_loss_weight,
     )
 
 
@@ -203,6 +205,7 @@ def main(
     num_nodes: int = 1,
     checkpoint_hparams: dict | None = None,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
+    eos_loss_weight: float = 1.0,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -310,6 +313,7 @@ def main(
         checkpoint_hparams=checkpoint_hparams,
         reconstruction_eval=reconstruction_eval,
         reconstruction_samples=reconstruction_samples,
+        eos_loss_weight=eos_loss_weight,
     )
 
     # Save final checkpoint
@@ -355,12 +359,13 @@ def fit(
     checkpoint_hparams: dict | None = None,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
     reconstruction_samples: dict[str, list] | None = None,
+    eos_loss_weight: float = 1.0,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
 
     if eval.initial_validation:
-        val_loss, _ = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+        val_loss, _, _ = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         val_loss = f"{val_loss:.3f}"
     else:
         fabric.print("Verifying settings ...")
@@ -420,7 +425,7 @@ def fit(
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(**model_inputs)
-            loss = chunked_cross_entropy(logits, targets)
+            loss = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         running_loss.update(loss.detach())
@@ -477,7 +482,9 @@ def fit(
 
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
             t0 = time.perf_counter()
-            val_loss, task_losses = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+            val_loss, task_losses, eos_metrics = validate(
+                fabric, model, val_dataloader, max_iters=eval.max_iters
+            )
             val_loss = val_loss.item()
             td = time.perf_counter() - t0
 
@@ -490,6 +497,7 @@ def fit(
             for name, tl in task_losses.items():
                 metrics[f"val_loss_{name}"] = tl
                 metrics[f"val_ppl_{name}"] = math.exp(tl)
+            metrics.update(eos_metrics)
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
             fabric.barrier()
 
@@ -531,11 +539,14 @@ def fit(
 
     # Final validation
     if eval.final_validation:
-        val_loss, task_losses = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+        val_loss, task_losses, eos_metrics = validate(
+            fabric, model, val_dataloader, max_iters=eval.max_iters
+        )
         metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
         for name, tl in task_losses.items():
             metrics[f"val_loss_{name}"] = tl
             metrics[f"val_ppl_{name}"] = math.exp(tl)
+        metrics.update(eos_metrics)
         fabric.log_dict(metrics, step=state["iter_num"])
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
@@ -591,6 +602,10 @@ def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
             f"{metrics['reconstruction/stop_late_rate']:.0%}, "
             f"len abs err: {metrics['reconstruction/gen_len_abs_err_mean']:.1f}"
         )
+        if "reconstruction/stop_no_stop_rate" in metrics:
+            message += (
+                f", no stop: {metrics['reconstruction/stop_no_stop_rate']:.0%}"
+            )
     if "reconstruction/psnr_mean_valid" in metrics:
         message += (
             f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
@@ -602,7 +617,7 @@ def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
 @torch.no_grad()
 def validate(
     fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int, verbose: bool = True
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
     fabric.barrier()
     if verbose:
         fabric.print("Validating ...")
@@ -616,6 +631,9 @@ def validate(
     task_regions = {"ar": REGION_TARGET, "fim": REGION_BRIDGE}
     task_loss_sum = {name: 0.0 for name in task_regions}
     task_tok_count = {name: 0 for name in task_regions}
+    eos_probability_sum = {name: 0.0 for name in task_regions}
+    eos_rank_sum = {name: 0.0 for name in task_regions}
+    eos_count = {name: 0 for name in task_regions}
     for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
@@ -632,6 +650,17 @@ def validate(
                 if count > 0:
                     task_loss_sum[name] += float(chunked_cross_entropy(logits, masked)) * count
                     task_tok_count[name] += count
+                eos_mask = (targets == SEQ_EOS_ID) & (region_ids == region)
+                if eos_mask.any():
+                    eos_logits = logits[eos_mask].float()
+                    eos_scores = eos_logits[:, SEQ_EOS_ID]
+                    eos_probability_sum[name] += float(
+                        torch.softmax(eos_logits, dim=-1)[:, SEQ_EOS_ID].sum()
+                    )
+                    eos_rank_sum[name] += float(
+                        (eos_logits > eos_scores.unsqueeze(-1)).sum(dim=-1).add(1).sum()
+                    )
+                    eos_count[name] += int(eos_mask.sum())
 
     val_loss = torch.stack(losses).mean()
     task_losses = {
@@ -639,9 +668,41 @@ def validate(
         for name in task_regions
         if task_tok_count[name] > 0
     }
+    eos_metrics = {}
+    for name in task_regions:
+        if eos_count[name] > 0:
+            eos_metrics[f"val_eos_probability_{name}"] = (
+                eos_probability_sum[name] / eos_count[name]
+            )
+            eos_metrics[f"val_eos_rank_{name}"] = eos_rank_sum[name] / eos_count[name]
     model.train()
     fabric.barrier()
-    return val_loss, task_losses
+    return val_loss, task_losses, eos_metrics
+
+
+def byte_weighted_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    eos_loss_weight: float = 1.0,
+) -> torch.Tensor:
+    """Weight positive SEQ_EOS targets without changing ordinary byte labels."""
+    if eos_loss_weight <= 0:
+        raise ValueError("eos_loss_weight must be positive")
+    if eos_loss_weight == 1.0:
+        return chunked_cross_entropy(logits, targets)
+
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    losses = torch.nn.functional.cross_entropy(
+        flat_logits,
+        flat_targets,
+        ignore_index=IGNORE_INDEX,
+        reduction="none",
+    )
+    supervised = flat_targets != IGNORE_INDEX
+    weights = torch.ones_like(losses)
+    weights[flat_targets == SEQ_EOS_ID] = eos_loss_weight
+    return (losses * weights).sum() / supervised.sum().clamp_min(1)
 
 
 def get_model_inputs_and_targets(batch, max_seq_length: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
