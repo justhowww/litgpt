@@ -82,6 +82,7 @@ def setup(
     compile_model: bool = True,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
     eos_loss_weight: float = 1.0,
+    eos_aux_loss_weight: float = 0.0,
 ):
     """Pretrain a model.
 
@@ -184,6 +185,7 @@ def setup(
         checkpoint_hparams=hparams,
         reconstruction_eval=reconstruction_eval,
         eos_loss_weight=eos_loss_weight,
+        eos_aux_loss_weight=eos_aux_loss_weight,
     )
 
 
@@ -206,6 +208,7 @@ def main(
     checkpoint_hparams: dict | None = None,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
     eos_loss_weight: float = 1.0,
+    eos_aux_loss_weight: float = 0.0,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -314,6 +317,7 @@ def main(
         reconstruction_eval=reconstruction_eval,
         reconstruction_samples=reconstruction_samples,
         eos_loss_weight=eos_loss_weight,
+        eos_aux_loss_weight=eos_aux_loss_weight,
     )
 
     # Save final checkpoint
@@ -360,6 +364,7 @@ def fit(
     reconstruction_eval: ReconstructionEvalConfig | None = None,
     reconstruction_samples: dict[str, list] | None = None,
     eos_loss_weight: float = 1.0,
+    eos_aux_loss_weight: float = 0.0,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -425,7 +430,12 @@ def fit(
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(**model_inputs)
-            loss = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
+            loss = byte_training_loss(
+                logits,
+                targets,
+                eos_loss_weight=eos_loss_weight,
+                eos_aux_loss_weight=eos_aux_loss_weight,
+            )
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         running_loss.update(loss.detach())
@@ -703,6 +713,57 @@ def byte_weighted_cross_entropy(
     weights = torch.ones_like(losses)
     weights[flat_targets == SEQ_EOS_ID] = eos_loss_weight
     return (losses * weights).sum() / supervised.sum().clamp_min(1)
+
+
+def balanced_eos_auxiliary_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize early EOS and missed EOS with equal positive/negative class weight."""
+    flat_logits = logits.reshape(-1, logits.size(-1)).float()
+    flat_targets = targets.reshape(-1)
+    supervised = flat_targets != IGNORE_INDEX
+    positive = supervised & (flat_targets == SEQ_EOS_ID)
+    negative = supervised & (flat_targets != SEQ_EOS_ID)
+
+    # Treat EOS versus all byte/control tokens as a binary classification
+    # problem. Normalizing each class separately prevents the many non-EOS
+    # positions from overwhelming the single endpoint in each sample.
+    eos_binary_logits = flat_logits[:, SEQ_EOS_ID] - torch.logsumexp(
+        torch.cat(
+            [
+                flat_logits[:, :SEQ_EOS_ID],
+                flat_logits[:, SEQ_EOS_ID + 1 :],
+            ],
+            dim=-1,
+        ),
+        dim=-1,
+    )
+    binary_targets = positive.to(flat_logits.dtype)
+    losses = torch.nn.functional.binary_cross_entropy_with_logits(
+        eos_binary_logits,
+        binary_targets,
+        reduction="none",
+    )
+    positive_loss = losses[positive].sum() / positive.sum().clamp_min(1)
+    negative_loss = losses[negative].sum() / negative.sum().clamp_min(1)
+    return 0.5 * (positive_loss + negative_loss)
+
+
+def byte_training_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eos_loss_weight: float = 1.0,
+    eos_aux_loss_weight: float = 0.0,
+) -> torch.Tensor:
+    """Combine byte CE with an optional balanced EOS calibration objective."""
+    if eos_aux_loss_weight < 0:
+        raise ValueError("eos_aux_loss_weight must be non-negative")
+    loss = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
+    if eos_aux_loss_weight == 0:
+        return loss
+    return loss + eos_aux_loss_weight * balanced_eos_auxiliary_loss(logits, targets)
 
 
 def get_model_inputs_and_targets(batch, max_seq_length: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:

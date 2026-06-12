@@ -116,6 +116,15 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Positive loss weight for SEQ_EOS targets. Requires --use-eos when not 1.",
     )
+    parser.add_argument(
+        "--eos-aux-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for a class-balanced EOS-vs-non-EOS auxiliary loss. "
+            "Requires --use-eos when positive."
+        ),
+    )
     parser.add_argument("--fim-min-gap", type=int, default=64)
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
@@ -136,6 +145,10 @@ def main() -> None:
         raise ValueError("--eos-loss-weight must be positive")
     if args.eos_loss_weight != 1.0 and not args.use_eos:
         raise ValueError("--eos-loss-weight requires --use-eos")
+    if args.eos_aux_loss_weight < 0:
+        raise ValueError("--eos-aux-loss-weight must be non-negative")
+    if args.eos_aux_loss_weight > 0 and not args.use_eos:
+        raise ValueError("--eos-aux-loss-weight requires --use-eos")
     # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.
     torch.set_float32_matmul_precision("high")
 
@@ -234,6 +247,7 @@ def main() -> None:
         compile_model=args.compile,
         reconstruction_eval=reconstruction_eval,
         eos_loss_weight=args.eos_loss_weight,
+        eos_aux_loss_weight=args.eos_aux_loss_weight,
     )
 
 

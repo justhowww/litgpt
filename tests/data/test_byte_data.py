@@ -350,6 +350,20 @@ def test_reference_slices_are_dropped_whole_when_context_is_tight(tmp_path):
     )  # Target supervision is preserved after dropping refs.
 
 
+def test_short_slice_falls_back_to_ar_instead_of_clamping_fim_gap(tmp_path):
+    """Preserves the configured FIM minimum instead of silently sampling a smaller gap."""
+    ds = make_dataset(
+        tmp_path,
+        p_fim=1.0,
+        fim_min_gap=1024,
+        fim_max_gap=8192,
+    )
+
+    sample = ds[0]
+
+    assert sample["sample_meta"]["task"] == "ar"  # Ineligible short slices remain valid AR examples.
+
+
 def test_collate_pads_with_byte_constants(tmp_path):
     """Pads batched tensors with byte-data constants understood by the model/loss."""
     ds = make_dataset(tmp_path, p_fim=0.0, num_ref_slices=1)

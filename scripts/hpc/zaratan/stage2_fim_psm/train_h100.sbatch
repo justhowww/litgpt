@@ -33,6 +33,7 @@ FIM_FORMAT=${FIM_FORMAT:-psm}
 # baseline (which writes to a distinct, untagged directory).
 USE_EOS=${USE_EOS:-1}
 EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1}
+EOS_AUX_LOSS_WEIGHT=${EOS_AUX_LOSS_WEIGHT:-0}
 if [[ "${USE_EOS}" == "1" ]]; then
     EOS_TAG="-eos"
 else
@@ -102,6 +103,7 @@ if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
 fi
 cmd+=(--eos-loss-weight "${EOS_LOSS_WEIGHT}")
+cmd+=(--eos-aux-loss-weight "${EOS_AUX_LOSS_WEIGHT}")
 if [[ "${RECONSTRUCTION_ORACLE_LENGTH}" == "1" ]]; then
     cmd+=(--reconstruction-oracle-length)
 fi

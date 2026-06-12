@@ -366,6 +366,10 @@ class ByteSliceDataset(Dataset):
             raise ValueError("num_ref_slices must be non-negative")
         if reference_mode not in REFERENCE_MODES:
             raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
+        if fim_min_gap < 1:
+            raise ValueError("fim_min_gap must be positive")
+        if fim_max_gap < fim_min_gap:
+            raise ValueError("fim_max_gap must be greater than or equal to fim_min_gap")
 
         self.rows = rows
         self.max_seq_length = max_seq_length
@@ -412,7 +416,9 @@ class ByteSliceDataset(Dataset):
         target_nal = nals[sample.target_index]
         target = bytes_to_ids(data[target_nal.start : target_nal.end])
 
-        if self.p_fim > 0 and rng.random() < self.p_fim:
+        fim_selected = self.p_fim > 0 and rng.random() < self.p_fim
+        fim_eligible = self._max_fim_gap(target, target_nal) >= self.fim_min_gap
+        if fim_selected and fim_eligible:
             return self._build_fim_item(
                 meta, ref_chunks, target, target_nal, rng, sample, reference_source_path
             )
@@ -760,19 +766,23 @@ class ByteSliceDataset(Dataset):
             target.numel() - 2,
             target_nal.start_code_len + 1 + self.slice_header_guard_bytes,
         )
-        max_gap = min(self.fim_max_gap, target.numel() - protected - 1)
-        if max_gap < 1:
-            split = max(1, target.numel() // 2)
-            gap = 1
-        else:
-            min_gap = min(self.fim_min_gap, max_gap)
-            gap = rng.randint(min_gap, max_gap)
-            split = rng.randint(protected, target.numel() - gap)
+        max_gap = self._max_fim_gap(target, target_nal)
+        if max_gap < self.fim_min_gap:
+            raise ValueError("Target slice cannot fit the configured minimum FIM gap")
+        gap = rng.randint(self.fim_min_gap, max_gap)
+        split = rng.randint(protected, target.numel() - gap)
 
         prefix = target[:split]
         missing = target[split : split + gap]
         orphan = target[split + gap :]
         return prefix, missing, orphan, split
+
+    def _max_fim_gap(self, target: Tensor, target_nal: NALUnit) -> int:
+        protected = min(
+            target.numel() - 2,
+            target_nal.start_code_len + 1 + self.slice_header_guard_bytes,
+        )
+        return min(self.fim_max_gap, target.numel() - protected - 1)
 
     def _pack_item(
         self,
