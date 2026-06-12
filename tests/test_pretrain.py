@@ -87,7 +87,7 @@ def test_pretrain(_, tmp_path):
 
 
 @_RunIf(min_cuda_gpus=2, standalone=True)
-@mock.patch("litgpt.pretrain.L.Fabric.load_raw")
+@mock.patch("litgpt.pretrain.L.Fabric.load")
 # See comment in `test_pretrain` why we need to mock `save_hyperparameters()`
 @mock.patch("litgpt.pretrain.save_hyperparameters")
 def test_initial_checkpoint_dir(_, load_mock, tmp_path):
@@ -106,7 +106,9 @@ def test_initial_checkpoint_dir(_, load_mock, tmp_path):
         out_dir=tmp_path,
     )
 
-    load_mock.assert_called_once_with(tmp_path / "lit_model.pth", ANY)
+    load_mock.assert_called_once_with(
+        tmp_path / "lit_model.pth", {"model": ANY}, weights_only=False
+    )
 
 
 @pytest.mark.parametrize(("strategy", "expected"), [(SingleDeviceStrategy, True), (FSDPStrategy, False)])

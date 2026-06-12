@@ -300,9 +300,6 @@ def main(
         reconstruction_samples = {}
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
-    if initial_checkpoint_dir:
-        fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
-
     state = {
         "model": model,
         "optimizer": optimizer,
@@ -310,6 +307,15 @@ def main(
         "iter_num": 0,
         "step_count": 0,
     }
+
+    if initial_checkpoint_dir:
+        checkpoint_path = initial_checkpoint_dir / "lit_model.pth"
+        fabric.print(f"Initializing model weights from {checkpoint_path}")
+        # LitGPT training checkpoints contain optimizer and DataLoader objects,
+        # not only a raw state_dict. Load just the model entry from this trusted
+        # local checkpoint; PyTorch 2.6+ otherwise rejects those extra objects
+        # under its default weights-only policy.
+        fabric.load(checkpoint_path, {"model": model}, weights_only=False)
 
     resume = find_resume_path(resume, out_dir)
     if resume:
