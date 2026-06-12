@@ -289,15 +289,20 @@ def decode_frame(
     timeout_sec: int,
     *,
     error_exploding: bool = False,
+    strict_syntax: bool = False,
 ) -> tuple[Tensor | None, str]:
-    """Decode one frame, optionally rejecting errors FFmpeg would normally tolerate."""
+    """Decode one frame, optionally disabling concealment and rejecting errors."""
     command = [
         ffmpeg_binary,
         "-hide_banner",
         "-loglevel",
         "error",
     ]
-    if error_exploding:
+    if strict_syntax:
+        command.extend(
+            ["-ec", "0", "-err_detect", "explode+bitstream+buffer+compliant"]
+        )
+    elif error_exploding:
         command.extend(["-err_detect", "explode"])
     command.extend(
         [
@@ -327,7 +332,7 @@ def decode_frame(
         )
     except subprocess.TimeoutExpired:
         return None, "timeout"
-    if error_exploding and result.returncode != 0:
+    if (error_exploding or strict_syntax) and result.returncode != 0:
         return None, "decoder_error"
     if not result.stdout:
         return None, "no_frame"

@@ -227,6 +227,28 @@ def test_error_exploding_rejects_nonzero_ffmpeg_exit(monkeypatch):
     assert commands[1][commands[1].index("-err_detect") + 1] == "explode"  # Strict mode requests error explosion.
 
 
+def test_strict_syntax_disables_concealment_and_checks_multiple_error_classes(monkeypatch):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1, stdout=b"")
+
+    monkeypatch.setattr("litgpt.eval.byte_reconstruction.subprocess.run", fake_run)
+
+    image, status = decode_frame(
+        b"stream", 0, "ffmpeg", 5, strict_syntax=True
+    )
+
+    assert image is None  # Strict MRT decoding does not accept a failed decoder output.
+    assert status == "decoder_error"  # Syntax rejection is distinct from a missing frame.
+    assert commands[0][commands[0].index("-ec") + 1] == "0"  # Concealment is disabled.
+    assert (
+        commands[0][commands[0].index("-err_detect") + 1]
+        == "explode+bitstream+buffer+compliant"
+    )  # Multiple syntax/error classes are fatal.
+
+
 def test_reconstruction_metrics_are_namespaced_by_task():
     metrics = {
         "reconstruction/decode_rate": 1.0,

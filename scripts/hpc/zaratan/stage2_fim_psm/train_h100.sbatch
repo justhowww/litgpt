@@ -53,6 +53,19 @@ RECONSTRUCTION_ERROR_EXPLODING=${RECONSTRUCTION_ERROR_EXPLODING:-0}
 RECONSTRUCTION_FIM_BASELINES=${RECONSTRUCTION_FIM_BASELINES:-0}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
+INITIAL_CHECKPOINT_DIR=${INITIAL_CHECKPOINT_DIR:-}
+MRT_INTERVAL=${MRT_INTERVAL:-0}
+MRT_START_STEP=${MRT_START_STEP:-0}
+MRT_NUM_CANDIDATES=${MRT_NUM_CANDIDATES:-16}
+MRT_CONTEXT_POOL_SIZE=${MRT_CONTEXT_POOL_SIZE:-64}
+MRT_MAX_TARGET_BYTES=${MRT_MAX_TARGET_BYTES:-2048}
+MRT_TEMPERATURE=${MRT_TEMPERATURE:-1.0}
+MRT_CANDIDATE_ALPHA=${MRT_CANDIDATE_ALPHA:-1.0}
+MRT_WEIGHT=${MRT_WEIGHT:-4.0}
+MRT_MSE_WEIGHT=${MRT_MSE_WEIGHT:-1000.0}
+MRT_DECODE_FAILURE_WEIGHT=${MRT_DECODE_FAILURE_WEIGHT:-2.0}
+MRT_MAX_RISK=${MRT_MAX_RISK:-2.0}
+MRT_DECODE_WORKERS=${MRT_DECODE_WORKERS:-8}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable: ${MANIFEST}" >&2
@@ -97,8 +110,28 @@ cmd=(
     --ffmpeg-binary "${FFMPEG_BINARY}"
     --save-interval 500
     --compile
-    --resume
 )
+if [[ -n "${INITIAL_CHECKPOINT_DIR}" ]]; then
+    cmd+=(--initial-checkpoint-dir "${INITIAL_CHECKPOINT_DIR}")
+else
+    cmd+=(--resume)
+fi
+if (( MRT_INTERVAL > 0 )); then
+    cmd+=(
+        --mrt-interval "${MRT_INTERVAL}"
+        --mrt-start-step "${MRT_START_STEP}"
+        --mrt-num-candidates "${MRT_NUM_CANDIDATES}"
+        --mrt-context-pool-size "${MRT_CONTEXT_POOL_SIZE}"
+        --mrt-max-target-bytes "${MRT_MAX_TARGET_BYTES}"
+        --mrt-temperature "${MRT_TEMPERATURE}"
+        --mrt-candidate-alpha "${MRT_CANDIDATE_ALPHA}"
+        --mrt-weight "${MRT_WEIGHT}"
+        --mrt-mse-weight "${MRT_MSE_WEIGHT}"
+        --mrt-decode-failure-weight "${MRT_DECODE_FAILURE_WEIGHT}"
+        --mrt-max-risk "${MRT_MAX_RISK}"
+        --mrt-decode-workers "${MRT_DECODE_WORKERS}"
+    )
+fi
 if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
 fi

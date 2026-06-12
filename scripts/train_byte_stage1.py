@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from litgpt.args import EvalArgs, TrainArgs
+from litgpt.byte_mrt import MRTConfig
 from litgpt.config import Config
 from litgpt.data.byte_data import (
     FIM_FORMATS,
@@ -133,6 +134,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-offset-id", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--initial-checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Initialize model weights from a LitGPT checkpoint directory.",
+    )
+    parser.add_argument("--mrt-interval", type=int, default=0)
+    parser.add_argument("--mrt-start-step", type=int, default=0)
+    parser.add_argument("--mrt-num-candidates", type=int, default=16)
+    parser.add_argument("--mrt-context-pool-size", type=int, default=64)
+    parser.add_argument("--mrt-max-target-bytes", type=int, default=2048)
+    parser.add_argument("--mrt-temperature", type=float, default=1.0)
+    parser.add_argument("--mrt-candidate-alpha", type=float, default=1.0)
+    parser.add_argument("--mrt-weight", type=float, default=4.0)
+    parser.add_argument("--mrt-mse-weight", type=float, default=1000.0)
+    parser.add_argument("--mrt-decode-failure-weight", type=float, default=2.0)
+    parser.add_argument("--mrt-max-risk", type=float, default=2.0)
+    parser.add_argument("--mrt-decode-workers", type=int, default=8)
     parser.add_argument("--precision", default=None)
     parser.add_argument("--logger-name", default="tensorboard")
     parser.add_argument("--seed", type=int, default=42)
@@ -149,6 +168,12 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight must be non-negative")
     if args.eos_aux_loss_weight > 0 and not args.use_eos:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
+    if args.resume and args.initial_checkpoint_dir is not None:
+        raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
+    if args.mrt_interval > 0 and not args.use_eos:
+        raise ValueError("MRT requires --use-eos for variable-length candidates")
+    if args.mrt_interval > 0 and args.p_fim <= 0:
+        raise ValueError("MRT requires a non-zero --p-fim")
     # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.
     torch.set_float32_matmul_precision("high")
 
@@ -228,6 +253,24 @@ def main() -> None:
         if args.reconstruction_eval_interval > 0
         else None
     )
+    mrt = MRTConfig(
+        interval=args.mrt_interval,
+        start_step=args.mrt_start_step,
+        num_candidates=args.mrt_num_candidates,
+        context_pool_size=args.mrt_context_pool_size,
+        max_target_bytes=args.mrt_max_target_bytes,
+        temperature=args.mrt_temperature,
+        candidate_alpha=args.mrt_candidate_alpha,
+        weight=args.mrt_weight,
+        mse_weight=args.mrt_mse_weight,
+        decode_failure_weight=args.mrt_decode_failure_weight,
+        max_risk=args.mrt_max_risk,
+        timeout_sec=args.reconstruction_timeout_sec,
+        decode_workers=args.mrt_decode_workers,
+        ffmpeg_binary=args.ffmpeg_binary,
+    )
+    if mrt.enabled:
+        mrt.validate()
 
     setup(
         model_name=args.model_name,
@@ -235,6 +278,7 @@ def main() -> None:
         out_dir=args.out_dir,
         precision=args.precision,
         resume="auto" if args.resume else False,
+        initial_checkpoint_dir=args.initial_checkpoint_dir,
         data=data,
         train=train,
         eval=eval_args,
@@ -248,6 +292,7 @@ def main() -> None:
         reconstruction_eval=reconstruction_eval,
         eos_loss_weight=args.eos_loss_weight,
         eos_aux_loss_weight=args.eos_aux_loss_weight,
+        mrt=mrt,
     )
 
 

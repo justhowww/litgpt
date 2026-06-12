@@ -20,6 +20,12 @@ from torchmetrics.aggregation import RunningMean
 
 from litgpt import Tokenizer
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
+from litgpt.byte_mrt import (
+    MRTConfig,
+    candidate_mean_log_probability,
+    prepare_mrt_step,
+    should_run_mrt,
+)
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
@@ -83,6 +89,7 @@ def setup(
     reconstruction_eval: ReconstructionEvalConfig | None = None,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
+    mrt: MRTConfig | None = None,
 ):
     """Pretrain a model.
 
@@ -186,6 +193,7 @@ def setup(
         reconstruction_eval=reconstruction_eval,
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
+        mrt=mrt,
     )
 
 
@@ -209,6 +217,7 @@ def main(
     reconstruction_eval: ReconstructionEvalConfig | None = None,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
+    mrt: MRTConfig | None = None,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -256,6 +265,27 @@ def main(
         )
         for task in reconstruction_tasks
     }
+    mrt_samples = []
+    if mrt is not None and mrt.enabled:
+        mrt.validate()
+        if fabric.world_size != 1:
+            raise ValueError("Online byte MRT currently supports one device only")
+        mrt_samples = select_reconstruction_samples(
+            train_dataloader.dataset,
+            mrt.context_pool_size,
+            mrt.max_target_bytes,
+            "fim",
+        )
+        if not mrt_samples:
+            raise ValueError("MRT is enabled but no eligible FIM samples were found")
+        if fabric.global_rank == 0:
+            save_reconstruction_sample_manifest(
+                mrt_samples, out_dir / "mrt_training_samples.json"
+            )
+        fabric.print(
+            f"Online MRT enabled: {len(mrt_samples)} FIM contexts, "
+            f"{mrt.num_candidates} candidates every {mrt.interval} steps"
+        )
     if reconstruction_eval is not None and fabric.global_rank == 0:
         for task, samples in reconstruction_samples.items():
             manifest_name = (
@@ -318,6 +348,8 @@ def main(
         reconstruction_samples=reconstruction_samples,
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
+        mrt=mrt,
+        mrt_samples=mrt_samples,
     )
 
     # Save final checkpoint
@@ -365,6 +397,8 @@ def fit(
     reconstruction_samples: dict[str, list] | None = None,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
+    mrt: MRTConfig | None = None,
+    mrt_samples: list | None = None,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -428,6 +462,11 @@ def fit(
         model_inputs, targets = get_model_inputs_and_targets(train_data, model.max_seq_length)
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
+        run_mrt = (
+            not is_accumulating
+            and mrt is not None
+            and should_run_mrt(state["step_count"] + 1, mrt)
+        )
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(**model_inputs)
             loss = byte_training_loss(
@@ -438,6 +477,45 @@ def fit(
             )
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
+        mrt_metrics = None
+        if run_mrt:
+            assert mrt is not None and mrt_samples
+            next_step = state["step_count"] + 1
+            mrt_update_index = (next_step - mrt.start_step) // mrt.interval - 1
+            context_index = mrt_update_index % len(mrt_samples)
+            prepared = prepare_mrt_step(
+                model, mrt_samples[context_index], mrt, fabric.device
+            )
+            if prepared is not None:
+                for candidate, coefficient in zip(
+                    prepared.candidates, prepared.coefficients
+                ):
+                    if abs(float(coefficient)) < 1e-8:
+                        continue
+                    with fabric.autocast():
+                        score = candidate_mean_log_probability(
+                            model,
+                            prepared.sample,
+                            candidate,
+                            fabric.device,
+                            temperature=mrt.temperature,
+                        )
+                    # MRT uses one context per optimizer step, so unlike CE it
+                    # must not be divided by gradient accumulation.
+                    fabric.backward(mrt.weight * coefficient * score)
+                mrt_metrics = {
+                    "mrt/skipped": 0.0,
+                    "mrt/expected_risk": prepared.expected_risk,
+                    "mrt/decode_rate": prepared.decode_rate,
+                    "mrt/ground_truth_probability": prepared.ground_truth_probability,
+                    "mrt/num_unique_candidates": float(len(prepared.candidates)),
+                    "mrt/risk_min": float(prepared.risks.min()),
+                    "mrt/risk_mean": float(prepared.risks.mean()),
+                    "mrt/risk_max": float(prepared.risks.max()),
+                }
+            else:
+                mrt_metrics = {"mrt/skipped": 1.0}
+
         running_loss.update(loss.detach())
 
         if not is_accumulating:
@@ -445,6 +523,19 @@ def fit(
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
+            if mrt_metrics is not None:
+                fabric.log_dict(mrt_metrics, step=state["iter_num"] - 1)
+                if mrt_metrics["mrt/skipped"]:
+                    fabric.print(
+                        f"MRT step {state['step_count']} skipped: reference frame did not decode strictly"
+                    )
+                else:
+                    fabric.print(
+                        "MRT step "
+                        f"{state['step_count']} | risk: {mrt_metrics['mrt/expected_risk']:.4f}, "
+                        f"decode: {mrt_metrics['mrt/decode_rate']:.1%}, "
+                        f"unique: {int(mrt_metrics['mrt/num_unique_candidates'])}"
+                    )
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
