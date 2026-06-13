@@ -407,6 +407,11 @@ def fit(
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
         fabric.device
     )
+    # Track the CE represented by one optimizer step. MRT is applied only at
+    # the accumulation boundary, so a single final microbatch is not a fair
+    # scalar comparison with its decoder-risk update.
+    step_ce_sum = torch.zeros((), device=fabric.device)
+    step_ce_count = 0
     fabric.barrier()
     total_t0 = time.perf_counter()
 
@@ -443,12 +448,35 @@ def fit(
                 * loss
                 / train.gradient_accumulation_iters(devices, num_nodes)
             )
+        step_ce_sum += loss.detach()
+        step_ce_count += 1
 
         mrt_metrics = None
         if run_mrt:
+            weighted_ce_grad_norm = byte_runtime.gradient_l2_norm(model)
+            ce_gradients = byte_runtime.capture_gradients(model)
             mrt_metrics = byte_runtime.run_mrt(
                 fabric, model, state["step_count"] + 1
             )
+            if mrt_metrics is not None and not mrt_metrics["mrt/skipped"]:
+                raw_ce_step = float(step_ce_sum / step_ce_count)
+                weighted_ce_step = byte_runtime.ce_loss_weight * raw_ce_step
+                weighted_risk = mrt_metrics["mrt/weighted_expected_risk"]
+                mrt_metrics.update(
+                    {
+                        "optimization/raw_ce_step": raw_ce_step,
+                        "optimization/weighted_ce_step": weighted_ce_step,
+                        "optimization/combined_objective_sampled": weighted_ce_step
+                        + weighted_risk,
+                        "optimization/weighted_ce_grad_norm": weighted_ce_grad_norm,
+                        "optimization/mrt_grad_norm": byte_runtime.gradient_delta_l2_norm(
+                            model, ce_gradients
+                        ),
+                        "optimization/combined_grad_norm_pre_clip": byte_runtime.gradient_l2_norm(
+                            model
+                        ),
+                    }
+                )
 
         running_loss.update(loss.detach())
 
@@ -461,6 +489,8 @@ def fit(
                 byte_runtime.log_mrt(
                     fabric, mrt_metrics, state["step_count"], state["iter_num"]
                 )
+            step_ce_sum.zero_()
+            step_ce_count = 0
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization

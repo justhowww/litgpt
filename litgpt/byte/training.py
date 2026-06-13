@@ -193,6 +193,8 @@ class ByteTrainingRuntime:
         metrics = {
             "mrt/skipped": 0.0,
             "mrt/expected_risk": prepared.expected_risk,
+            "mrt/weighted_expected_risk": config.weight
+            * prepared.expected_risk,
             "mrt/decode_rate": prepared.decode_rate,
             "mrt/ground_truth_probability": prepared.ground_truth_probability,
             "mrt/num_unique_candidates": float(len(prepared.candidates)),
@@ -216,6 +218,45 @@ class ByteTrainingRuntime:
             )
         return metrics
 
+    @staticmethod
+    def gradient_l2_norm(model: nn.Module) -> float:
+        """Return the global L2 norm of the gradients currently on the model."""
+        total = None
+        for parameter in model.parameters():
+            if parameter.grad is None:
+                continue
+            squared_norm = parameter.grad.detach().float().square().sum()
+            total = squared_norm if total is None else total + squared_norm
+        return 0.0 if total is None else float(total.sqrt())
+
+    @staticmethod
+    def capture_gradients(model: nn.Module) -> tuple[Tensor | None, ...]:
+        """Snapshot current gradients so a later backward contribution is measurable."""
+        return tuple(
+            None if parameter.grad is None else parameter.grad.detach().clone()
+            for parameter in model.parameters()
+        )
+
+    @staticmethod
+    def gradient_delta_l2_norm(
+        model: nn.Module, before: tuple[Tensor | None, ...]
+    ) -> float:
+        """Return the L2 norm of gradients added since ``before`` was captured."""
+        total = None
+        for parameter, previous in zip(model.parameters(), before):
+            current = parameter.grad
+            if current is None and previous is None:
+                continue
+            if current is None:
+                delta = -previous
+            elif previous is None:
+                delta = current.detach()
+            else:
+                delta = current.detach() - previous
+            squared_norm = delta.float().square().sum()
+            total = squared_norm if total is None else total + squared_norm
+        return 0.0 if total is None else float(total.sqrt())
+
     def log_mrt(
         self, fabric: Fabric, metrics: dict[str, float], step: int, iter_num: int
     ) -> None:
@@ -227,6 +268,13 @@ class ByteTrainingRuntime:
         else:
             fabric.print(
                 f"MRT step {step} | risk: {metrics['mrt/expected_risk']:.4f}, "
+                f"objective: {metrics['optimization/combined_objective_sampled']:.4f}, "
+                f"CE(raw/weighted): {metrics['optimization/raw_ce_step']:.4f}/"
+                f"{metrics['optimization/weighted_ce_step']:.4f}, "
+                f"grad(CE/MRT/combined): "
+                f"{metrics['optimization/weighted_ce_grad_norm']:.4f}/"
+                f"{metrics['optimization/mrt_grad_norm']:.4f}/"
+                f"{metrics['optimization/combined_grad_norm_pre_clip']:.4f}, "
                 f"spread: {metrics['mrt/risk_std']:.4f}, "
                 f"decode: {metrics['mrt/decode_rate']:.1%}, "
                 f"unique: {int(metrics['mrt/num_unique_candidates'])}"
