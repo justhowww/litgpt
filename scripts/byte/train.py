@@ -76,6 +76,14 @@ def parse_args() -> argparse.Namespace:
         help="Also generate exactly the known target length while excluding control tokens.",
     )
     parser.add_argument(
+        "--reconstruction-learned-eos",
+        action="store_true",
+        help=(
+            "Allow EOS stopping during reconstruction even when EOS is absent "
+            "from dataset labels."
+        ),
+    )
+    parser.add_argument(
         "--reconstruction-error-exploding",
         action="store_true",
         help="Also decode candidates with FFmpeg -err_detect explode.",
@@ -164,6 +172,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate and score exactly the known missing-span byte length.",
     )
+    parser.add_argument(
+        "--mrt-learned-eos",
+        action="store_true",
+        help="Allow MRT to learn EOS stopping without supervised EOS targets.",
+    )
     parser.add_argument("--mrt-temperature", type=float, default=1.0)
     parser.add_argument("--mrt-candidate-alpha", type=float, default=1.0)
     parser.add_argument("--mrt-weight", type=float, default=4.0)
@@ -209,9 +222,22 @@ def main() -> None:
         raise ValueError("--ce-byte-only cannot train supervised EOS targets")
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
-    if args.mrt_interval > 0 and not args.use_eos and not args.mrt_oracle_length:
+    if (
+        args.mrt_interval > 0
+        and not args.use_eos
+        and not args.mrt_oracle_length
+        and not args.mrt_learned_eos
+    ):
         raise ValueError(
-            "MRT requires --use-eos unless --mrt-oracle-length is enabled"
+            "MRT requires --use-eos, --mrt-oracle-length, or --mrt-learned-eos"
+        )
+    if args.mrt_oracle_length and args.mrt_learned_eos:
+        raise ValueError(
+            "--mrt-oracle-length and --mrt-learned-eos are mutually exclusive"
+        )
+    if args.reconstruction_oracle_length and args.reconstruction_learned_eos:
+        raise ValueError(
+            "Reconstruction oracle length and learned EOS are mutually exclusive"
         )
     if args.mrt_interval > 0 and args.p_fim <= 0:
         raise ValueError("MRT requires a non-zero --p-fim")
@@ -290,6 +316,7 @@ def main() -> None:
             evaluate_oracle_length=args.reconstruction_oracle_length,
             evaluate_error_exploding=args.reconstruction_error_exploding,
             evaluate_fim_baselines=args.reconstruction_fim_baselines,
+            learned_eos_stopping=args.reconstruction_learned_eos,
         )
         if args.reconstruction_eval_interval > 0
         else None
@@ -301,6 +328,7 @@ def main() -> None:
         context_pool_size=args.mrt_context_pool_size,
         max_target_bytes=args.mrt_max_target_bytes,
         oracle_length=args.mrt_oracle_length,
+        learned_eos=args.mrt_learned_eos,
         temperature=args.mrt_temperature,
         candidate_alpha=args.mrt_candidate_alpha,
         weight=args.mrt_weight,

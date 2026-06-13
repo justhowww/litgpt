@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 from litgpt.byte_mrt import (
@@ -41,6 +42,13 @@ def test_mrt_schedule_runs_after_each_complete_interval():
     assert not should_run_mrt(1007, config)  # Seven optimizer steps remain CE+EOS only.
     assert should_run_mrt(1008, config)  # The eighth optimizer step receives MRT.
     assert should_run_mrt(1016, config)  # The cadence repeats at the configured interval.
+
+
+def test_mrt_length_modes_are_mutually_exclusive():
+    config = MRTConfig(interval=1, oracle_length=True, learned_eos=True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        config.validate()
 
 
 def test_minimum_risk_coefficients_favor_lower_risk_candidates():

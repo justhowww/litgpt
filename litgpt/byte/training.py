@@ -81,6 +81,7 @@ class ByteTrainingRuntime:
                     reconstruction_config.num_samples,
                     reconstruction_config.max_target_bytes,
                     task,
+                    force_eos_stopping=reconstruction_config.learned_eos_stopping,
                 )
                 for task in tasks
             }
@@ -112,6 +113,7 @@ class ByteTrainingRuntime:
                 mrt_config.context_pool_size,
                 mrt_config.max_target_bytes,
                 "fim",
+                force_eos_stopping=mrt_config.learned_eos,
             )
             if not mrt_samples:
                 raise ValueError(

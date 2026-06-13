@@ -35,6 +35,7 @@ class MRTConfig:
     context_pool_size: int = 64
     max_target_bytes: int = 2048
     oracle_length: bool = False
+    learned_eos: bool = False
     temperature: float = 1.0
     candidate_alpha: float = 1.0
     weight: float = 4.0
@@ -62,6 +63,10 @@ class MRTConfig:
             raise ValueError("MRT context pool size must be positive")
         if self.max_target_bytes <= 0:
             raise ValueError("MRT max target bytes must be positive")
+        if self.oracle_length and self.learned_eos:
+            raise ValueError(
+                "MRT oracle length and learned EOS are mutually exclusive"
+            )
         if self.temperature <= 0:
             raise ValueError("MRT temperature must be positive")
         if self.candidate_alpha <= 0:
@@ -235,9 +240,10 @@ def sample_candidates(
     num_candidates: int,
     temperature: float,
     oracle_length: bool = False,
+    learned_eos: bool = False,
 ) -> list[Candidate]:
     """Sample byte spans in one batched KV-cache decode."""
-    if not oracle_length and sample.stop_token != SEQ_EOS_ID:
+    if not oracle_length and not learned_eos and sample.stop_token != SEQ_EOS_ID:
         raise ValueError("MRT candidate generation requires SEQ_EOS supervision")
 
     raw_model = _unwrap_model(model)
@@ -413,6 +419,7 @@ def prepare_mrt_step(
         num_candidates=config.num_candidates - 1,
         temperature=config.temperature,
         oracle_length=config.oracle_length,
+        learned_eos=config.learned_eos,
     )
     candidates: list[Candidate] = []
     seen: set[tuple[bytes, bool]] = set()

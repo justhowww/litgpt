@@ -39,6 +39,7 @@ class ReconstructionEvalConfig:
     evaluate_oracle_length: bool = False
     evaluate_error_exploding: bool = False
     evaluate_fim_baselines: bool = False
+    learned_eos_stopping: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,12 @@ class GenerationResult:
 
 
 def select_reconstruction_samples(
-    dataset: object, num_samples: int, max_target_bytes: int, task: str = "ar"
+    dataset: object,
+    num_samples: int,
+    max_target_bytes: int,
+    task: str = "ar",
+    *,
+    force_eos_stopping: bool = False,
 ) -> list[ReconstructionSample]:
     """Select a deterministic prefix of held-out AR or FIM samples."""
     if task not in {"ar", "fim"}:
@@ -133,7 +139,9 @@ def select_reconstruction_samples(
                 generation_offset_start=(
                     replacement_start + 1 if task == "fim" else prompt_end
                 ),
-                stop_token=SEQ_EOS_ID if use_eos else None,
+                stop_token=(
+                    SEQ_EOS_ID if use_eos or force_eos_stopping else None
+                ),
             )
         )
         if len(selected) >= num_samples:
@@ -234,6 +242,18 @@ def generate_target_slice(
                 # Exclude control tokens so this probe isolates byte-content
                 # quality from the model's learned stopping behavior.
                 token = int(next_logits[:BYTE_VOCAB_SIZE].argmax())
+            elif sample.stop_token == SEQ_EOS_ID:
+                # EOS can be an MRT-only action even when it is not part of
+                # dataset supervision or the logical (unpadded) vocabulary.
+                allowed_logits = torch.cat(
+                    (
+                        next_logits[:BYTE_VOCAB_SIZE],
+                        next_logits[SEQ_EOS_ID : SEQ_EOS_ID + 1],
+                    )
+                )
+                token = int(allowed_logits.argmax())
+                if token == BYTE_VOCAB_SIZE:
+                    token = SEQ_EOS_ID
             else:
                 token = int(next_logits[: raw_model.config.vocab_size].argmax())
             if sample.stop_token is not None and token == sample.stop_token:
