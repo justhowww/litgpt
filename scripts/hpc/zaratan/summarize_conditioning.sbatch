@@ -15,4 +15,4 @@ source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 
 : "${ABLATION_ROOT:?Set ABLATION_ROOT to the matched-run output directory}"
 
-python scripts/summarize_conditioning_ablations.py "${ABLATION_ROOT}"
+python scripts/byte/summarize_conditioning_ablations.py "${ABLATION_ROOT}"

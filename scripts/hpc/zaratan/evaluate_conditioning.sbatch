@@ -24,7 +24,7 @@ UNIGRAM_TRAIN_SAMPLES=${UNIGRAM_TRAIN_SAMPLES:-100000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 
-srun python scripts/evaluate_byte_conditioning.py \
+srun python scripts/byte/evaluate_conditioning.py \
     "${CHECKPOINT_DIR}" \
     "${MANIFEST}" \
     --output "${RESULTS_PATH}" \

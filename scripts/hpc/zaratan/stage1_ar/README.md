@@ -10,7 +10,7 @@ builds on, and the reference-mode ablations (`normal` / `no_ref` / `zero_ref` /
 
 ## What's changed vs the shared script
 
-All stages run `scripts/train_byte_stage1.py`. Stage 1 simply leaves the FIM
+All stages run `scripts/byte/train.py`. Stage 1 simply leaves the FIM
 knobs at their defaults:
 
 - `--p-fim` **not passed** -> `0.0`, so every sample is AR (no FIM spans).

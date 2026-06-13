@@ -36,7 +36,7 @@ fi
 
 mkdir -p "${OUT_DIR}"
 
-srun python scripts/train_byte_stage1.py \
+srun python scripts/byte/train.py \
     "${MANIFEST}" \
     --model-name "${MODEL_NAME}" \
     --nal-index-path "${NAL_INDEX}" \

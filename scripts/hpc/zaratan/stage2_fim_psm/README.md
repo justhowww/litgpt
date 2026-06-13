@@ -18,7 +18,7 @@ keep the result interpretable even though no PSM-without-EOS baseline exists.
 
 ## What's changed vs the shared script
 
-Same `scripts/train_byte_stage1.py` as the other stages, with:
+Same `scripts/byte/train.py` as the other stages, with:
 
 - `--fim-format psm` (vs `bridge`)
 - `--use-eos` (vocab lifts to `263` for both formats)

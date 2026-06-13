@@ -46,7 +46,7 @@ fi
 
 mkdir -p "${OUT_DIR}"
 
-srun python scripts/train_byte_stage1.py \
+srun python scripts/byte/train.py \
     "${MANIFEST}" \
     --nal-index-path "${NAL_INDEX}" \
     --out-dir "${OUT_DIR}" \

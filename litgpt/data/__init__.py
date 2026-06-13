@@ -4,7 +4,6 @@ from litgpt.data.alpaca import Alpaca
 from litgpt.data.alpaca_2k import Alpaca2k
 from litgpt.data.alpaca_gpt4 import AlpacaGPT4
 from litgpt.data.base import DataModule, SFTDataset, get_sft_collate_fn
-from litgpt.data.byte_data import ByteDataModule
 from litgpt.data.deita import Deita
 from litgpt.data.flan import FLAN
 from litgpt.data.json_data import JSON
@@ -21,7 +20,6 @@ __all__ = [
     "Alpaca",
     "Alpaca2k",
     "AlpacaGPT4",
-    "ByteDataModule",
     "Deita",
     "FLAN",
     "JSON",

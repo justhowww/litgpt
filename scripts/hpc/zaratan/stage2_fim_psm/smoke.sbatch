@@ -49,7 +49,7 @@ fi
 mkdir -p "${OUT_DIR}"
 
 cmd=(
-    python scripts/train_byte_stage1.py
+    python scripts/byte/train.py
     "${MANIFEST}"
     --model-name "${MODEL_NAME}"
     --nal-index-path "${NAL_INDEX}"

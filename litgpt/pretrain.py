@@ -20,21 +20,21 @@ from torchmetrics.aggregation import RunningMean
 
 from litgpt import Tokenizer
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
-from litgpt.byte_mrt import (
-    MRTConfig,
-    candidate_mean_log_probability,
-    prepare_mrt_step,
-    should_run_mrt,
-)
+from litgpt.byte.mrt import MRTConfig
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
-from litgpt.data.byte_data import IGNORE_INDEX, REGION_BRIDGE, REGION_TARGET, SEQ_EOS_ID
-from litgpt.eval.byte_reconstruction import (
+from litgpt.byte.reconstruction import (
     ReconstructionEvalConfig,
-    run_reconstruction_probe,
-    save_reconstruction_sample_manifest,
-    select_reconstruction_samples,
+)
+from litgpt.byte.training import (
+    ByteTrainingRuntime,
+    balanced_eos_auxiliary_loss,
+    byte_training_loss,
+    byte_weighted_cross_entropy,
+    get_model_inputs_and_targets,
+    namespace_reconstruction_metrics,
+    validate,
 )
 from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from litgpt.parser_config import save_hyperparameters
@@ -251,53 +251,16 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
 
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
-    reconstruction_tasks = (
-        ("ar", "fim")
-        if reconstruction_eval is not None and reconstruction_eval.task == "both"
-        else ((reconstruction_eval.task,) if reconstruction_eval is not None else ())
+    byte_runtime = ByteTrainingRuntime.prepare(
+        fabric,
+        train_dataloader.dataset,
+        val_dataloader.dataset,
+        out_dir,
+        eos_loss_weight=eos_loss_weight,
+        eos_aux_loss_weight=eos_aux_loss_weight,
+        reconstruction_config=reconstruction_eval,
+        mrt_config=mrt,
     )
-    reconstruction_samples = {
-        task: select_reconstruction_samples(
-            val_dataloader.dataset,
-            reconstruction_eval.num_samples,
-            reconstruction_eval.max_target_bytes,
-            task,
-        )
-        for task in reconstruction_tasks
-    }
-    mrt_samples = []
-    if mrt is not None and mrt.enabled:
-        mrt.validate()
-        if fabric.world_size != 1:
-            raise ValueError("Online byte MRT currently supports one device only")
-        mrt_samples = select_reconstruction_samples(
-            train_dataloader.dataset,
-            mrt.context_pool_size,
-            mrt.max_target_bytes,
-            "fim",
-        )
-        if not mrt_samples:
-            raise ValueError("MRT is enabled but no eligible FIM samples were found")
-        if fabric.global_rank == 0:
-            save_reconstruction_sample_manifest(
-                mrt_samples, out_dir / "mrt_training_samples.json"
-            )
-        fabric.print(
-            f"Online MRT enabled: {len(mrt_samples)} FIM contexts, "
-            f"{mrt.num_candidates} candidates every {mrt.interval} steps"
-        )
-    if reconstruction_eval is not None and fabric.global_rank == 0:
-        for task, samples in reconstruction_samples.items():
-            manifest_name = (
-                f"reconstruction_samples_{task}.json"
-                if len(reconstruction_samples) > 1
-                else "reconstruction_samples.json"
-            )
-            save_reconstruction_sample_manifest(samples, out_dir / manifest_name)
-    if reconstruction_eval is not None and fabric.world_size != 1:
-        fabric.print("Byte reconstruction validation currently requires a single-device run; disabling it.")
-        reconstruction_eval = None
-        reconstruction_samples = {}
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     state = {
@@ -350,12 +313,7 @@ def main(
         train=train,
         eval=eval,
         checkpoint_hparams=checkpoint_hparams,
-        reconstruction_eval=reconstruction_eval,
-        reconstruction_samples=reconstruction_samples,
-        eos_loss_weight=eos_loss_weight,
-        eos_aux_loss_weight=eos_aux_loss_weight,
-        mrt=mrt,
-        mrt_samples=mrt_samples,
+        byte_runtime=byte_runtime,
     )
 
     # Save final checkpoint
@@ -399,15 +357,11 @@ def fit(
     eval: EvalArgs,
     num_nodes: int = 1,
     checkpoint_hparams: dict | None = None,
-    reconstruction_eval: ReconstructionEvalConfig | None = None,
-    reconstruction_samples: dict[str, list] | None = None,
-    eos_loss_weight: float = 1.0,
-    eos_aux_loss_weight: float = 0.0,
-    mrt: MRTConfig | None = None,
-    mrt_samples: list | None = None,
+    byte_runtime: ByteTrainingRuntime | None = None,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
+    byte_runtime = byte_runtime or ByteTrainingRuntime()
 
     if eval.initial_validation:
         val_loss, _, _ = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
@@ -468,59 +422,19 @@ def fit(
         model_inputs, targets = get_model_inputs_and_targets(train_data, model.max_seq_length)
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
-        run_mrt = (
-            not is_accumulating
-            and mrt is not None
-            and should_run_mrt(state["step_count"] + 1, mrt)
+        run_mrt = byte_runtime.should_run_mrt(
+            state["step_count"] + 1, is_accumulating
         )
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(**model_inputs)
-            loss = byte_training_loss(
-                logits,
-                targets,
-                eos_loss_weight=eos_loss_weight,
-                eos_aux_loss_weight=eos_aux_loss_weight,
-            )
+            loss = byte_runtime.loss(logits, targets)
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         mrt_metrics = None
         if run_mrt:
-            assert mrt is not None and mrt_samples
-            next_step = state["step_count"] + 1
-            mrt_update_index = (next_step - mrt.start_step) // mrt.interval - 1
-            context_index = mrt_update_index % len(mrt_samples)
-            prepared = prepare_mrt_step(
-                model, mrt_samples[context_index], mrt, fabric.device
+            mrt_metrics = byte_runtime.run_mrt(
+                fabric, model, state["step_count"] + 1
             )
-            if prepared is not None:
-                for candidate, coefficient in zip(
-                    prepared.candidates, prepared.coefficients
-                ):
-                    if abs(float(coefficient)) < 1e-8:
-                        continue
-                    with fabric.autocast():
-                        score = candidate_mean_log_probability(
-                            model,
-                            prepared.sample,
-                            candidate,
-                            fabric.device,
-                            temperature=mrt.temperature,
-                        )
-                    # MRT uses one context per optimizer step, so unlike CE it
-                    # must not be divided by gradient accumulation.
-                    fabric.backward(mrt.weight * coefficient * score)
-                mrt_metrics = {
-                    "mrt/skipped": 0.0,
-                    "mrt/expected_risk": prepared.expected_risk,
-                    "mrt/decode_rate": prepared.decode_rate,
-                    "mrt/ground_truth_probability": prepared.ground_truth_probability,
-                    "mrt/num_unique_candidates": float(len(prepared.candidates)),
-                    "mrt/risk_min": float(prepared.risks.min()),
-                    "mrt/risk_mean": float(prepared.risks.mean()),
-                    "mrt/risk_max": float(prepared.risks.max()),
-                }
-            else:
-                mrt_metrics = {"mrt/skipped": 1.0}
 
         running_loss.update(loss.detach())
 
@@ -530,18 +444,9 @@ def fit(
             optimizer.zero_grad()
             state["step_count"] += 1
             if mrt_metrics is not None:
-                fabric.log_dict(mrt_metrics, step=state["iter_num"] - 1)
-                if mrt_metrics["mrt/skipped"]:
-                    fabric.print(
-                        f"MRT step {state['step_count']} skipped: reference frame did not decode strictly"
-                    )
-                else:
-                    fabric.print(
-                        "MRT step "
-                        f"{state['step_count']} | risk: {mrt_metrics['mrt/expected_risk']:.4f}, "
-                        f"decode: {mrt_metrics['mrt/decode_rate']:.1%}, "
-                        f"unique: {int(mrt_metrics['mrt/num_unique_candidates'])}"
-                    )
+                byte_runtime.log_mrt(
+                    fabric, mrt_metrics, state["step_count"], state["iter_num"]
+                )
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
@@ -618,30 +523,12 @@ def fit(
             )
 
         if (
-            reconstruction_eval is not None
-            and reconstruction_samples
+            byte_runtime.reconstruction_due(state["step_count"])
             and not is_accumulating
-            and state["step_count"] % reconstruction_eval.interval == 0
         ):
-            for task, samples in reconstruction_samples.items():
-                if not samples:
-                    continue
-                metrics = run_reconstruction_probe(
-                    model,
-                    samples,
-                    reconstruction_eval,
-                    fabric.device,
-                )
-                fabric.print(
-                    format_reconstruction_metrics(
-                        f"{task.upper()} reconstruction validation",
-                        metrics,
-                    )
-                )
-                fabric.log_dict(
-                    _namespace_reconstruction_metrics(metrics, task),
-                    step=state["iter_num"] - 1,
-                )
+            byte_runtime.evaluate_reconstruction(
+                fabric, model, state["iter_num"] - 1
+            )
             last_reconstruction_step = state["step_count"]
 
     # Final validation
@@ -658,226 +545,18 @@ def fit(
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
     if (
-        reconstruction_eval is not None
-        and reconstruction_samples
+        byte_runtime.reconstruction_config is not None
+        and byte_runtime.reconstruction_samples
         and last_reconstruction_step != state["step_count"]
     ):
-        for task, samples in reconstruction_samples.items():
-            if not samples:
-                continue
-            metrics = run_reconstruction_probe(
-                model,
-                samples,
-                reconstruction_eval,
-                fabric.device,
-            )
-            fabric.print(
-                format_reconstruction_metrics(
-                    f"Final {task.upper()} reconstruction validation",
-                    metrics,
-                )
-            )
-            fabric.log_dict(
-                _namespace_reconstruction_metrics(metrics, task),
-                step=state["iter_num"],
-            )
-
-
-def _namespace_reconstruction_metrics(
-    metrics: dict[str, float], task: str
-) -> dict[str, float]:
-    return {
-        key.replace("reconstruction/", f"reconstruction/{task}/", 1): value
-        for key, value in metrics.items()
-    }
-
-
-def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
-    message = (
-        f"{label} | decode rate: {metrics['reconstruction/decode_rate']:.2%} "
-        f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])}), "
-        f"invalid generation: {int(metrics['reconstruction/invalid_generation'])}, "
-        f"timeouts: {int(metrics['reconstruction/timeouts'])}, "
-        f"missing frames: {int(metrics['reconstruction/missing_target_frames'])}, "
-        f"unexpected failures: {int(metrics['reconstruction/unexpected_failures'])}"
-    )
-    if "reconstruction/stop_exact_rate" in metrics:
-        message += (
-            f", stop exact/early/late: "
-            f"{metrics['reconstruction/stop_exact_rate']:.0%}/"
-            f"{metrics['reconstruction/stop_early_rate']:.0%}/"
-            f"{metrics['reconstruction/stop_late_rate']:.0%}, "
-            f"len abs err: {metrics['reconstruction/gen_len_abs_err_mean']:.1f}"
+        byte_runtime.evaluate_reconstruction(
+            fabric, model, state["iter_num"], final=True
         )
-        if "reconstruction/stop_no_stop_rate" in metrics:
-            message += (
-                f", no stop: {metrics['reconstruction/stop_no_stop_rate']:.0%}"
-            )
-    if "reconstruction/psnr_mean_valid" in metrics:
-        message += (
-            f", PSNR: {metrics['reconstruction/psnr_mean_valid']:.2f}, "
-            f"SSIM: {metrics['reconstruction/ssim_mean_valid']:.4f}"
-        )
-    return message
 
 
-@torch.no_grad()
-def validate(
-    fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int, verbose: bool = True
-) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
-    fabric.barrier()
-    if verbose:
-        fabric.print("Validating ...")
-    model.eval()
-
-    losses = []
-    # Token-weighted per-task loss. AR target bytes carry REGION_TARGET and FIM
-    # span bytes carry REGION_BRIDGE, and each sample is wholly one task, so
-    # masking the labels by region splits the loss exactly. Skipped for text
-    # batches, which have no region_ids.
-    task_regions = {"ar": REGION_TARGET, "fim": REGION_BRIDGE}
-    task_loss_sum = {name: 0.0 for name in task_regions}
-    task_tok_count = {name: 0 for name in task_regions}
-    eos_probability_sum = {name: 0.0 for name in task_regions}
-    eos_rank_sum = {name: 0.0 for name in task_regions}
-    eos_count = {name: 0 for name in task_regions}
-    for k, batch in enumerate(val_dataloader):
-        if k >= max_iters:
-            break
-        model_inputs, targets = get_model_inputs_and_targets(batch, model.max_seq_length)
-        logits = model(**model_inputs)
-        loss = chunked_cross_entropy(logits, targets)
-        losses.append(loss)
-
-        region_ids = model_inputs.get("region_ids")
-        if region_ids is not None:
-            for name, region in task_regions.items():
-                masked = torch.where(region_ids == region, targets, torch.full_like(targets, IGNORE_INDEX))
-                count = int((masked != IGNORE_INDEX).sum())
-                if count > 0:
-                    task_loss_sum[name] += float(chunked_cross_entropy(logits, masked)) * count
-                    task_tok_count[name] += count
-                eos_mask = (targets == SEQ_EOS_ID) & (region_ids == region)
-                if eos_mask.any():
-                    eos_logits = logits[eos_mask].float()
-                    eos_scores = eos_logits[:, SEQ_EOS_ID]
-                    eos_probability_sum[name] += float(
-                        torch.softmax(eos_logits, dim=-1)[:, SEQ_EOS_ID].sum()
-                    )
-                    eos_rank_sum[name] += float(
-                        (eos_logits > eos_scores.unsqueeze(-1)).sum(dim=-1).add(1).sum()
-                    )
-                    eos_count[name] += int(eos_mask.sum())
-
-    val_loss = torch.stack(losses).mean()
-    task_losses = {
-        name: task_loss_sum[name] / task_tok_count[name]
-        for name in task_regions
-        if task_tok_count[name] > 0
-    }
-    eos_metrics = {}
-    for name in task_regions:
-        if eos_count[name] > 0:
-            eos_metrics[f"val_eos_probability_{name}"] = (
-                eos_probability_sum[name] / eos_count[name]
-            )
-            eos_metrics[f"val_eos_rank_{name}"] = eos_rank_sum[name] / eos_count[name]
-    model.train()
-    fabric.barrier()
-    return val_loss, task_losses, eos_metrics
-
-
-def byte_weighted_cross_entropy(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    eos_loss_weight: float = 1.0,
-) -> torch.Tensor:
-    """Weight positive SEQ_EOS targets without changing ordinary byte labels."""
-    if eos_loss_weight <= 0:
-        raise ValueError("eos_loss_weight must be positive")
-    if eos_loss_weight == 1.0:
-        return chunked_cross_entropy(logits, targets)
-
-    flat_logits = logits.reshape(-1, logits.size(-1))
-    flat_targets = targets.reshape(-1)
-    losses = torch.nn.functional.cross_entropy(
-        flat_logits,
-        flat_targets,
-        ignore_index=IGNORE_INDEX,
-        reduction="none",
-    )
-    supervised = flat_targets != IGNORE_INDEX
-    weights = torch.ones_like(losses)
-    weights[flat_targets == SEQ_EOS_ID] = eos_loss_weight
-    return (losses * weights).sum() / supervised.sum().clamp_min(1)
-
-
-def balanced_eos_auxiliary_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-) -> torch.Tensor:
-    """Penalize early EOS and missed EOS with equal positive/negative class weight."""
-    flat_logits = logits.reshape(-1, logits.size(-1)).float()
-    flat_targets = targets.reshape(-1)
-    supervised = flat_targets != IGNORE_INDEX
-    positive = supervised & (flat_targets == SEQ_EOS_ID)
-    negative = supervised & (flat_targets != SEQ_EOS_ID)
-
-    # Treat EOS versus all byte/control tokens as a binary classification
-    # problem. Normalizing each class separately prevents the many non-EOS
-    # positions from overwhelming the single endpoint in each sample.
-    eos_binary_logits = flat_logits[:, SEQ_EOS_ID] - torch.logsumexp(
-        torch.cat(
-            [
-                flat_logits[:, :SEQ_EOS_ID],
-                flat_logits[:, SEQ_EOS_ID + 1 :],
-            ],
-            dim=-1,
-        ),
-        dim=-1,
-    )
-    binary_targets = positive.to(flat_logits.dtype)
-    losses = torch.nn.functional.binary_cross_entropy_with_logits(
-        eos_binary_logits,
-        binary_targets,
-        reduction="none",
-    )
-    positive_loss = losses[positive].sum() / positive.sum().clamp_min(1)
-    negative_loss = losses[negative].sum() / negative.sum().clamp_min(1)
-    return 0.5 * (positive_loss + negative_loss)
-
-
-def byte_training_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    eos_loss_weight: float = 1.0,
-    eos_aux_loss_weight: float = 0.0,
-) -> torch.Tensor:
-    """Combine byte CE with an optional balanced EOS calibration objective."""
-    if eos_aux_loss_weight < 0:
-        raise ValueError("eos_aux_loss_weight must be non-negative")
-    loss = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
-    if eos_aux_loss_weight == 0:
-        return loss
-    return loss + eos_aux_loss_weight * balanced_eos_auxiliary_loss(logits, targets)
-
-
-def get_model_inputs_and_targets(batch, max_seq_length: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-    """Adapt byte-domain dict batches without changing LitGPT tensor batches."""
-    if isinstance(batch, dict):
-        input_ids = batch["input_ids"][:, :max_seq_length].contiguous().long()
-        targets = batch["labels"][:, :max_seq_length].contiguous().long()
-        model_inputs = {"idx": input_ids}
-        if "region_ids" in batch:
-            model_inputs["region_ids"] = batch["region_ids"][:, :max_seq_length].contiguous().long()
-        if "offset_ids" in batch:
-            model_inputs["offset_ids"] = batch["offset_ids"][:, :max_seq_length].contiguous().long()
-        return model_inputs, targets
-
-    input_ids = batch[:, 0:max_seq_length].contiguous().long()
-    targets = batch[:, 1 : (max_seq_length + 1)].contiguous().long()
-    return {"idx": input_ids}, targets
+# Compatibility alias for callers that imported this private helper before the
+# byte training helpers were moved into their own package.
+_namespace_reconstruction_metrics = namespace_reconstruction_metrics
 
 
 def get_dataloaders(

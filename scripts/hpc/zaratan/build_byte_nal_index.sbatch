@@ -52,7 +52,7 @@ fi
 cd "${REPO_ROOT}"
 
 cmd=(
-    "${PYTHON_BIN}" scripts/build_byte_nal_index.py
+    "${PYTHON_BIN}" scripts/byte/build_nal_index.py
     "${MANIFEST}"
     --output "${NAL_INDEX}"
     --workers "${INDEX_WORKERS}"

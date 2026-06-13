@@ -1,7 +1,8 @@
 # Zaratan Training Jobs
 
 These wrappers keep Zaratan/Slurm configuration separate from the portable
-`scripts/train_byte_stage1.py` launcher.
+`scripts/byte/train.py` launcher. The former
+`scripts/train_byte_stage1.py` path remains as a compatibility wrapper.
 
 Experiment launchers are grouped by training stage:
 

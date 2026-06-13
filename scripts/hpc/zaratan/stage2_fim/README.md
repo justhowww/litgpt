@@ -11,7 +11,7 @@ the model learns from more easily.
 
 ## What's changed vs the shared script
 
-Runs the same `scripts/train_byte_stage1.py` as Stage 1, but enables the FIM
+Runs the same `scripts/byte/train.py` as Stage 1, but enables the FIM
 path:
 
 - `--p-fim 0.5` — each sample is FIM with prob 0.5, otherwise AR.
