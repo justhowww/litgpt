@@ -14,7 +14,13 @@ import torch.nn as nn
 from lightning import Fabric
 from torch.utils.data import DataLoader
 
-from litgpt.byte.data import IGNORE_INDEX, REGION_BRIDGE, REGION_TARGET, SEQ_EOS_ID
+from litgpt.byte.data import (
+    BYTE_VOCAB_SIZE,
+    IGNORE_INDEX,
+    REGION_BRIDGE,
+    REGION_TARGET,
+    SEQ_EOS_ID,
+)
 from litgpt.byte.mrt import (
     MRTConfig,
     candidate_mean_log_probability,
@@ -36,6 +42,7 @@ class ByteTrainingRuntime:
     """Prepared byte-domain state used by the generic pretraining loop."""
 
     ce_loss_weight: float = 1.0
+    ce_byte_only: bool = False
     eos_loss_weight: float = 1.0
     eos_aux_loss_weight: float = 0.0
     reconstruction_config: ReconstructionEvalConfig | None = None
@@ -54,6 +61,7 @@ class ByteTrainingRuntime:
         out_dir: Path,
         *,
         ce_loss_weight: float,
+        ce_byte_only: bool,
         eos_loss_weight: float,
         eos_aux_loss_weight: float,
         reconstruction_config: ReconstructionEvalConfig | None,
@@ -123,6 +131,7 @@ class ByteTrainingRuntime:
             raise ValueError("CE loss weight must be non-negative")
         return cls(
             ce_loss_weight=ce_loss_weight,
+            ce_byte_only=ce_byte_only,
             eos_loss_weight=eos_loss_weight,
             eos_aux_loss_weight=eos_aux_loss_weight,
             reconstruction_config=reconstruction_config,
@@ -135,6 +144,7 @@ class ByteTrainingRuntime:
         return byte_training_loss(
             logits,
             targets,
+            ce_byte_only=self.ce_byte_only,
             eos_loss_weight=self.eos_loss_weight,
             eos_aux_loss_weight=self.eos_aux_loss_weight,
         )
@@ -345,12 +355,22 @@ def byte_training_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     *,
+    ce_byte_only: bool = False,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
 ) -> torch.Tensor:
     """Combine byte CE with an optional balanced EOS calibration objective."""
     if eos_aux_loss_weight < 0:
         raise ValueError("eos_aux_loss_weight must be non-negative")
+    if ce_byte_only:
+        supervised_targets = targets[targets != IGNORE_INDEX]
+        if bool((supervised_targets >= BYTE_VOCAB_SIZE).any()):
+            raise ValueError(
+                "Byte-only CE requires every supervised target to be a raw byte"
+            )
+        # Exclude EOS and all structural/control tokens from CE normalization.
+        # This gives their logits zero CE gradient in oracle-length ablations.
+        logits = logits[..., :BYTE_VOCAB_SIZE]
     loss = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
     if eos_aux_loss_weight == 0:
         return loss

@@ -6,13 +6,13 @@ This run isolates decoder-risk optimization:
 - `1024-8192` byte gaps everywhere, matching the balanced-EOS baseline;
 - exact oracle generation length with no EOS supervision or EOS action;
 - MRT every optimizer step with 8 candidates;
-- `1.0 * MRT + 0.05 * CE`;
+- `1.0 * MRT + 0.05 * byte-only CE`;
 - initialization from the 1,000-step balanced-EOS checkpoint.
 
-EOS is excluded from targets, candidate sampling, and MRT scoring. Ordinary CE
-still suppresses its logit through full-vocabulary normalization; it receives
-no positive terminator target. PSM vocab sizes with and without EOS both pad to
-264, so the balanced-EOS checkpoint tensors remain shape-compatible.
+EOS is excluded from targets, candidate sampling, MRT scoring, and byte-only CE
+normalization, so it receives no training gradient. PSM vocab sizes with and
+without EOS both pad to 264, so the balanced-EOS checkpoint tensors remain
+shape-compatible.
 
 Launch on H100:
 

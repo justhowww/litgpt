@@ -118,6 +118,14 @@ def parse_args() -> argparse.Namespace:
         help="Multiplier applied to supervised byte CE gradients.",
     )
     parser.add_argument(
+        "--ce-byte-only",
+        action="store_true",
+        help=(
+            "Normalize supervised CE over raw byte ids 0-255 only. "
+            "All supervised labels must therefore be bytes."
+        ),
+    )
+    parser.add_argument(
         "--eos-loss-weight",
         type=float,
         default=1.0,
@@ -197,6 +205,8 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight must be non-negative")
     if args.eos_aux_loss_weight > 0 and not args.use_eos:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
+    if args.ce_byte_only and args.use_eos:
+        raise ValueError("--ce-byte-only cannot train supervised EOS targets")
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
     if args.mrt_interval > 0 and not args.use_eos and not args.mrt_oracle_length:
@@ -325,6 +335,7 @@ def main() -> None:
         compile_model=args.compile,
         reconstruction_eval=reconstruction_eval,
         ce_loss_weight=args.ce_loss_weight,
+        ce_byte_only=args.ce_byte_only,
         eos_loss_weight=args.eos_loss_weight,
         eos_aux_loss_weight=args.eos_aux_loss_weight,
         mrt=mrt,

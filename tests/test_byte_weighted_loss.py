@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -87,3 +88,23 @@ def test_byte_training_loss_adds_balanced_eos_objective():
     )
 
     assert torch.allclose(actual, byte_ce + 0.5 * eos_aux)  # The coefficient controls only EOS calibration.
+
+
+def test_byte_only_ce_excludes_eos_and_control_logits():
+    logits = torch.zeros(1, 1, SEQ_EOS_ID + 1, requires_grad=True)
+    targets = torch.tensor([[7]])
+
+    loss = byte_training_loss(logits, targets, ce_byte_only=True)
+    loss.backward()
+
+    assert torch.isclose(loss, torch.log(torch.tensor(256.0)))
+    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad[..., 256:]) == 0
+
+
+def test_byte_only_ce_rejects_control_targets():
+    logits = torch.zeros(1, 1, SEQ_EOS_ID + 1)
+    targets = torch.tensor([[SEQ_EOS_ID]])
+
+    with pytest.raises(ValueError, match="raw byte"):
+        byte_training_loss(logits, targets, ce_byte_only=True)

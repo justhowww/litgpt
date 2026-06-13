@@ -22,6 +22,7 @@ FIM_FORMAT=${FIM_FORMAT:-psm}
 # baseline (which writes to a distinct, untagged directory).
 USE_EOS=${USE_EOS:-1}
 CE_LOSS_WEIGHT=${CE_LOSS_WEIGHT:-1}
+CE_BYTE_ONLY=${CE_BYTE_ONLY:-0}
 EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1}
 EOS_AUX_LOSS_WEIGHT=${EOS_AUX_LOSS_WEIGHT:-0}
 if [[ "${USE_EOS}" == "1" ]]; then
@@ -131,6 +132,9 @@ if (( MRT_INTERVAL > 0 )); then
 fi
 if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
+fi
+if [[ "${CE_BYTE_ONLY}" == "1" ]]; then
+    cmd+=(--ce-byte-only)
 fi
 cmd+=(--eos-loss-weight "${EOS_LOSS_WEIGHT}")
 cmd+=(--eos-aux-loss-weight "${EOS_AUX_LOSS_WEIGHT}")

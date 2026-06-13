@@ -22,6 +22,9 @@ export EOS_AUX_LOSS_WEIGHT=0
 
 # Decoder risk is primary on every step; CE remains a small syntax regularizer.
 export CE_LOSS_WEIGHT=${CE_LOSS_WEIGHT:-0.05}
+# Restrict CE to byte logits so the unused EOS/control logits receive no CE
+# gradient. MRT remains responsible for decoder-level candidate preference.
+export CE_BYTE_ONLY=1
 export MRT_INTERVAL=1
 export MRT_START_STEP=0
 export MRT_NUM_CANDIDATES=${MRT_NUM_CANDIDATES:-8}
