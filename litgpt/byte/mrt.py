@@ -22,6 +22,8 @@ from litgpt.byte.reconstruction import (
     replace_target_nal,
 )
 
+MRT_RISK_MODES = ("clipped_mse", "smooth_mse")
+
 
 @dataclass(frozen=True)
 class MRTConfig:
@@ -35,7 +37,9 @@ class MRTConfig:
     temperature: float = 1.0
     candidate_alpha: float = 1.0
     weight: float = 4.0
+    risk_mode: str = "clipped_mse"
     mse_weight: float = 1000.0
+    mse_tau: float = 0.002
     decode_failure_weight: float = 2.0
     max_risk: float = 2.0
     timeout_sec: int = 30
@@ -61,8 +65,12 @@ class MRTConfig:
             raise ValueError("MRT temperature must be positive")
         if self.candidate_alpha <= 0:
             raise ValueError("MRT candidate alpha must be positive")
+        if self.risk_mode not in MRT_RISK_MODES:
+            raise ValueError(f"MRT risk mode must be one of {MRT_RISK_MODES}")
         if self.weight < 0 or self.mse_weight < 0:
             raise ValueError("MRT and MSE weights must be non-negative")
+        if self.mse_tau <= 0:
+            raise ValueError("MRT MSE tau must be positive")
         if self.decode_failure_weight < 0 or self.max_risk <= 0:
             raise ValueError("MRT failure weight and max risk must be positive")
         if self.timeout_sec <= 0 or self.decode_workers <= 0:
@@ -92,10 +100,20 @@ class PreparedMRTStep:
     sample: ReconstructionSample
     candidates: tuple[Candidate, ...]
     risks: Tensor
+    candidate_mses: Tensor
     coefficients: Tensor
     expected_risk: float
     decode_rate: float
     ground_truth_probability: float
+
+
+def visual_risk(mse: float, config: MRTConfig) -> float:
+    """Map decoded-frame MSE to the configured bounded MRT risk."""
+    if mse < 0:
+        raise ValueError("MSE must be non-negative")
+    if config.risk_mode == "smooth_mse":
+        return mse / (mse + config.mse_tau)
+    return min(config.max_risk, config.mse_weight * mse)
 
 
 def should_run_mrt(next_step: int, config: MRTConfig) -> bool:
@@ -338,7 +356,7 @@ def _candidate_risk(
     candidate: Candidate,
     reference: Tensor,
     config: MRTConfig,
-) -> tuple[float, bool]:
+) -> tuple[float, bool, float | None]:
     reconstructed_stream = replace_target_nal(stream, sample, candidate.data)
     reconstruction, status = decode_frame(
         reconstructed_stream,
@@ -348,9 +366,9 @@ def _candidate_risk(
         strict_syntax=True,
     )
     if reconstruction is None or reconstruction.shape != reference.shape:
-        return config.decode_failure_weight, False
+        return config.decode_failure_weight, False, None
     mse = torch.nn.functional.mse_loss(reconstruction, reference).item()
-    return min(config.max_risk, config.mse_weight * mse), status == "decoded"
+    return visual_risk(mse, config), status == "decoded", mse
 
 
 def prepare_mrt_step(
@@ -401,8 +419,12 @@ def prepare_mrt_step(
                 candidates,
             )
         )
-    risks = torch.tensor([risk for risk, _ in risk_results], device=device)
-    decode_rate = sum(decoded for _, decoded in risk_results) / len(risk_results)
+    risks = torch.tensor([risk for risk, _, _ in risk_results], device=device)
+    candidate_mses = torch.tensor(
+        [float("nan") if mse is None else mse for _, _, mse in risk_results],
+        device=device,
+    )
+    decode_rate = sum(decoded for _, decoded, _ in risk_results) / len(risk_results)
 
     scores: list[float] = []
     for candidate in candidates:
@@ -432,6 +454,7 @@ def prepare_mrt_step(
         sample=sample,
         candidates=tuple(candidates),
         risks=risks.detach(),
+        candidate_mses=candidate_mses.detach(),
         coefficients=coefficients,
         expected_risk=float(expected_risk),
         decode_rate=decode_rate,

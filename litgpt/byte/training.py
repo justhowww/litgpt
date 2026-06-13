@@ -114,7 +114,7 @@ class ByteTrainingRuntime:
             fabric.print(
                 f"Online MRT enabled: {len(mrt_samples)} FIM contexts, "
                 f"{mrt_config.num_candidates} candidates every "
-                f"{mrt_config.interval} steps"
+                f"{mrt_config.interval} steps, risk={mrt_config.risk_mode}"
             )
 
         return cls(
@@ -173,7 +173,7 @@ class ByteTrainingRuntime:
             # MRT uses one context per optimizer step, so unlike CE it is not
             # divided by gradient accumulation.
             fabric.backward(config.weight * coefficient * score)
-        return {
+        metrics = {
             "mrt/skipped": 0.0,
             "mrt/expected_risk": prepared.expected_risk,
             "mrt/decode_rate": prepared.decode_rate,
@@ -182,7 +182,22 @@ class ByteTrainingRuntime:
             "mrt/risk_min": float(prepared.risks.min()),
             "mrt/risk_mean": float(prepared.risks.mean()),
             "mrt/risk_max": float(prepared.risks.max()),
+            "mrt/risk_std": float(prepared.risks.std(unbiased=False)),
         }
+        decoded_mses = prepared.candidate_mses[
+            torch.isfinite(prepared.candidate_mses)
+        ]
+        if decoded_mses.numel() > 0:
+            metrics.update(
+                {
+                    "mrt/mse_min": float(decoded_mses.min()),
+                    "mrt/mse_mean": float(decoded_mses.mean()),
+                    "mrt/mse_p50": float(torch.quantile(decoded_mses, 0.5)),
+                    "mrt/mse_p90": float(torch.quantile(decoded_mses, 0.9)),
+                    "mrt/mse_max": float(decoded_mses.max()),
+                }
+            )
+        return metrics
 
     def log_mrt(
         self, fabric: Fabric, metrics: dict[str, float], step: int, iter_num: int
@@ -195,6 +210,7 @@ class ByteTrainingRuntime:
         else:
             fabric.print(
                 f"MRT step {step} | risk: {metrics['mrt/expected_risk']:.4f}, "
+                f"spread: {metrics['mrt/risk_std']:.4f}, "
                 f"decode: {metrics['mrt/decode_rate']:.1%}, "
                 f"unique: {int(metrics['mrt/num_unique_candidates'])}"
             )

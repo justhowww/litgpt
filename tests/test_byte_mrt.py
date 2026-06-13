@@ -8,6 +8,7 @@ from litgpt.byte_mrt import (
     build_candidate_inputs,
     minimum_risk_coefficients,
     should_run_mrt,
+    visual_risk,
 )
 from litgpt.data.byte_data import REGION_BRIDGE, SEQ_EOS_ID
 from litgpt.eval.byte_reconstruction import ReconstructionSample
@@ -53,6 +54,26 @@ def test_minimum_risk_coefficients_favor_lower_risk_candidates():
     assert coefficients[0] < 0  # Gradient descent raises the score of the best candidate.
     assert coefficients[2] > 0  # Gradient descent lowers the score of the worst candidate.
     assert abs(float(coefficients.sum())) < 1e-6  # Centering removes a constant-risk baseline.
+
+
+def test_smooth_mse_risk_preserves_order_without_hard_saturation():
+    config = MRTConfig(risk_mode="smooth_mse", mse_tau=0.002)
+
+    risks = [visual_risk(mse, config) for mse in (0.002, 0.01, 0.1)]
+
+    assert risks[0] == 0.5  # Tau is the interpretable midpoint of the risk curve.
+    assert risks[0] < risks[1] < risks[2] < 1.0  # Poor decoded candidates remain distinguishable.
+
+
+def test_clipped_mse_risk_remains_available_for_reproducibility():
+    config = MRTConfig(
+        risk_mode="clipped_mse",
+        mse_weight=1000.0,
+        max_risk=2.0,
+    )
+
+    assert visual_risk(0.001, config) == 1.0  # Below-threshold behavior matches the original experiment.
+    assert visual_risk(0.01, config) == 2.0  # The legacy mode still hard-clips large errors.
 
 
 def test_minimum_risk_surrogate_matches_expected_risk_gradient():

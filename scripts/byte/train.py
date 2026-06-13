@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from litgpt.args import EvalArgs, TrainArgs
-from litgpt.byte.mrt import MRTConfig
+from litgpt.byte.mrt import MRTConfig, MRT_RISK_MODES
 from litgpt.config import Config
 from litgpt.byte.data import (
     FIM_FORMATS,
@@ -148,7 +148,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mrt-temperature", type=float, default=1.0)
     parser.add_argument("--mrt-candidate-alpha", type=float, default=1.0)
     parser.add_argument("--mrt-weight", type=float, default=4.0)
+    parser.add_argument(
+        "--mrt-risk-mode",
+        choices=MRT_RISK_MODES,
+        default="clipped_mse",
+        help=(
+            "Visual-risk mapping. clipped_mse preserves the original "
+            "min(max_risk, mse_weight*MSE) experiment; smooth_mse uses "
+            "MSE/(MSE+mse_tau) and preserves ordering without hard clipping."
+        ),
+    )
     parser.add_argument("--mrt-mse-weight", type=float, default=1000.0)
+    parser.add_argument(
+        "--mrt-mse-tau",
+        type=float,
+        default=0.002,
+        help="MSE midpoint for smooth_mse risk: MSE=tau maps to risk 0.5.",
+    )
     parser.add_argument("--mrt-decode-failure-weight", type=float, default=2.0)
     parser.add_argument("--mrt-max-risk", type=float, default=2.0)
     parser.add_argument("--mrt-decode-workers", type=int, default=8)
@@ -262,7 +278,9 @@ def main() -> None:
         temperature=args.mrt_temperature,
         candidate_alpha=args.mrt_candidate_alpha,
         weight=args.mrt_weight,
+        risk_mode=args.mrt_risk_mode,
         mse_weight=args.mrt_mse_weight,
+        mse_tau=args.mrt_mse_tau,
         decode_failure_weight=args.mrt_decode_failure_weight,
         max_risk=args.mrt_max_risk,
         timeout_sec=args.reconstruction_timeout_sec,

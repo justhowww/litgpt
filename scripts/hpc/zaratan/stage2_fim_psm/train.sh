@@ -51,7 +51,9 @@ MRT_MAX_TARGET_BYTES=${MRT_MAX_TARGET_BYTES:-2048}
 MRT_TEMPERATURE=${MRT_TEMPERATURE:-1.0}
 MRT_CANDIDATE_ALPHA=${MRT_CANDIDATE_ALPHA:-1.0}
 MRT_WEIGHT=${MRT_WEIGHT:-4.0}
+MRT_RISK_MODE=${MRT_RISK_MODE:-clipped_mse}
 MRT_MSE_WEIGHT=${MRT_MSE_WEIGHT:-1000.0}
+MRT_MSE_TAU=${MRT_MSE_TAU:-0.002}
 MRT_DECODE_FAILURE_WEIGHT=${MRT_DECODE_FAILURE_WEIGHT:-2.0}
 MRT_MAX_RISK=${MRT_MAX_RISK:-2.0}
 MRT_DECODE_WORKERS=${MRT_DECODE_WORKERS:-8}
@@ -115,7 +117,9 @@ if (( MRT_INTERVAL > 0 )); then
         --mrt-temperature "${MRT_TEMPERATURE}"
         --mrt-candidate-alpha "${MRT_CANDIDATE_ALPHA}"
         --mrt-weight "${MRT_WEIGHT}"
+        --mrt-risk-mode "${MRT_RISK_MODE}"
         --mrt-mse-weight "${MRT_MSE_WEIGHT}"
+        --mrt-mse-tau "${MRT_MSE_TAU}"
         --mrt-decode-failure-weight "${MRT_DECODE_FAILURE_WEIGHT}"
         --mrt-max-risk "${MRT_MAX_RISK}"
         --mrt-decode-workers "${MRT_DECODE_WORKERS}"
