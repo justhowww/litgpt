@@ -86,7 +86,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reconstruction-error-exploding",
         action="store_true",
-        help="Also decode candidates with FFmpeg -err_detect explode.",
+        help=(
+            "Also report the legacy FFmpeg -err_detect explode diagnostic. "
+            "Primary reconstruction metrics always disable concealment and "
+            "use strict syntax checking."
+        ),
     )
     parser.add_argument(
         "--reconstruction-fim-baselines",

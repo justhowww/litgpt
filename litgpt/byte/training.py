@@ -392,7 +392,7 @@ def namespace_reconstruction_metrics(
 def format_reconstruction_metrics(label: str, metrics: dict[str, float]) -> str:
     """Format one decoder-level validation result for console logs."""
     message = (
-        f"{label} | decode rate: {metrics['reconstruction/decode_rate']:.2%} "
+        f"{label} | strict decode rate: {metrics['reconstruction/decode_rate']:.2%} "
         f"({int(metrics['reconstruction/decoded'])}/{int(metrics['reconstruction/attempted'])}), "
         f"invalid generation: {int(metrics['reconstruction/invalid_generation'])}, "
         f"timeouts: {int(metrics['reconstruction/timeouts'])}, "

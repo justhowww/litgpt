@@ -28,7 +28,12 @@ from litgpt.byte.data import (
 
 @dataclass(frozen=True)
 class ReconstructionEvalConfig:
-    """Controls the expensive AR or FIM decoder-level probe."""
+    """Controls the expensive AR or FIM decoder-level probe.
+
+    Primary reconstruction metrics always use strict FFmpeg decoding with
+    error concealment disabled. ``evaluate_error_exploding`` optionally adds
+    the older, less strict diagnostic for comparison only.
+    """
 
     interval: int = 1000
     num_samples: int = 5
@@ -465,7 +470,9 @@ def run_reconstruction_probe(
     for sample in samples:
         stage = "read_stream"
         try:
-            modes = ["normal"]
+            # The deployment signal must measure the generated bitstream, not
+            # frames repaired by FFmpeg's decoder-side error concealment.
+            modes = ["strict"]
             if config.evaluate_error_exploding:
                 modes.append("error_exploding")
             for mode in modes:
@@ -474,7 +481,11 @@ def run_reconstruction_probe(
             stream = sample.h264_path.read_bytes()
             stage = "decode_reference"
             reference, reference_status = decode_frame(
-                stream, sample.frame_index, config.ffmpeg_binary, config.timeout_sec
+                stream,
+                sample.frame_index,
+                config.ffmpeg_binary,
+                config.timeout_sec,
+                strict_syntax=True,
             )
             if reference is None:
                 for mode in modes:
@@ -529,6 +540,7 @@ def run_reconstruction_probe(
                         config.ffmpeg_binary,
                         config.timeout_sec,
                         error_exploding=mode == "error_exploding",
+                        strict_syntax=mode == "strict",
                     )
                     if reconstruction is None:
                         candidate_stats["timeouts"] += int(status == "timeout")
@@ -551,21 +563,23 @@ def run_reconstruction_probe(
                     flush=True,
                 )
 
-    learned_normal = stats_for("model_learned", "normal")
-    attempted = int(learned_normal["attempted"])
-    decoded = int(learned_normal["decoded"])
+    learned_strict = stats_for("model_learned", "strict")
+    attempted = int(learned_strict["attempted"])
+    decoded = int(learned_strict["decoded"])
     metrics = {
         "reconstruction/attempted": float(attempted),
         "reconstruction/decoded": float(decoded),
         "reconstruction/decode_rate": decoded / attempted if attempted else 0.0,
         "reconstruction/invalid_generation": float(invalid_generation),
-        "reconstruction/timeouts": float(learned_normal["timeouts"]),
+        "reconstruction/timeouts": float(learned_strict["timeouts"]),
         "reconstruction/missing_target_frames": float(
-            learned_normal["missing_frames"]
+            learned_strict["missing_frames"]
         ),
         "reconstruction/unexpected_failures": float(unexpected_failures),
     }
-    metrics.update(_quality_metrics("reconstruction/", learned_normal))
+    # Keep stable top-level metric names, but make them aliases of the strict,
+    # concealment-free series used for experiment decisions.
+    metrics.update(_quality_metrics("reconstruction/", learned_strict))
 
     if stop_records:
         n = len(stop_records)
@@ -610,7 +624,7 @@ def run_reconstruction_probe(
             method_values["missing_frames"]
         )
         metrics.update(_quality_metrics(prefix, method_values))
-    for mode in ("normal", "error_exploding"):
+    for mode in ("strict", "error_exploding"):
         oracle_prefix = f"reconstruction/model_oracle/{mode}/"
         concealment_prefix = f"reconstruction/deleted_gap/{mode}/"
         for metric_name in ("psnr_mean_valid", "ssim_mean_valid"):

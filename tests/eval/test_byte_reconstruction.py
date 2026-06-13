@@ -12,6 +12,7 @@ from litgpt.data.byte_data import (
     ByteSliceDataset,
 )
 from litgpt.eval.byte_reconstruction import (
+    ReconstructionEvalConfig,
     ReconstructionSample,
     _deterministic_random_bytes,
     _ground_truth_replacement,
@@ -20,6 +21,7 @@ from litgpt.eval.byte_reconstruction import (
     image_ssim,
     parse_ppm,
     replace_target_nal,
+    run_reconstruction_probe,
     select_reconstruction_samples,
 )
 from litgpt.pretrain import _namespace_reconstruction_metrics
@@ -271,6 +273,53 @@ def test_strict_syntax_disables_concealment_and_checks_multiple_error_classes(mo
         commands[0][commands[0].index("-err_detect") + 1]
         == "explode+bitstream+buffer+compliant"
     )  # Multiple syntax/error classes are fatal.
+
+
+def test_reconstruction_probe_defaults_to_strict_concealment_free_decoding(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "stream.h264"
+    path.write_bytes(b"stream")
+    sample = ReconstructionSample(
+        h264_path=path,
+        target_start=0,
+        target_end=6,
+        target_nal_index=0,
+        frame_index=0,
+        prompt_ids=torch.tensor([SPAN_BOS_ID]),
+        prompt_region_ids=torch.tensor([REGION_BRIDGE]),
+        prompt_offset_ids=torch.tensor([0]),
+        target_length=1,
+    )
+    strict_flags = []
+
+    def fake_decode(*args, strict_syntax=False, **kwargs):
+        strict_flags.append(strict_syntax)
+        return torch.zeros((1, 1, 3)), "decoded"
+
+    monkeypatch.setattr("litgpt.byte.reconstruction.decode_frame", fake_decode)
+    monkeypatch.setattr(
+        "litgpt.byte.reconstruction.generate_target_slice",
+        lambda *args, **kwargs: SimpleNamespace(data=b"x", stopped=False),
+    )
+
+    metrics = run_reconstruction_probe(
+        torch.nn.Identity(),
+        [sample],
+        ReconstructionEvalConfig(),
+        torch.device("cpu"),
+    )
+
+    assert strict_flags == [
+        True,
+        True,
+    ]  # Reference and generated streams both disable concealment.
+    assert (
+        metrics["reconstruction/decode_rate"] == 1.0
+    )  # Top-level decode rate is the strict result.
+    assert (
+        metrics["reconstruction/model_learned/strict/decode_rate"] == 1.0
+    )  # The strict series is retained explicitly for TensorBoard inspection.
 
 
 def test_reconstruction_metrics_are_namespaced_by_task():
