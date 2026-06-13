@@ -87,6 +87,7 @@ def setup(
     seed: int = 42,
     compile_model: bool = True,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
+    ce_loss_weight: float = 1.0,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
@@ -191,6 +192,7 @@ def setup(
         compile_model=compile_model,
         checkpoint_hparams=hparams,
         reconstruction_eval=reconstruction_eval,
+        ce_loss_weight=ce_loss_weight,
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
         mrt=mrt,
@@ -215,6 +217,7 @@ def main(
     num_nodes: int = 1,
     checkpoint_hparams: dict | None = None,
     reconstruction_eval: ReconstructionEvalConfig | None = None,
+    ce_loss_weight: float = 1.0,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
@@ -256,6 +259,7 @@ def main(
         train_dataloader.dataset,
         val_dataloader.dataset,
         out_dir,
+        ce_loss_weight=ce_loss_weight,
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
         reconstruction_config=reconstruction_eval,
@@ -428,7 +432,13 @@ def fit(
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(**model_inputs)
             loss = byte_runtime.loss(logits, targets)
-            fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
+            # Byte-domain experiments may make decoder risk the primary
+            # objective while retaining a small CE syntax regularizer.
+            fabric.backward(
+                byte_runtime.ce_loss_weight
+                * loss
+                / train.gradient_accumulation_iters(devices, num_nodes)
+            )
 
         mrt_metrics = None
         if run_mrt:

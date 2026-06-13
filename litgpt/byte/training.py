@@ -35,6 +35,7 @@ from litgpt.utils import chunked_cross_entropy
 class ByteTrainingRuntime:
     """Prepared byte-domain state used by the generic pretraining loop."""
 
+    ce_loss_weight: float = 1.0
     eos_loss_weight: float = 1.0
     eos_aux_loss_weight: float = 0.0
     reconstruction_config: ReconstructionEvalConfig | None = None
@@ -52,6 +53,7 @@ class ByteTrainingRuntime:
         val_dataset,
         out_dir: Path,
         *,
+        ce_loss_weight: float,
         eos_loss_weight: float,
         eos_aux_loss_weight: float,
         reconstruction_config: ReconstructionEvalConfig | None,
@@ -117,7 +119,10 @@ class ByteTrainingRuntime:
                 f"{mrt_config.interval} steps, risk={mrt_config.risk_mode}"
             )
 
+        if ce_loss_weight < 0:
+            raise ValueError("CE loss weight must be non-negative")
         return cls(
+            ce_loss_weight=ce_loss_weight,
             eos_loss_weight=eos_loss_weight,
             eos_aux_loss_weight=eos_aux_loss_weight,
             reconstruction_config=reconstruction_config,

@@ -34,6 +34,7 @@ class MRTConfig:
     num_candidates: int = 16
     context_pool_size: int = 64
     max_target_bytes: int = 2048
+    oracle_length: bool = False
     temperature: float = 1.0
     candidate_alpha: float = 1.0
     weight: float = 4.0
@@ -196,7 +197,7 @@ def candidate_mean_log_probability(
     device: torch.device,
     temperature: float = 1.0,
 ) -> Tensor:
-    """Return length-normalized log probability under the byte/EOS policy."""
+    """Return length-normalized log probability under the active policy."""
     if temperature <= 0:
         raise ValueError("Candidate temperature must be positive")
     inputs, labels = build_candidate_inputs(sample, candidate, device)
@@ -208,17 +209,20 @@ def candidate_mean_log_probability(
     target = labels[0, supervised]
     selected_logits = logits[supervised].float()
 
-    allowed_logits = (
-        torch.cat(
+    if candidate.stopped:
+        allowed_logits = torch.cat(
             (
                 selected_logits[:, :BYTE_VOCAB_SIZE],
                 selected_logits[:, SEQ_EOS_ID : SEQ_EOS_ID + 1],
             ),
             dim=-1,
         )
-        / temperature
-    )
-    allowed_target = torch.where(target == SEQ_EOS_ID, BYTE_VOCAB_SIZE, target)
+        allowed_target = torch.where(target == SEQ_EOS_ID, BYTE_VOCAB_SIZE, target)
+    else:
+        # Oracle-length MRT has no EOS action: normalize over raw bytes only.
+        allowed_logits = selected_logits[:, :BYTE_VOCAB_SIZE]
+        allowed_target = target
+    allowed_logits = allowed_logits / temperature
     log_probabilities = torch.log_softmax(allowed_logits, dim=-1)
     return log_probabilities.gather(1, allowed_target.unsqueeze(1)).mean()
 
@@ -230,9 +234,10 @@ def sample_candidates(
     device: torch.device,
     num_candidates: int,
     temperature: float,
+    oracle_length: bool = False,
 ) -> list[Candidate]:
     """Sample byte spans in one batched KV-cache decode."""
-    if sample.stop_token != SEQ_EOS_ID:
+    if not oracle_length and sample.stop_token != SEQ_EOS_ID:
         raise ValueError("MRT candidate generation requires SEQ_EOS supervision")
 
     raw_model = _unwrap_model(model)
@@ -242,8 +247,11 @@ def sample_candidates(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0).expand(num_candidates, -1)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0).expand(num_candidates, -1)
     prompt_length = prompt.size(1)
+    generation_limit = (
+        sample.target_length if oracle_length else 2 * sample.target_length
+    )
     max_new = min(
-        2 * sample.target_length,
+        generation_limit,
         raw_model.max_seq_length - prompt_length + 1,
     )
     if max_new <= 0:
@@ -278,31 +286,35 @@ def sample_candidates(
 
         for generated_idx in range(max_new):
             next_logits = logits[:, -1].float()
-            allowed_logits = (
-                torch.cat(
-                    (
-                        next_logits[:, :BYTE_VOCAB_SIZE],
-                        next_logits[:, SEQ_EOS_ID : SEQ_EOS_ID + 1],
-                    ),
-                    dim=-1,
+            if oracle_length:
+                allowed_logits = next_logits[:, :BYTE_VOCAB_SIZE] / temperature
+            else:
+                allowed_logits = (
+                    torch.cat(
+                        (
+                            next_logits[:, :BYTE_VOCAB_SIZE],
+                            next_logits[:, SEQ_EOS_ID : SEQ_EOS_ID + 1],
+                        ),
+                        dim=-1,
+                    )
+                    / temperature
                 )
-                / temperature
-            )
             log_probs = torch.log_softmax(allowed_logits, dim=-1)
             sampled = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(1)
             sampled_log_probs = log_probs.gather(1, sampled.unsqueeze(1)).squeeze(1)
-            sampled = torch.where(
-                sampled == BYTE_VOCAB_SIZE,
-                torch.full_like(sampled, SEQ_EOS_ID),
-                sampled,
-            )
+            if not oracle_length:
+                sampled = torch.where(
+                    sampled == BYTE_VOCAB_SIZE,
+                    torch.full_like(sampled, SEQ_EOS_ID),
+                    sampled,
+                )
 
             active_indices = active.nonzero(as_tuple=False).flatten()
             log_probability_sums[active] += sampled_log_probs[active]
             token_counts[active] += 1
             for row in active_indices.tolist():
                 token = int(sampled[row])
-                if token == SEQ_EOS_ID:
+                if not oracle_length and token == SEQ_EOS_ID:
                     stopped[row] = True
                     active[row] = False
                 else:
@@ -343,7 +355,7 @@ def sample_candidates(
     return [
         Candidate(
             data=bytes(tokens),
-            stopped=bool(stopped[row]),
+            stopped=bool(stopped[row]) if not oracle_length else False,
             mean_log_probability=float(log_probability_sums[row] / token_counts[row].clamp_min(1)),
         )
         for row, tokens in enumerate(generated)
@@ -391,7 +403,7 @@ def prepare_mrt_step(
 
     ground_truth = Candidate(
         data=_ground_truth_replacement(stream, sample),
-        stopped=True,
+        stopped=not config.oracle_length,
         is_ground_truth=True,
     )
     sampled = sample_candidates(
@@ -400,6 +412,7 @@ def prepare_mrt_step(
         device,
         num_candidates=config.num_candidates - 1,
         temperature=config.temperature,
+        oracle_length=config.oracle_length,
     )
     candidates: list[Candidate] = []
     seen: set[tuple[bytes, bool]] = set()

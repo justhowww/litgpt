@@ -21,6 +21,7 @@ FIM_FORMAT=${FIM_FORMAT:-psm}
 # EOS is enabled by default for this experiment; set USE_EOS=0 for a PSM-only
 # baseline (which writes to a distinct, untagged directory).
 USE_EOS=${USE_EOS:-1}
+CE_LOSS_WEIGHT=${CE_LOSS_WEIGHT:-1}
 EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1}
 EOS_AUX_LOSS_WEIGHT=${EOS_AUX_LOSS_WEIGHT:-0}
 if [[ "${USE_EOS}" == "1" ]]; then
@@ -36,6 +37,7 @@ FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
 RECONSTRUCTION_EVAL_INTERVAL=${RECONSTRUCTION_EVAL_INTERVAL:-1000}
 RECONSTRUCTION_EVAL_SAMPLES=${RECONSTRUCTION_EVAL_SAMPLES:-5}
+RECONSTRUCTION_TASK=${RECONSTRUCTION_TASK:-both}
 RECONSTRUCTION_MAX_TARGET_BYTES=${RECONSTRUCTION_MAX_TARGET_BYTES:-1400}
 RECONSTRUCTION_ORACLE_LENGTH=${RECONSTRUCTION_ORACLE_LENGTH:-0}
 RECONSTRUCTION_ERROR_EXPLODING=${RECONSTRUCTION_ERROR_EXPLODING:-0}
@@ -48,6 +50,7 @@ MRT_START_STEP=${MRT_START_STEP:-0}
 MRT_NUM_CANDIDATES=${MRT_NUM_CANDIDATES:-16}
 MRT_CONTEXT_POOL_SIZE=${MRT_CONTEXT_POOL_SIZE:-64}
 MRT_MAX_TARGET_BYTES=${MRT_MAX_TARGET_BYTES:-2048}
+MRT_ORACLE_LENGTH=${MRT_ORACLE_LENGTH:-0}
 MRT_TEMPERATURE=${MRT_TEMPERATURE:-1.0}
 MRT_CANDIDATE_ALPHA=${MRT_CANDIDATE_ALPHA:-1.0}
 MRT_WEIGHT=${MRT_WEIGHT:-4.0}
@@ -92,9 +95,10 @@ cmd=(
     --fim-min-gap "${FIM_MIN_GAP}"
     --fim-max-gap "${FIM_MAX_GAP}"
     --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"
+    --ce-loss-weight "${CE_LOSS_WEIGHT}"
     --eval-interval 250
     --eval-iters 20
-    --reconstruction-task both
+    --reconstruction-task "${RECONSTRUCTION_TASK}"
     --reconstruction-eval-interval "${RECONSTRUCTION_EVAL_INTERVAL}"
     --reconstruction-eval-samples "${RECONSTRUCTION_EVAL_SAMPLES}"
     --reconstruction-max-target-bytes "${RECONSTRUCTION_MAX_TARGET_BYTES}"
@@ -132,6 +136,9 @@ cmd+=(--eos-loss-weight "${EOS_LOSS_WEIGHT}")
 cmd+=(--eos-aux-loss-weight "${EOS_AUX_LOSS_WEIGHT}")
 if [[ "${RECONSTRUCTION_ORACLE_LENGTH}" == "1" ]]; then
     cmd+=(--reconstruction-oracle-length)
+fi
+if [[ "${MRT_ORACLE_LENGTH}" == "1" ]]; then
+    cmd+=(--mrt-oracle-length)
 fi
 if [[ "${RECONSTRUCTION_ERROR_EXPLODING}" == "1" ]]; then
     cmd+=(--reconstruction-error-exploding)

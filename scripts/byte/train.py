@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         "to terminate. Default off uses oracle lengths for generation.",
     )
     parser.add_argument(
+        "--ce-loss-weight",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to supervised byte CE gradients.",
+    )
+    parser.add_argument(
         "--eos-loss-weight",
         type=float,
         default=1.0,
@@ -145,6 +151,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mrt-num-candidates", type=int, default=16)
     parser.add_argument("--mrt-context-pool-size", type=int, default=64)
     parser.add_argument("--mrt-max-target-bytes", type=int, default=2048)
+    parser.add_argument(
+        "--mrt-oracle-length",
+        action="store_true",
+        help="Generate and score exactly the known missing-span byte length.",
+    )
     parser.add_argument("--mrt-temperature", type=float, default=1.0)
     parser.add_argument("--mrt-candidate-alpha", type=float, default=1.0)
     parser.add_argument("--mrt-weight", type=float, default=4.0)
@@ -176,6 +187,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.ce_loss_weight < 0:
+        raise ValueError("--ce-loss-weight must be non-negative")
     if args.eos_loss_weight <= 0:
         raise ValueError("--eos-loss-weight must be positive")
     if args.eos_loss_weight != 1.0 and not args.use_eos:
@@ -186,8 +199,10 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
-    if args.mrt_interval > 0 and not args.use_eos:
-        raise ValueError("MRT requires --use-eos for variable-length candidates")
+    if args.mrt_interval > 0 and not args.use_eos and not args.mrt_oracle_length:
+        raise ValueError(
+            "MRT requires --use-eos unless --mrt-oracle-length is enabled"
+        )
     if args.mrt_interval > 0 and args.p_fim <= 0:
         raise ValueError("MRT requires a non-zero --p-fim")
     # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.
@@ -275,6 +290,7 @@ def main() -> None:
         num_candidates=args.mrt_num_candidates,
         context_pool_size=args.mrt_context_pool_size,
         max_target_bytes=args.mrt_max_target_bytes,
+        oracle_length=args.mrt_oracle_length,
         temperature=args.mrt_temperature,
         candidate_alpha=args.mrt_candidate_alpha,
         weight=args.mrt_weight,
@@ -308,6 +324,7 @@ def main() -> None:
         seed=args.seed,
         compile_model=args.compile,
         reconstruction_eval=reconstruction_eval,
+        ce_loss_weight=args.ce_loss_weight,
         eos_loss_weight=args.eos_loss_weight,
         eos_aux_loss_weight=args.eos_aux_loss_weight,
         mrt=mrt,

@@ -103,3 +103,14 @@ def test_candidate_inputs_align_first_byte_with_prompt_marker():
         [1, 2, REGION_BRIDGE, REGION_BRIDGE, REGION_BRIDGE]
     ]  # Candidate inputs preserve the bridge region.
     assert inputs["offset_ids"].tolist() == [[0, 1, 5, 6, 7]]  # Generated inputs continue at the missing-span offsets.
+
+
+def test_oracle_length_candidate_inputs_exclude_eos():
+    sample = make_sample()
+    candidate = Candidate(data=b"\x21\x22", stopped=False)
+
+    inputs, labels = build_candidate_inputs(sample, candidate, torch.device("cpu"))
+
+    assert inputs["idx"].tolist() == [[10, 11, 12, 0x21]]
+    assert labels.tolist() == [[-100, -100, 0x21, 0x22]]
+    assert SEQ_EOS_ID not in labels.tolist()[0]
