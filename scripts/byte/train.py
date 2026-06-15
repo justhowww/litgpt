@@ -239,10 +239,9 @@ def main() -> None:
         raise ValueError(
             "--mrt-oracle-length and --mrt-learned-eos are mutually exclusive"
         )
-    if args.reconstruction_oracle_length and args.reconstruction_learned_eos:
-        raise ValueError(
-            "Reconstruction oracle length and learned EOS are mutually exclusive"
-        )
+    # Reconstruction probes support running learned-EOS generation as the
+    # primary policy while also evaluating an oracle-length candidate on the
+    # same checkpoint; the eval path emits both as separate metric prefixes.
     if args.mrt_interval > 0 and args.p_fim <= 0:
         raise ValueError("MRT requires a non-zero --p-fim")
     # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.

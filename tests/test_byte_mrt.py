@@ -6,8 +6,10 @@ import torch
 from litgpt.byte_mrt import (
     Candidate,
     MRTConfig,
+    PreparedMRTStep,
     build_candidate_inputs,
     minimum_risk_coefficients,
+    mrt_candidate_diagnostics,
     should_run_mrt,
     visual_risk,
 )
@@ -122,3 +124,40 @@ def test_oracle_length_candidate_inputs_exclude_eos():
     assert inputs["idx"].tolist() == [[10, 11, 12, 0x21]]
     assert labels.tolist() == [[-100, -100, 0x21, 0x22]]
     assert SEQ_EOS_ID not in labels.tolist()[0]
+
+
+def test_mrt_diagnostics_separate_ground_truth_from_sampled_candidates():
+    candidates = (
+        Candidate(data=b"gt", stopped=False, is_ground_truth=True),
+        Candidate(data=b"a", stopped=False),
+        Candidate(data=b"b", stopped=False),
+    )
+    prepared = PreparedMRTStep(
+        sample=make_sample(),
+        candidates=candidates,
+        risks=torch.tensor([0.0, 0.6, 1.0]),
+        candidate_mses=torch.tensor([0.0, 0.01, float("nan")]),
+        candidate_scores=torch.tensor([-2.0, -2.5, -3.5]),
+        candidate_decoded=torch.tensor([True, True, False]),
+        candidate_probabilities=torch.tensor([0.5, 0.3, 0.2]),
+        coefficients=torch.zeros(3),
+        expected_risk=0.5,
+        decode_rate=2 / 3,
+        ground_truth_probability=0.5,
+    )
+
+    metrics = mrt_candidate_diagnostics(prepared)
+
+    assert metrics["mrt/score_gt"] == -2.0  # GT score is selected by role, not position-dependent slicing.
+    assert metrics["mrt/score_sampled_mean"] == -3.0  # Only model-generated candidate scores are averaged.
+    assert metrics["mrt/score_margin_gt_vs_sampled"] == 1.0  # Positive margin means GT has higher mean log-probability.
+    assert metrics["mrt/sampled_risk_mean"] == pytest.approx(0.8)  # GT's zero risk cannot create artificial sampled spread.
+    assert metrics["mrt/sampled_risk_std"] == pytest.approx(0.2)  # Sampled-only spread measures reward discrimination.
+    assert metrics["mrt/sampled_strict_decode_rate"] == 0.5  # Decode rate excludes the guaranteed-valid GT candidate.
+    assert metrics["mrt/sampled_mse_mean"] == pytest.approx(0.01)  # Failed strict decodes are excluded from MSE statistics.
+    assert metrics["mrt/sampled_q_sum"] == pytest.approx(0.5)
+    assert metrics["mrt/sampled_q_mean"] == pytest.approx(0.25)
+    assert metrics["mrt/sampled_q_max"] == pytest.approx(0.3)
+    # sampled contribution = 0.3*0.6 + 0.2*1.0 = 0.38; expected_risk = sum is the same (GT risk = 0).
+    assert metrics["mrt/sampled_expected_risk_contribution"] == pytest.approx(0.38)
+    assert metrics["mrt/sampled_conditional_expected_risk"] == pytest.approx(0.38 / 0.5)

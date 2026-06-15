@@ -24,6 +24,7 @@ from litgpt.byte.data import (
 from litgpt.byte.mrt import (
     MRTConfig,
     candidate_mean_log_probability,
+    mrt_candidate_diagnostics,
     prepare_mrt_step,
     should_run_mrt,
 )
@@ -203,6 +204,7 @@ class ByteTrainingRuntime:
             "mrt/risk_max": float(prepared.risks.max()),
             "mrt/risk_std": float(prepared.risks.std(unbiased=False)),
         }
+        metrics.update(mrt_candidate_diagnostics(prepared))
         decoded_mses = prepared.candidate_mses[
             torch.isfinite(prepared.candidate_mses)
         ]
@@ -276,6 +278,7 @@ class ByteTrainingRuntime:
                 f"{metrics['optimization/mrt_grad_norm']:.4f}/"
                 f"{metrics['optimization/combined_grad_norm_pre_clip']:.4f}, "
                 f"spread: {metrics['mrt/risk_std']:.4f}, "
+                f"sampled spread: {metrics['mrt/sampled_risk_std']:.4f}, "
                 f"decode: {metrics['mrt/decode_rate']:.1%}, "
                 f"unique: {int(metrics['mrt/num_unique_candidates'])}"
             )

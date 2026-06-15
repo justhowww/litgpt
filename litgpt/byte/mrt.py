@@ -22,7 +22,7 @@ from litgpt.byte.reconstruction import (
     replace_target_nal,
 )
 
-MRT_RISK_MODES = ("clipped_mse", "smooth_mse")
+MRT_RISK_MODES = ("clipped_mse", "smooth_mse", "scaled_mse")
 
 
 @dataclass(frozen=True)
@@ -107,10 +107,91 @@ class PreparedMRTStep:
     candidates: tuple[Candidate, ...]
     risks: Tensor
     candidate_mses: Tensor
+    candidate_scores: Tensor
+    candidate_decoded: Tensor
+    candidate_probabilities: Tensor
     coefficients: Tensor
     expected_risk: float
     decode_rate: float
     ground_truth_probability: float
+
+
+def mrt_candidate_diagnostics(prepared: PreparedMRTStep) -> dict[str, float]:
+    """Summarize GT and model-sampled candidates without mixing their roles."""
+    ground_truth_mask = torch.tensor(
+        [candidate.is_ground_truth for candidate in prepared.candidates],
+        dtype=torch.bool,
+        device=prepared.risks.device,
+    )
+    sampled_mask = ~ground_truth_mask
+    metrics: dict[str, float] = {}
+
+    ground_truth_scores = prepared.candidate_scores[ground_truth_mask]
+    sampled_scores = prepared.candidate_scores[sampled_mask]
+    if ground_truth_scores.numel() > 0:
+        metrics["mrt/score_gt"] = float(ground_truth_scores.mean())
+    if sampled_scores.numel() > 0:
+        sampled_score_mean = float(sampled_scores.mean())
+        metrics["mrt/score_sampled_mean"] = sampled_score_mean
+        if ground_truth_scores.numel() > 0:
+            metrics["mrt/score_margin_gt_vs_sampled"] = (
+                float(ground_truth_scores.mean()) - sampled_score_mean
+            )
+
+    sampled_risks = prepared.risks[sampled_mask]
+    if sampled_risks.numel() > 0:
+        metrics.update(
+            {
+                "mrt/sampled_risk_min": float(sampled_risks.min()),
+                "mrt/sampled_risk_mean": float(sampled_risks.mean()),
+                "mrt/sampled_risk_max": float(sampled_risks.max()),
+                "mrt/sampled_risk_std": float(
+                    sampled_risks.std(unbiased=False)
+                ),
+                "mrt/sampled_strict_decode_rate": float(
+                    prepared.candidate_decoded[sampled_mask].float().mean()
+                ),
+            }
+        )
+
+    # Sampled-q decomposition. GT has risk = 0 under non-saturating reward
+    # modes (`scaled_mse`, `clipped_mse` in its unsaturated range), so the
+    # q_GT * r_GT contribution to expected_risk is zero. Then
+    #   expected_risk = sum_sampled (q_j * r_j)
+    # and a falling expected_risk has two distinct causes to disambiguate:
+    #   (a) sampled probability mass shrinks (mass moves to GT)
+    #       -> sampled_q_sum drops, conditional_expected_risk roughly flat
+    #   (b) sampled candidates themselves become visually better
+    #       -> sampled_q_sum roughly flat, conditional_expected_risk drops
+    sampled_q = prepared.candidate_probabilities[sampled_mask]
+    sampled_risks_for_q = prepared.risks[sampled_mask]
+    if sampled_q.numel() > 0:
+        sampled_q_sum = float(sampled_q.sum())
+        metrics["mrt/sampled_q_sum"] = sampled_q_sum
+        metrics["mrt/sampled_q_mean"] = float(sampled_q.mean())
+        metrics["mrt/sampled_q_max"] = float(sampled_q.max())
+        sampled_contribution = float((sampled_q * sampled_risks_for_q).sum())
+        metrics["mrt/sampled_expected_risk_contribution"] = sampled_contribution
+        if sampled_q_sum > 0:
+            metrics["mrt/sampled_conditional_expected_risk"] = (
+                sampled_contribution / sampled_q_sum
+            )
+
+    sampled_mses = prepared.candidate_mses[
+        sampled_mask & torch.isfinite(prepared.candidate_mses)
+    ]
+    if sampled_mses.numel() > 0:
+        metrics.update(
+            {
+                "mrt/sampled_mse_min": float(sampled_mses.min()),
+                "mrt/sampled_mse_mean": float(sampled_mses.mean()),
+                "mrt/sampled_mse_p50": float(torch.quantile(sampled_mses, 0.5)),
+                "mrt/sampled_mse_p90": float(torch.quantile(sampled_mses, 0.9)),
+                "mrt/sampled_mse_max": float(sampled_mses.max()),
+                "mrt/sampled_mse_std": float(sampled_mses.std(unbiased=False)),
+            }
+        )
+    return metrics
 
 
 def visual_risk(mse: float, config: MRTConfig) -> float:
@@ -119,6 +200,11 @@ def visual_risk(mse: float, config: MRTConfig) -> float:
         raise ValueError("MSE must be non-negative")
     if config.risk_mode == "smooth_mse":
         return mse / (mse + config.mse_tau)
+    if config.risk_mode == "scaled_mse":
+        # Vanilla scaled MSE: no clipping, no asymptote. The decode-failure
+        # penalty (config.decode_failure_weight) sits outside this function
+        # and provides the only large-magnitude tail.
+        return config.mse_weight * mse
     return min(config.max_risk, config.mse_weight * mse)
 
 
@@ -444,7 +530,12 @@ def prepare_mrt_step(
         [float("nan") if mse is None else mse for _, _, mse in risk_results],
         device=device,
     )
-    decode_rate = sum(decoded for _, decoded, _ in risk_results) / len(risk_results)
+    candidate_decoded = torch.tensor(
+        [decoded for _, decoded, _ in risk_results],
+        dtype=torch.bool,
+        device=device,
+    )
+    decode_rate = float(candidate_decoded.float().mean())
 
     scores: list[float] = []
     for candidate in candidates:
@@ -465,18 +556,32 @@ def prepare_mrt_step(
             )
         scores.append(float(score))
 
+    candidate_scores = torch.tensor(scores, device=device)
     q, expected_risk, coefficients = minimum_risk_coefficients(
-        torch.tensor(scores, device=device),
+        candidate_scores,
         risks,
         config.candidate_alpha,
+    )
+    ground_truth_mask = torch.tensor(
+        [candidate.is_ground_truth for candidate in candidates],
+        dtype=torch.bool,
+        device=device,
+    )
+    ground_truth_probability = (
+        float(q[ground_truth_mask].sum())
+        if bool(ground_truth_mask.any())
+        else float("nan")
     )
     return PreparedMRTStep(
         sample=sample,
         candidates=tuple(candidates),
         risks=risks.detach(),
         candidate_mses=candidate_mses.detach(),
+        candidate_scores=candidate_scores.detach(),
+        candidate_decoded=candidate_decoded.detach(),
+        candidate_probabilities=q.detach(),
         coefficients=coefficients,
         expected_risk=float(expected_risk),
         decode_rate=decode_rate,
-        ground_truth_probability=float(q[0]),
+        ground_truth_probability=ground_truth_probability,
     )
