@@ -36,6 +36,11 @@ class MRTConfig:
     max_target_bytes: int = 2048
     oracle_length: bool = False
     learned_eos: bool = False
+    # When True (default), the ground-truth replacement is prepended to the
+    # candidate pool as an upper anchor. When False, all num_candidates are
+    # model-sampled -- tests whether GT-in-pool is contributing useful anchor
+    # information or hijacking the gradient toward CE-like reranking.
+    include_ground_truth: bool = True
     temperature: float = 1.0
     candidate_alpha: float = 1.0
     weight: float = 4.0
@@ -493,23 +498,32 @@ def prepare_mrt_step(
     if reference is None:
         return None
 
-    ground_truth = Candidate(
-        data=_ground_truth_replacement(stream, sample),
-        stopped=not config.oracle_length,
-        is_ground_truth=True,
+    num_sampled = (
+        config.num_candidates - 1
+        if config.include_ground_truth
+        else config.num_candidates
     )
     sampled = sample_candidates(
         model,
         sample,
         device,
-        num_candidates=config.num_candidates - 1,
+        num_candidates=num_sampled,
         temperature=config.temperature,
         oracle_length=config.oracle_length,
         learned_eos=config.learned_eos,
     )
+    if config.include_ground_truth:
+        ground_truth = Candidate(
+            data=_ground_truth_replacement(stream, sample),
+            stopped=not config.oracle_length,
+            is_ground_truth=True,
+        )
+        pool: tuple[Candidate, ...] = (ground_truth, *sampled)
+    else:
+        pool = tuple(sampled)
     candidates: list[Candidate] = []
     seen: set[tuple[bytes, bool]] = set()
-    for candidate in (ground_truth, *sampled):
+    for candidate in pool:
         identity = (candidate.data, candidate.stopped)
         if identity in seen:
             continue

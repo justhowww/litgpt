@@ -63,6 +63,7 @@ MRT_MSE_TAU=${MRT_MSE_TAU:-0.002}
 MRT_DECODE_FAILURE_WEIGHT=${MRT_DECODE_FAILURE_WEIGHT:-2.0}
 MRT_MAX_RISK=${MRT_MAX_RISK:-2.0}
 MRT_DECODE_WORKERS=${MRT_DECODE_WORKERS:-8}
+MRT_INCLUDE_GROUND_TRUTH=${MRT_INCLUDE_GROUND_TRUTH:-1}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable: ${MANIFEST}" >&2
@@ -148,6 +149,9 @@ if [[ "${MRT_ORACLE_LENGTH}" == "1" ]]; then
 fi
 if [[ "${MRT_LEARNED_EOS}" == "1" ]]; then
     cmd+=(--mrt-learned-eos)
+fi
+if [[ "${MRT_INCLUDE_GROUND_TRUTH}" == "0" ]]; then
+    cmd+=(--no-mrt-ground-truth)
 fi
 if [[ "${RECONSTRUCTION_LEARNED_EOS}" == "1" ]]; then
     cmd+=(--reconstruction-learned-eos)

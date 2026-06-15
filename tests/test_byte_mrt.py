@@ -161,3 +161,36 @@ def test_mrt_diagnostics_separate_ground_truth_from_sampled_candidates():
     # sampled contribution = 0.3*0.6 + 0.2*1.0 = 0.38; expected_risk = sum is the same (GT risk = 0).
     assert metrics["mrt/sampled_expected_risk_contribution"] == pytest.approx(0.38)
     assert metrics["mrt/sampled_conditional_expected_risk"] == pytest.approx(0.38 / 0.5)
+
+
+def test_mrt_diagnostics_without_ground_truth_candidate():
+    candidates = (
+        Candidate(data=b"a", stopped=False),
+        Candidate(data=b"b", stopped=False),
+        Candidate(data=b"c", stopped=False),
+    )
+    prepared = PreparedMRTStep(
+        sample=make_sample(),
+        candidates=candidates,
+        risks=torch.tensor([0.2, 0.6, 1.0]),
+        candidate_mses=torch.tensor([0.005, 0.02, float("nan")]),
+        candidate_scores=torch.tensor([-2.5, -3.0, -3.5]),
+        candidate_decoded=torch.tensor([True, True, False]),
+        candidate_probabilities=torch.tensor([0.5, 0.3, 0.2]),
+        coefficients=torch.zeros(3),
+        expected_risk=0.48,
+        decode_rate=2 / 3,
+        ground_truth_probability=float("nan"),
+    )
+
+    metrics = mrt_candidate_diagnostics(prepared)
+
+    # GT-specific metrics absent.
+    assert "mrt/score_gt" not in metrics
+    assert "mrt/score_margin_gt_vs_sampled" not in metrics
+    # Sampled pool spans all candidates -> sums to 1, conditional == expected_risk.
+    assert metrics["mrt/sampled_q_sum"] == pytest.approx(1.0)
+    assert metrics["mrt/sampled_q_mean"] == pytest.approx(1.0 / 3)
+    contribution = 0.5 * 0.2 + 0.3 * 0.6 + 0.2 * 1.0
+    assert metrics["mrt/sampled_expected_risk_contribution"] == pytest.approx(contribution)
+    assert metrics["mrt/sampled_conditional_expected_risk"] == pytest.approx(contribution)

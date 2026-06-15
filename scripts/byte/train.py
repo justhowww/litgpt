@@ -181,6 +181,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow MRT to learn EOS stopping without supervised EOS targets.",
     )
+    parser.add_argument(
+        "--no-mrt-ground-truth",
+        dest="mrt_include_ground_truth",
+        action="store_false",
+        help=(
+            "Drop GT from the MRT candidate pool; all num_candidates are "
+            "model-sampled. Default behavior keeps GT as an upper anchor."
+        ),
+    )
+    parser.set_defaults(mrt_include_ground_truth=True)
     parser.add_argument("--mrt-temperature", type=float, default=1.0)
     parser.add_argument("--mrt-candidate-alpha", type=float, default=1.0)
     parser.add_argument("--mrt-weight", type=float, default=4.0)
@@ -332,6 +342,7 @@ def main() -> None:
         max_target_bytes=args.mrt_max_target_bytes,
         oracle_length=args.mrt_oracle_length,
         learned_eos=args.mrt_learned_eos,
+        include_ground_truth=args.mrt_include_ground_truth,
         temperature=args.mrt_temperature,
         candidate_alpha=args.mrt_candidate_alpha,
         weight=args.mrt_weight,
