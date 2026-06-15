@@ -45,6 +45,14 @@ class ReconstructionEvalConfig:
     evaluate_error_exploding: bool = False
     evaluate_fim_baselines: bool = False
     learned_eos_stopping: bool = False
+    # FIM gap-size buckets for per-bucket metric breakdown. Each tuple is
+    # (lo_inclusive, hi_exclusive, name). Defaults match the 1-8 KiB FIM
+    # configuration. AR samples are reported under "all" only.
+    gap_buckets: tuple[tuple[int, int, str], ...] = (
+        (1024, 2048, "1k_2k"),
+        (2048, 4096, "2k_4k"),
+        (4096, 8193, "4k_8k"),
+    )
 
 
 @dataclass(frozen=True)
@@ -450,22 +458,35 @@ def run_reconstruction_probe(
     device: torch.device,
 ) -> dict[str, float]:
     method_stats: dict[tuple[str, str], dict[str, object]] = {}
+    bucket_stats: dict[tuple[str, str, str], dict[str, object]] = {}
     stop_records: list[tuple[int, int, bool]] = []
     unexpected_failures = 0
     invalid_generation = 0
 
+    def _empty_stats() -> dict[str, object]:
+        return {
+            "attempted": 0,
+            "decoded": 0,
+            "timeouts": 0,
+            "missing_frames": 0,
+            "psnr": [],
+            "ssim": [],
+        }
+
     def stats_for(method: str, mode: str) -> dict[str, object]:
-        return method_stats.setdefault(
-            (method, mode),
-            {
-                "attempted": 0,
-                "decoded": 0,
-                "timeouts": 0,
-                "missing_frames": 0,
-                "psnr": [],
-                "ssim": [],
-            },
-        )
+        return method_stats.setdefault((method, mode), _empty_stats())
+
+    def bucket_for_sample(sample: ReconstructionSample) -> str | None:
+        if sample.task != "fim":
+            return None
+        gap = sample.target_length
+        for lo, hi, name in config.gap_buckets:
+            if lo <= gap < hi:
+                return name
+        return None
+
+    def bucket_stats_for(method: str, mode: str, bucket: str) -> dict[str, object]:
+        return bucket_stats.setdefault((method, mode, bucket), _empty_stats())
 
     for sample in samples:
         stage = "read_stream"
@@ -475,8 +496,11 @@ def run_reconstruction_probe(
             modes = ["strict"]
             if config.evaluate_error_exploding:
                 modes.append("error_exploding")
+            sample_bucket = bucket_for_sample(sample)
             for mode in modes:
                 stats_for("model_learned", mode)["attempted"] += 1
+                if sample_bucket is not None:
+                    bucket_stats_for("model_learned", mode, sample_bucket)["attempted"] += 1
 
             stream = sample.h264_path.read_bytes()
             stage = "decode_reference"
@@ -494,6 +518,10 @@ def run_reconstruction_probe(
                     target_stats["missing_frames"] += int(
                         reference_status != "timeout"
                     )
+                    if sample_bucket is not None:
+                        bts = bucket_stats_for("model_learned", mode, sample_bucket)
+                        bts["timeouts"] += int(reference_status == "timeout")
+                        bts["missing_frames"] += int(reference_status != "timeout")
                 continue
 
             stage = "generate_learned"
@@ -531,8 +559,15 @@ def run_reconstruction_probe(
                 )
                 for mode in modes:
                     candidate_stats = stats_for(method, mode)
+                    bucket_cs = (
+                        bucket_stats_for(method, mode, sample_bucket)
+                        if sample_bucket is not None
+                        else None
+                    )
                     if method != "model_learned":
                         candidate_stats["attempted"] += 1
+                        if bucket_cs is not None:
+                            bucket_cs["attempted"] += 1
                     stage = f"decode_{method}_{mode}"
                     reconstruction, status = decode_frame(
                         reconstructed_stream,
@@ -545,14 +580,19 @@ def run_reconstruction_probe(
                     if reconstruction is None:
                         candidate_stats["timeouts"] += int(status == "timeout")
                         candidate_stats["missing_frames"] += int(status != "timeout")
+                        if bucket_cs is not None:
+                            bucket_cs["timeouts"] += int(status == "timeout")
+                            bucket_cs["missing_frames"] += int(status != "timeout")
                         continue
+                    psnr_value = image_psnr(reference, reconstruction)
+                    ssim_value = image_ssim(reference, reconstruction)
                     candidate_stats["decoded"] += 1
-                    candidate_stats["psnr"].append(
-                        image_psnr(reference, reconstruction)
-                    )
-                    candidate_stats["ssim"].append(
-                        image_ssim(reference, reconstruction)
-                    )
+                    candidate_stats["psnr"].append(psnr_value)
+                    candidate_stats["ssim"].append(ssim_value)
+                    if bucket_cs is not None:
+                        bucket_cs["decoded"] += 1
+                        bucket_cs["psnr"].append(psnr_value)
+                        bucket_cs["ssim"].append(ssim_value)
         except Exception as exc:
             unexpected_failures += 1
             if unexpected_failures <= 3:
@@ -624,6 +664,20 @@ def run_reconstruction_probe(
             method_values["missing_frames"]
         )
         metrics.update(_quality_metrics(prefix, method_values))
+    for (method, mode, bucket), bucket_values in bucket_stats.items():
+        prefix = f"reconstruction/{method}/{mode}/bucket_{bucket}/"
+        attempted = int(bucket_values["attempted"])
+        decoded = int(bucket_values["decoded"])
+        metrics[f"{prefix}attempted"] = float(attempted)
+        metrics[f"{prefix}decoded"] = float(decoded)
+        metrics[f"{prefix}decode_rate"] = (
+            decoded / attempted if attempted else 0.0
+        )
+        metrics[f"{prefix}timeouts"] = float(bucket_values["timeouts"])
+        metrics[f"{prefix}missing_target_frames"] = float(
+            bucket_values["missing_frames"]
+        )
+        metrics.update(_quality_metrics(prefix, bucket_values))
     for mode in ("strict", "error_exploding"):
         oracle_prefix = f"reconstruction/model_oracle/{mode}/"
         concealment_prefix = f"reconstruction/deleted_gap/{mode}/"

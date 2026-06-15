@@ -64,6 +64,8 @@ MRT_DECODE_FAILURE_WEIGHT=${MRT_DECODE_FAILURE_WEIGHT:-2.0}
 MRT_MAX_RISK=${MRT_MAX_RISK:-2.0}
 MRT_DECODE_WORKERS=${MRT_DECODE_WORKERS:-8}
 MRT_INCLUDE_GROUND_TRUTH=${MRT_INCLUDE_GROUND_TRUTH:-1}
+VAL_FRACTION=${VAL_FRACTION:-0.01}
+SPLIT_BY_VIDEO=${SPLIT_BY_VIDEO:-0}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable: ${MANIFEST}" >&2
@@ -152,6 +154,10 @@ if [[ "${MRT_LEARNED_EOS}" == "1" ]]; then
 fi
 if [[ "${MRT_INCLUDE_GROUND_TRUTH}" == "0" ]]; then
     cmd+=(--no-mrt-ground-truth)
+fi
+cmd+=(--val-fraction "${VAL_FRACTION}")
+if [[ "${SPLIT_BY_VIDEO}" == "1" ]]; then
+    cmd+=(--split-by-video)
 fi
 if [[ "${RECONSTRUCTION_LEARNED_EOS}" == "1" ]]; then
     cmd+=(--reconstruction-learned-eos)

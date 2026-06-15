@@ -156,6 +156,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
     parser.add_argument("--no-sps-pps-conditioning", action="store_true")
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.01,
+        help=(
+            "Fraction held out for validation. With --split-by-video this is "
+            "the fraction of source videos; without it, the fraction of slice "
+            "samples (the legacy slice-level split)."
+        ),
+    )
+    parser.add_argument(
+        "--split-by-video",
+        action="store_true",
+        help=(
+            "Split train/val by source video (h264_path), not by slice. "
+            "Eliminates within-video leakage and produces a genuinely held-out "
+            "video evaluation set."
+        ),
+    )
     parser.add_argument("--no-region-id", action="store_true")
     parser.add_argument("--no-offset-id", action="store_true")
     parser.add_argument("--compile", action="store_true")
@@ -285,6 +304,8 @@ def main() -> None:
         num_workers=args.num_workers,
         condition_on_sps_pps=not args.no_sps_pps_conditioning,
         default_max_seq_length=args.block_size,
+        val_fraction=args.val_fraction,
+        split_by_video=args.split_by_video,
     )
     max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
     data = ByteDataModule(

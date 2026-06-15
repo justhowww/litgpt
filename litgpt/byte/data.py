@@ -93,6 +93,10 @@ class ByteDataConfig:
     # header/intra-frame recovery experiments.
     target_nal_types: tuple[int, ...] = (1,)
     val_fraction: float = 0.01  # Fraction of slice samples held out for validation.
+    # When True, the train/val split is performed over source videos (h264_path)
+    # rather than over individual slice samples, eliminating within-video
+    # leakage. val_fraction then denotes the fraction of *videos* held out.
+    split_by_video: bool = False
     seed: int = 42  # Seed for train/val split and deterministic span sampling.
     num_workers: int = 4  # DataLoader workers.
     fim_min_gap: int = 64  # Minimum FIM missing-span length in bytes.
@@ -900,32 +904,57 @@ class ByteDataModule(DataModule):
         )
         if self.nal_index_path is not None and nal_index is None:
             raise FileNotFoundError(f"NAL index does not exist: {index_path}")
-        dataset = ByteSliceDataset(
-            rows,
-            max_seq_length=self.max_seq_length,
-            p_fim=self.config.p_fim,
-            fim_format=self.config.fim_format,
-            use_eos=self.config.use_eos,
-            num_ref_slices=self.config.num_ref_slices,
-            target_nal_types=self.config.target_nal_types,
-            fim_min_gap=self.config.fim_min_gap,
-            fim_max_gap=self.config.fim_max_gap,
-            slice_header_guard_bytes=self.config.slice_header_guard_bytes,
-            condition_on_sps_pps=self.config.condition_on_sps_pps,
-            reference_mode=self.config.reference_mode,
-            nal_index=nal_index,
-            seed=self.config.seed,
-        )
-        val_size = max(1, int(len(dataset) * self.config.val_fraction))
-        train_size = len(dataset) - val_size
-        if train_size <= 0:
-            raise ValueError(
-                "Need at least two usable byte samples for train/val split"
+        def _build_dataset(rows_subset: list[dict[str, Any]]) -> ByteSliceDataset:
+            return ByteSliceDataset(
+                rows_subset,
+                max_seq_length=self.max_seq_length,
+                p_fim=self.config.p_fim,
+                fim_format=self.config.fim_format,
+                use_eos=self.config.use_eos,
+                num_ref_slices=self.config.num_ref_slices,
+                target_nal_types=self.config.target_nal_types,
+                fim_min_gap=self.config.fim_min_gap,
+                fim_max_gap=self.config.fim_max_gap,
+                slice_header_guard_bytes=self.config.slice_header_guard_bytes,
+                condition_on_sps_pps=self.config.condition_on_sps_pps,
+                reference_mode=self.config.reference_mode,
+                nal_index=nal_index,
+                seed=self.config.seed,
             )
-        generator = torch.Generator().manual_seed(self.config.seed)
-        self.train_dataset, self.val_dataset = random_split(
-            dataset, [train_size, val_size], generator=generator
-        )
+
+        if self.config.split_by_video:
+            # Group rows by source video, then split videos into train/val so
+            # no video contributes slices to both partitions. This produces a
+            # genuinely held-out video evaluation set, eliminating within-video
+            # leakage that slice-level random_split allows.
+            video_to_rows: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                video_to_rows.setdefault(row["h264_path"], []).append(row)
+            video_ids = sorted(video_to_rows.keys())
+            generator = torch.Generator().manual_seed(self.config.seed)
+            perm = torch.randperm(len(video_ids), generator=generator).tolist()
+            n_val = max(1, int(len(video_ids) * self.config.val_fraction))
+            if len(video_ids) - n_val <= 0:
+                raise ValueError(
+                    "Need at least two source videos for video-level split"
+                )
+            val_video_ids = {video_ids[i] for i in perm[:n_val]}
+            train_rows = [r for r in rows if r["h264_path"] not in val_video_ids]
+            val_rows = [r for r in rows if r["h264_path"] in val_video_ids]
+            self.train_dataset = _build_dataset(train_rows)
+            self.val_dataset = _build_dataset(val_rows)
+        else:
+            dataset = _build_dataset(rows)
+            val_size = max(1, int(len(dataset) * self.config.val_fraction))
+            train_size = len(dataset) - val_size
+            if train_size <= 0:
+                raise ValueError(
+                    "Need at least two usable byte samples for train/val split"
+                )
+            generator = torch.Generator().manual_seed(self.config.seed)
+            self.train_dataset, self.val_dataset = random_split(
+                dataset, [train_size, val_size], generator=generator
+            )
 
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
