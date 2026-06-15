@@ -322,6 +322,61 @@ def test_reconstruction_probe_defaults_to_strict_concealment_free_decoding(
     )  # The strict series is retained explicitly for TensorBoard inspection.
 
 
+def test_reconstruction_probe_collects_default_concealment_comparison(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "stream.h264"
+    path.write_bytes(b"stream")
+    sample = ReconstructionSample(
+        h264_path=path,
+        target_start=0,
+        target_end=6,
+        target_nal_index=0,
+        frame_index=0,
+        prompt_ids=torch.tensor([SPAN_BOS_ID]),
+        prompt_region_ids=torch.tensor([REGION_BRIDGE]),
+        prompt_offset_ids=torch.tensor([0]),
+        target_length=1,
+        task="fim",
+        replacement_start=0,
+        replacement_end=1,
+    )
+    decode_modes = []
+
+    def fake_decode(*args, error_exploding=False, strict_syntax=False, **kwargs):
+        decode_modes.append((error_exploding, strict_syntax))
+        return torch.zeros((2, 3, 3)), "decoded"
+
+    monkeypatch.setattr("litgpt.byte.reconstruction.decode_frame", fake_decode)
+    monkeypatch.setattr(
+        "litgpt.byte.reconstruction.generate_target_slice",
+        lambda *args, **kwargs: SimpleNamespace(data=b"x", stopped=False),
+    )
+    visualizations = []
+
+    run_reconstruction_probe(
+        torch.nn.Identity(),
+        [sample],
+        ReconstructionEvalConfig(
+            evaluate_fim_baselines=True,
+            num_visualization_samples=1,
+        ),
+        torch.device("cpu"),
+        visualizations=visualizations,
+    )
+
+    assert len(visualizations) == 1  # One fixed sample produces one comparison panel.
+    assert (
+        visualizations[0].statuses["deleted_gap_default"] == "decoded"
+    )  # The FFmpeg-default concealment result is retained for TensorBoard.
+    assert (
+        False, False
+    ) in decode_modes  # Default concealment adds no strict or error-exploding flags.
+    assert (
+        "model_learned_strict" in visualizations[0].frames
+    )  # Our reconstruction is visualized only after concealment-free decoding.
+
+
 def test_reconstruction_metrics_are_namespaced_by_task():
     metrics = {
         "reconstruction/decode_rate": 1.0,

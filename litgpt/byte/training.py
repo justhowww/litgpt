@@ -31,6 +31,7 @@ from litgpt.byte.mrt import (
 from litgpt.byte.reconstruction import (
     ReconstructionEvalConfig,
     ReconstructionSample,
+    ReconstructionVisualization,
     run_reconstruction_probe,
     save_reconstruction_sample_manifest,
     select_reconstruction_samples,
@@ -305,11 +306,13 @@ class ByteTrainingRuntime:
         for task, samples in self.reconstruction_samples.items():
             if not samples:
                 continue
+            visualizations: list[ReconstructionVisualization] = []
             metrics = run_reconstruction_probe(
                 model,
                 samples,
                 config,
                 fabric.device,
+                visualizations=visualizations,
             )
             prefix = "Final " if final else ""
             fabric.print(
@@ -322,6 +325,80 @@ class ByteTrainingRuntime:
                 namespace_reconstruction_metrics(metrics, task),
                 step=log_step,
             )
+            self._log_reconstruction_visualizations(
+                fabric, task, visualizations, log_step
+            )
+
+    @staticmethod
+    def _log_reconstruction_visualizations(
+        fabric: Fabric,
+        task: str,
+        visualizations: list[ReconstructionVisualization],
+        step: int,
+    ) -> None:
+        """Log fixed decoder comparisons when a TensorBoard writer is active."""
+        if fabric.global_rank != 0 or not visualizations:
+            return
+        column_order = (
+            "ground_truth",
+            "deleted_gap_strict",
+            "deleted_gap_default",
+            "model_learned_strict",
+        )
+        column_labels = (
+            "Ground truth",
+            "Deleted gap, strict",
+            "Deleted gap, FFmpeg default",
+            "Model reconstruction, strict",
+        )
+        for logger in fabric.loggers:
+            writer = getattr(logger, "experiment", None)
+            if not callable(getattr(writer, "add_image", None)):
+                continue
+            for visualization in visualizations:
+                try:
+                    reference = visualization.frames["ground_truth"]
+                    missing = torch.zeros_like(reference)
+                    missing[..., 0] = 1.0  # Red tile denotes a failed decode.
+                    separator = torch.ones(
+                        (reference.shape[0], 4, reference.shape[2]),
+                        dtype=reference.dtype,
+                    )
+                    columns = [
+                        visualization.frames.get(name, missing)
+                        for name in column_order
+                    ]
+                    panel_parts: list[Tensor] = []
+                    for column_index, column in enumerate(columns):
+                        if column_index:
+                            panel_parts.append(separator)
+                        panel_parts.append(column)
+                    panel = torch.cat(panel_parts, dim=1).clamp(0, 1)
+                    tag = (
+                        f"reconstruction/{task}/frames/"
+                        f"sample_{visualization.sample_index:02d}"
+                    )
+                    writer.add_image(
+                        tag, panel, global_step=step, dataformats="HWC"
+                    )
+                    if callable(getattr(writer, "add_text", None)):
+                        rows = ["| Column | Decode status |", "|---|---|"]
+                        rows.extend(
+                            f"| {label} | {visualization.statuses.get(name, 'not decoded')} |"
+                            for label, name in zip(column_labels, column_order)
+                        )
+                        rows.append("\nRed frame = decode failed or produced no frame.")
+                        writer.add_text(
+                            f"{tag}_legend",
+                            "\n".join(rows),
+                            global_step=step,
+                        )
+                except Exception as exc:
+                    fabric.print(
+                        "TensorBoard reconstruction image logging failed for "
+                        f"{task} sample {visualization.sample_index}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
 
 
 def get_model_inputs_and_targets(

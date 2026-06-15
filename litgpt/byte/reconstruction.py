@@ -45,6 +45,9 @@ class ReconstructionEvalConfig:
     evaluate_error_exploding: bool = False
     evaluate_fim_baselines: bool = False
     learned_eos_stopping: bool = False
+    # Number of fixed probe samples rendered to TensorBoard. Visual panels are
+    # opt-in because they add one default-decoder pass per displayed sample.
+    num_visualization_samples: int = 0
     # FIM gap-size buckets for per-bucket metric breakdown. Each tuple is
     # (lo_inclusive, hi_exclusive, name). Defaults match the 1-8 KiB FIM
     # configuration. AR samples are reported under "all" only.
@@ -81,6 +84,15 @@ class ReconstructionSample:
 class GenerationResult:
     data: bytes
     stopped: bool
+
+
+@dataclass(frozen=True)
+class ReconstructionVisualization:
+    """Decoded frames and statuses for one TensorBoard comparison panel."""
+
+    sample_index: int
+    frames: dict[str, Tensor]
+    statuses: dict[str, str]
 
 
 def select_reconstruction_samples(
@@ -456,6 +468,7 @@ def run_reconstruction_probe(
     samples: list[ReconstructionSample],
     config: ReconstructionEvalConfig,
     device: torch.device,
+    visualizations: list[ReconstructionVisualization] | None = None,
 ) -> dict[str, float]:
     method_stats: dict[tuple[str, str], dict[str, object]] = {}
     bucket_stats: dict[tuple[str, str, str], dict[str, object]] = {}
@@ -488,8 +501,15 @@ def run_reconstruction_probe(
     def bucket_stats_for(method: str, mode: str, bucket: str) -> dict[str, object]:
         return bucket_stats.setdefault((method, mode, bucket), _empty_stats())
 
-    for sample in samples:
+    for sample_index, sample in enumerate(samples):
         stage = "read_stream"
+        collect_visualization = (
+            visualizations is not None
+            and sample_index < config.num_visualization_samples
+            and sample.task == "fim"
+        )
+        visualization_frames: dict[str, Tensor] = {}
+        visualization_statuses: dict[str, str] = {}
         try:
             # The deployment signal must measure the generated bitstream, not
             # frames repaired by FFmpeg's decoder-side error concealment.
@@ -523,6 +543,9 @@ def run_reconstruction_probe(
                         bts["timeouts"] += int(reference_status == "timeout")
                         bts["missing_frames"] += int(reference_status != "timeout")
                 continue
+            if collect_visualization:
+                visualization_frames["ground_truth"] = reference.detach().cpu()
+                visualization_statuses["ground_truth"] = reference_status
 
             stage = "generate_learned"
             learned = generate_target_slice(model, sample, device)
@@ -577,6 +600,16 @@ def run_reconstruction_probe(
                         error_exploding=mode == "error_exploding",
                         strict_syntax=mode == "strict",
                     )
+                    if (
+                        collect_visualization
+                        and mode == "strict"
+                        and method in {"model_learned", "deleted_gap"}
+                    ):
+                        visualization_statuses[f"{method}_strict"] = status
+                        if reconstruction is not None:
+                            visualization_frames[f"{method}_strict"] = (
+                                reconstruction.detach().cpu()
+                            )
                     if reconstruction is None:
                         candidate_stats["timeouts"] += int(status == "timeout")
                         candidate_stats["missing_frames"] += int(status != "timeout")
@@ -593,6 +626,23 @@ def run_reconstruction_probe(
                         bucket_cs["decoded"] += 1
                         bucket_cs["psnr"].append(psnr_value)
                         bucket_cs["ssim"].append(ssim_value)
+
+            if collect_visualization:
+                # This path intentionally passes no strict/error flags. It is
+                # FFmpeg's default decoder behavior, including concealment.
+                stage = "decode_deleted_gap_default"
+                deleted_stream = replace_target_nal(stream, sample, b"")
+                default_frame, default_status = decode_frame(
+                    deleted_stream,
+                    sample.frame_index,
+                    config.ffmpeg_binary,
+                    config.timeout_sec,
+                )
+                visualization_statuses["deleted_gap_default"] = default_status
+                if default_frame is not None:
+                    visualization_frames["deleted_gap_default"] = (
+                        default_frame.detach().cpu()
+                    )
         except Exception as exc:
             unexpected_failures += 1
             if unexpected_failures <= 3:
@@ -601,6 +651,15 @@ def run_reconstruction_probe(
                     f"[{stage}] {sample.h264_path} frame={sample.frame_index}: "
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
+                )
+        finally:
+            if collect_visualization and "ground_truth" in visualization_frames:
+                visualizations.append(
+                    ReconstructionVisualization(
+                        sample_index=sample_index,
+                        frames=visualization_frames,
+                        statuses=visualization_statuses,
+                    )
                 )
 
     learned_strict = stats_for("model_learned", "strict")

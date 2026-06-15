@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-eval-interval", type=int, default=0)
     parser.add_argument("--reconstruction-eval-samples", type=int, default=5)
     parser.add_argument(
+        "--reconstruction-visualization-samples",
+        type=int,
+        default=0,
+        help=(
+            "Log this many fixed FIM decoder comparison panels to TensorBoard; "
+            "0 disables image logging."
+        ),
+    )
+    parser.add_argument(
         "--reconstruction-task",
         choices=("ar", "fim", "both"),
         default="ar",
@@ -351,6 +360,7 @@ def main() -> None:
             evaluate_error_exploding=args.reconstruction_error_exploding,
             evaluate_fim_baselines=args.reconstruction_fim_baselines,
             learned_eos_stopping=args.reconstruction_learned_eos,
+            num_visualization_samples=args.reconstruction_visualization_samples,
         )
         if args.reconstruction_eval_interval > 0
         else None
