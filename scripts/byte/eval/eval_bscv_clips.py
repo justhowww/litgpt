@@ -13,9 +13,17 @@ import csv
 import json
 import random
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Running as ``python scripts/byte/eval/eval_bscv_clips.py`` puts the script's
+# own directory on sys.path, not the repo root, so the ``scripts`` package below
+# is not importable. Add the repo root (parents[3]) explicitly.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 from torch import Tensor

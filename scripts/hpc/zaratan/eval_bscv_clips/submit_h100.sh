@@ -4,7 +4,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=${REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)}
 SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-"metzler-prj-cmsc"}
+export REPO_ROOT
 
 job_id=$(
     sbatch \
