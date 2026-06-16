@@ -72,8 +72,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
     parser.add_argument("--timeout-sec", type=int, default=30)
     parser.add_argument("--max-target-bytes", type=int, default=8192)
-    parser.add_argument("--strategies", nargs="+", choices=("greedy", "best_of_n"), default=["greedy", "best_of_n"])
+    parser.add_argument(
+        "--strategies",
+        nargs="+",
+        choices=("greedy", "best_of_n", "beam"),
+        default=["greedy", "best_of_n"],
+    )
     parser.add_argument("--best-of-n", type=int, default=64)
+    parser.add_argument("--beam-width", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -254,6 +260,92 @@ def sample_tokens(logits: Tensor, temperature: float, top_k: int, top_p: float) 
     return torch.multinomial(probabilities, num_samples=1).squeeze(1)
 
 
+@torch.inference_mode()
+def beam_search_bytes(
+    model: nn.Module,
+    sample: ReconstructionSample,
+    device: torch.device,
+    beam_width: int,
+) -> list[bytes]:
+    """Return fixed-length byte candidates sorted by model log probability."""
+    if beam_width <= 0:
+        raise ValueError("beam_width must be positive")
+    raw_model = _unwrap_model(model)
+    raw_model.eval()
+    prompt = sample.prompt_ids.to(device).unsqueeze(0).expand(beam_width, -1).contiguous()
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0).expand(beam_width, -1).contiguous()
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0).expand(beam_width, -1).contiguous()
+    prompt_length = prompt.size(1)
+    if prompt_length + sample.target_length - 1 > raw_model.max_seq_length:
+        return []
+
+    sequences = torch.empty((beam_width, 0), device=device, dtype=torch.long)
+    scores = torch.full((beam_width,), float("-inf"), device=device)
+    scores[0] = 0.0
+    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
+    raw_model.set_kv_cache(
+        batch_size=beam_width,
+        max_seq_length=raw_model.max_seq_length,
+        device=device,
+        dtype=cache_dtype,
+    )
+    try:
+        input_pos = torch.arange(prompt_length, device=device, dtype=torch.long)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = raw_model(
+                prompt,
+                input_pos=input_pos,
+                input_pos_maxp1=prompt_length,
+                region_ids=region_ids,
+                offset_ids=offset_ids,
+            )
+        for generated_idx in range(sample.target_length):
+            log_probs = F.log_softmax(logits[:, -1, :BYTE_VOCAB_SIZE].float(), dim=-1)
+            flat_scores = (scores[:, None] + log_probs).reshape(-1)
+            next_scores, flat_indices = torch.topk(flat_scores, k=beam_width)
+            parents = flat_indices // BYTE_VOCAB_SIZE
+            tokens = flat_indices % BYTE_VOCAB_SIZE
+            _reorder_kv_cache(raw_model, parents)
+            sequences = torch.cat(
+                [sequences.index_select(0, parents), tokens[:, None]], dim=1
+            )
+            scores = next_scores
+            if generated_idx == sample.target_length - 1:
+                break
+            position = prompt_length + generated_idx
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                logits = raw_model(
+                    tokens.unsqueeze(1),
+                    input_pos=torch.full((beam_width, 1), position, device=device, dtype=torch.long),
+                    input_pos_maxp1=position + 1,
+                    region_ids=torch.full(
+                        (beam_width, 1),
+                        sample.generation_region_id,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                    offset_ids=torch.full(
+                        (beam_width, 1),
+                        sample.generation_offset_start + generated_idx,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                )
+    finally:
+        raw_model.clear_kv_cache()
+    return [bytes(row.tolist()) for row in sequences.detach().cpu()]
+
+
+def _reorder_kv_cache(model: nn.Module, parents: Tensor) -> None:
+    """Keep beam-search KV cache aligned with selected parent beams."""
+    for block in model.transformer.h:
+        kv_cache = block.attn.kv_cache
+        if kv_cache is None:
+            continue
+        kv_cache.k = kv_cache.k.index_select(0, parents)
+        kv_cache.v = kv_cache.v.index_select(0, parents)
+
+
 def evaluate_checkpoint(
     model: GPT,
     samples: list[ReconstructionSample],
@@ -269,6 +361,12 @@ def evaluate_checkpoint(
         "valid_candidates": [],
         "best_rank": [],
         "unique_candidates": [],
+        "beam_top_psnr": [],
+        "beam_top_ssim": [],
+        "beam_best_psnr": [],
+        "beam_best_ssim": [],
+        "beam_valid_candidates": [],
+        "beam_best_rank": [],
         "deleted_strict_psnr": [],
         "deleted_strict_ssim": [],
         "deleted_default_psnr": [],
@@ -276,6 +374,8 @@ def evaluate_checkpoint(
         "attempted": 0,
         "greedy_decoded": 0,
         "best_any_decoded": 0,
+        "beam_top_decoded": 0,
+        "beam_any_decoded": 0,
         "deleted_strict_decoded": 0,
         "deleted_default_decoded": 0,
     }
@@ -402,6 +502,65 @@ def evaluate_checkpoint(
             else:
                 best_record["num_valid"] = valid
 
+        beam_record: dict[str, Any] = {"top_decoded": False, "num_valid": 0}
+        if "beam" in args.strategies:
+            if sample_index == 0:
+                print(
+                    f"  {checkpoint_name}: running beam search width {args.beam_width}",
+                    flush=True,
+                )
+            beam_candidates = beam_search_bytes(model, sample, device, args.beam_width)
+            beam_best = None
+            beam_valid = 0
+            for rank, candidate in enumerate(beam_candidates):
+                candidate_stream = replace_target_nal(stream, sample, candidate)
+                candidate_frame, candidate_status = decode_frame(
+                    candidate_stream,
+                    sample.frame_index,
+                    args.ffmpeg_binary,
+                    args.timeout_sec,
+                    strict_syntax=True,
+                )
+                if candidate_frame is None:
+                    if rank == 0:
+                        beam_record["top_status"] = candidate_status
+                    continue
+                beam_valid += 1
+                psnr = image_psnr(reference, candidate_frame)
+                ssim = image_ssim(reference, candidate_frame)
+                if rank == 0:
+                    totals["beam_top_decoded"] += 1
+                    totals["beam_top_psnr"].append(psnr)
+                    totals["beam_top_ssim"].append(ssim)
+                    sample_frames["beam_top"] = candidate_frame.cpu()
+                    beam_record.update(
+                        {"top_decoded": True, "top_psnr": psnr, "top_ssim": ssim}
+                    )
+                if beam_best is None or psnr > beam_best["psnr"]:
+                    beam_best = {
+                        "rank": rank,
+                        "psnr": psnr,
+                        "ssim": ssim,
+                        "frame": candidate_frame.cpu(),
+                    }
+            totals["beam_valid_candidates"].append(beam_valid)
+            if beam_best is not None:
+                totals["beam_any_decoded"] += 1
+                totals["beam_best_psnr"].append(beam_best["psnr"])
+                totals["beam_best_ssim"].append(beam_best["ssim"])
+                totals["beam_best_rank"].append(beam_best["rank"])
+                sample_frames["beam_best"] = beam_best["frame"]
+                beam_record.update(
+                    {
+                        "num_valid": beam_valid,
+                        "best_rank": beam_best["rank"],
+                        "best_psnr": beam_best["psnr"],
+                        "best_ssim": beam_best["ssim"],
+                    }
+                )
+            else:
+                beam_record["num_valid"] = beam_valid
+
         if sample_index < args.num_visualizations:
             sample_frames["deleted_strict_status"] = deleted_strict_status
             sample_frames["deleted_default_status"] = deleted_default_status
@@ -415,6 +574,7 @@ def evaluate_checkpoint(
             "target_length": sample.target_length,
             "greedy": greedy_record,
             "best_of_n": best_record,
+            "beam": beam_record,
         })
 
     attempted = int(totals["attempted"])
@@ -432,6 +592,16 @@ def evaluate_checkpoint(
         "valid_candidates_median": _median(totals["valid_candidates"]),
         "best_rank_mean": _mean(totals["best_rank"]),
         "unique_candidates_mean": _mean(totals["unique_candidates"]),
+        "beam_width": args.beam_width,
+        "beam_top_decode_rate": _rate(totals["beam_top_decoded"], attempted),
+        "beam_top_psnr_mean": _mean(totals["beam_top_psnr"]),
+        "beam_top_ssim_mean": _mean(totals["beam_top_ssim"]),
+        "beam_best_decode_rate_any": _rate(totals["beam_any_decoded"], attempted),
+        "beam_best_psnr_mean": _mean(totals["beam_best_psnr"]),
+        "beam_best_ssim_mean": _mean(totals["beam_best_ssim"]),
+        "beam_valid_candidates_mean": _mean(totals["beam_valid_candidates"]),
+        "beam_valid_candidates_median": _median(totals["beam_valid_candidates"]),
+        "beam_best_rank_mean": _mean(totals["beam_best_rank"]),
         "deleted_strict_decode_rate": _rate(totals["deleted_strict_decoded"], attempted),
         "deleted_strict_psnr_mean": _mean(totals["deleted_strict_psnr"]),
         "deleted_strict_ssim_mean": _mean(totals["deleted_strict_ssim"]),
@@ -443,6 +613,12 @@ def evaluate_checkpoint(
         ),
         "best_vs_deleted_default_psnr_delta": _delta_mean(
             totals["best_psnr"], totals["deleted_default_psnr"]
+        ),
+        "beam_top_vs_deleted_default_psnr_delta": _delta_mean(
+            totals["beam_top_psnr"], totals["deleted_default_psnr"]
+        ),
+        "beam_best_vs_deleted_default_psnr_delta": _delta_mean(
+            totals["beam_best_psnr"], totals["deleted_default_psnr"]
         ),
     }
     return summary, details, frames
@@ -488,6 +664,8 @@ def save_panels(
             sample_frames.get("deleted_default", missing),
             sample_frames.get("greedy", missing),
             sample_frames.get("best_of_n", missing),
+            sample_frames.get("beam_top", missing),
+            sample_frames.get("beam_best", missing),
         ]
         separator = torch.ones((reference.shape[0], 4, reference.shape[2]), dtype=reference.dtype)
         panel_parts: list[Tensor] = []
@@ -505,6 +683,8 @@ def save_panels(
                 "deleted_gap_ffmpeg_default",
                 "model_greedy_strict",
                 "model_best_of_n_strict",
+                "model_beam_top_strict",
+                "model_beam_best_strict",
             ],
             "red_tile": "decode failed or no frame",
             "checkpoint": checkpoint_name,
@@ -560,6 +740,8 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     if args.temperature <= 0 and "best_of_n" in args.strategies:
         raise ValueError("--temperature must be positive for best_of_n sampling")
+    if args.beam_width <= 0:
+        raise ValueError("--beam-width must be positive")
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "config.json").write_text(

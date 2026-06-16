@@ -31,6 +31,7 @@ CHECKPOINT_STEPS=${CHECKPOINT_STEPS:-"500 1000 1500 2000 2500 3000 3500 4000 450
 NUM_SAMPLES=${NUM_SAMPLES:-20}
 NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-4}
 BEST_OF_N=${BEST_OF_N:-64}
+BEAM_WIDTHS=${BEAM_WIDTHS:-"2 4 8"}
 FIM_MIN_GAP=${FIM_MIN_GAP:-1024}
 FIM_MAX_GAP=${FIM_MAX_GAP:-8192}
 VAL_FRACTION=${VAL_FRACTION:-0.05}
@@ -68,29 +69,33 @@ echo "Repository: ${REPO_ROOT}"
 echo "Run dir: ${RUN_DIR}"
 echo "Output root: ${OUT_ROOT}"
 echo "Checkpoints: ${checkpoint_dirs[*]}"
-echo "NUM_SAMPLES=${NUM_SAMPLES} BEST_OF_N=${BEST_OF_N}"
+echo "NUM_SAMPLES=${NUM_SAMPLES} BEST_OF_N=${BEST_OF_N} BEAM_WIDTHS=${BEAM_WIDTHS}"
 
 run_setting() {
     local name=$1
     local temperature=$2
     local top_k=$3
     local top_p=$4
+    local strategies=$5
+    local beam_width=$6
     local out_dir="${OUT_ROOT}/${name}"
     if [[ "${RESUME_SKIP}" == "1" && -s "${out_dir}/summary.csv" ]]; then
         echo "[skip] ${name}: ${out_dir}/summary.csv exists"
-        append_summary "${name}" "${temperature}" "${top_k}" "${top_p}" "${out_dir}/summary.csv"
+        append_summary "${name}" "${temperature}" "${top_k}" "${top_p}" "${beam_width}" "${out_dir}/summary.csv"
         return 0
     fi
-    echo "[run] ${name}: temperature=${temperature} top_k=${top_k} top_p=${top_p}"
+    echo "[run] ${name}: strategies=${strategies} temperature=${temperature} top_k=${top_k} top_p=${top_p} beam_width=${beam_width}"
     cmd=(
         python scripts/byte/eval/eval_checkpoints.py
         "${MANIFEST}"
         --nal-index-path "${NAL_INDEX}"
         --checkpoint-dirs "${checkpoint_dirs[@]}"
         --out-dir "${out_dir}"
+        --strategies ${strategies}
         --num-samples "${NUM_SAMPLES}"
         --num-visualizations "${NUM_VISUALIZATIONS}"
         --best-of-n "${BEST_OF_N}"
+        --beam-width "${beam_width}"
         --temperature "${temperature}"
         --top-k "${top_k}"
         --top-p "${top_p}"
@@ -103,7 +108,7 @@ run_setting() {
         cmd+=(--split-by-video)
     fi
     srun "${cmd[@]}"
-    append_summary "${name}" "${temperature}" "${top_k}" "${top_p}" "${out_dir}/summary.csv"
+    append_summary "${name}" "${temperature}" "${top_k}" "${top_p}" "${beam_width}" "${out_dir}/summary.csv"
 }
 
 append_summary() {
@@ -111,31 +116,36 @@ append_summary() {
     local temperature=$2
     local top_k=$3
     local top_p=$4
-    local summary_csv=$5
+    local beam_width=$5
+    local summary_csv=$6
     if [[ ! -s "${summary_csv}" ]]; then
         echo "Missing summary for ${setting_name}: ${summary_csv}" >&2
         return 1
     fi
     if [[ ${SUMMARY_HEADER_WRITTEN} -eq 0 ]]; then
-        head -n 1 "${summary_csv}" | awk 'BEGIN{FS=OFS=","} {print "setting","temperature","top_k","top_p",$0}' > "${COMBINED_SUMMARY}"
+        head -n 1 "${summary_csv}" | awk 'BEGIN{FS=OFS=","} {print "setting","temperature","top_k","top_p","beam_width",$0}' > "${COMBINED_SUMMARY}"
         SUMMARY_HEADER_WRITTEN=1
     fi
-    tail -n +2 "${summary_csv}" | awk -v setting="${setting_name}" -v temp="${temperature}" -v topk="${top_k}" -v topp="${top_p}" 'BEGIN{FS=OFS=","} {print setting,temp,topk,topp,$0}' >> "${COMBINED_SUMMARY}"
+    tail -n +2 "${summary_csv}" | awk -v setting="${setting_name}" -v temp="${temperature}" -v topk="${top_k}" -v topp="${top_p}" -v beam="${beam_width}" 'BEGIN{FS=OFS=","} {print setting,temp,topk,topp,beam,$0}' >> "${COMBINED_SUMMARY}"
 }
 
 # One-dimensional diagnostics. These are not a full cross product.
 for temperature in 0.1 0.3 0.5 0.7 1.0; do
     setting_name="temperature_${temperature//./p}"
-    run_setting "${setting_name}" "${temperature}" 0 1.0
+    run_setting "${setting_name}" "${temperature}" 0 1.0 "greedy best_of_n" 1
 done
 
 for top_k in 1 2 5 10; do
-    run_setting "topk_${top_k}" 1.0 "${top_k}" 1.0
+    run_setting "topk_${top_k}" 1.0 "${top_k}" 1.0 "greedy best_of_n" 1
 done
 
 for top_p in 0.7 0.8 0.9 0.95; do
     setting_name="topp_${top_p//./p}"
-    run_setting "${setting_name}" 1.0 0 "${top_p}"
+    run_setting "${setting_name}" 1.0 0 "${top_p}" "greedy best_of_n" 1
+done
+
+for beam_width in ${BEAM_WIDTHS}; do
+    run_setting "beam_${beam_width}" 0 0 1.0 "greedy beam" "${beam_width}"
 done
 
 echo "Sampling sweep complete: ${OUT_ROOT}"
