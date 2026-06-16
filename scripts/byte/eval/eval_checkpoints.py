@@ -542,6 +542,18 @@ def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
         writer.writerows(summaries)
 
 
+def jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list):
+        return [jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: jsonable(item) for key, item in value.items()}
+    return value
+
+
 def main() -> None:
     args = parse_args()
     require_png_writer()
@@ -551,7 +563,7 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "config.json").write_text(
-        json.dumps({key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}, indent=2) + "\n",
+        json.dumps(jsonable(vars(args)), indent=2) + "\n",
         encoding="utf-8",
     )
 
