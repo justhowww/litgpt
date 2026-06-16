@@ -101,7 +101,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-bscv-reference", dest="bscv_reference", action="store_false")
     parser.add_argument("--corr-prob", type=int, default=1, help="Number of VCL frames corrupted per GOP, matching BSCV corr_prob semantics.")
     parser.add_argument("--corr-pos", type=float, default=0.4, help="Relative deletion position inside each selected VCL NAL payload.")
-    parser.add_argument("--corr-len-bytes", type=int, default=2048, help="Deleted payload bytes per selected frame. BSCV's corr_len is hex chars, so divide their value by two.")
+    parser.add_argument("--corr-len-bytes", type=int, default=2048, help="Max deleted payload bytes per selected frame, clamped to the frame's available payload. BSCV's corr_len is hex chars, so divide their value by two.")
+    parser.add_argument("--min-corr-bytes", type=int, default=256, help="Minimum payload a frame must have to be eligible for corruption. Keeps the per-GOP pool ~uniform over frames (small P-frames stay eligible) so the IDR is not over-selected; the excision is clamped to the available payload.")
     parser.add_argument("--slice-header-guard-bytes", type=int, default=0, help="Optional extra guard after the NAL header before deletion. Use 0 for closest BSCV-style corruption.")
     parser.add_argument("--max-spans-per-clip", type=int, default=0, help="Optional cap on corrupted spans per clip after BSCV-style GOP sampling. 0 keeps all selected spans.")
     parser.add_argument("--gop-position-mode", choices=("random", "early", "late"), default="random", help="Which frames in each GOP to corrupt: random (uniform over eligible), early (earliest eligible — worst-case forward propagation), or late (latest eligible — minimal propagation before the next IDR).")
@@ -239,12 +240,17 @@ def select_bscv_spans(
 
     spans: list[CorruptionSpan] = []
     for gop in gops:
+        # Gate by min_corr_bytes, NOT corr_len_bytes. Gating at the full corr_len
+        # excludes most (small) P-frames while the always-large IDR stays eligible,
+        # which inflates IDR selection to >50%. A small floor keeps the per-GOP pool
+        # ~uniform over frames, so the IDR is hit at its true ~1/|GOP| rate (matching
+        # BSCV); the excision is clamped to the available payload below.
         eligible = [
             nal_idx
             for nal_idx in gop
             if nals[nal_idx].nal_type in target_nal_types
             and frame_index_by_nal[nal_idx] < args.max_frames
-            and eligible_payload_space(nals[nal_idx], args) >= args.corr_len_bytes
+            and eligible_payload_space(nals[nal_idx], args) >= args.min_corr_bytes
         ]
         if not eligible:
             continue
@@ -258,11 +264,14 @@ def select_bscv_spans(
         for nal_idx in selected:
             nal = nals[nal_idx]
             payload_start = nal.payload_start + args.slice_header_guard_bytes
-            max_start = nal.end - args.corr_len_bytes
-            if max_start < payload_start:
+            # Clamp the excision to the available payload so small frames are still
+            # corrupted (just by less) instead of being excluded.
+            length = min(args.corr_len_bytes, nal.end - payload_start)
+            if length < args.min_corr_bytes:
                 continue
+            max_start = nal.end - length
             start = payload_start + int((max_start - payload_start) * args.corr_pos)
-            end = start + args.corr_len_bytes
+            end = start + length
             frame_index = frame_index_by_nal[nal_idx]
             spans.append(
                 CorruptionSpan(
@@ -271,7 +280,7 @@ def select_bscv_spans(
                     start=start,
                     end=end,
                     offset_in_nal=start - nal.start,
-                    length=args.corr_len_bytes,
+                    length=length,
                     gop_distance=distances[frame_index] if frame_index < len(distances) else -1,
                 )
             )
@@ -303,7 +312,12 @@ def bscv_reference_spans(
 
     Placement and length otherwise match select_bscv_spans; ``corr_len_bytes`` is
     BSCV's hex ``corr_len`` halved (their offsets are hex chars, two per byte).
+
+    The sample pool is restricted to ``target_nal_types`` so the column stays scoped
+    to the same frames the eval corrupts: pass ``1`` for a P-only run (matching a
+    P-only-trained checkpoint), ``1 5`` for the keyframe-inclusive BSCV-faithful run.
     """
+    target_nal_types = set(args.target_nal_types)
     vcl_indices = [idx for idx, nal in enumerate(nals) if nal.nal_type in VCL_NAL_TYPES]
     if not vcl_indices:
         return []
@@ -321,7 +335,11 @@ def bscv_reference_spans(
     corr_len = args.corr_len_bytes
     spans: list[CorruptionSpan] = []
     for gop in gops:
-        pool = [nal_idx for nal_idx in gop if frame_index_by_nal[nal_idx] < args.max_frames]
+        pool = [
+            nal_idx
+            for nal_idx in gop
+            if nals[nal_idx].nal_type in target_nal_types and frame_index_by_nal[nal_idx] < args.max_frames
+        ]
         if not pool:
             continue
         k = min(args.corr_prob, len(pool))

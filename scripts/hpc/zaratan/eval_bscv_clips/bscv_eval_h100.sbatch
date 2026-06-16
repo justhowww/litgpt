@@ -40,11 +40,12 @@ MAX_SPANS_PER_CLIP=${MAX_SPANS_PER_CLIP:-0}
 MAX_FRAMES=${MAX_FRAMES:-96}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 NUM_REF_SLICES=${NUM_REF_SLICES:-1}
-# BSCV samples corruption from the whole GOP including the IDR (nal type 5), so
-# the ~6-12% keyframe-hit catastrophic tail is part of its degraded set. Include
-# 5 to reproduce that tail; 1 covers both 0x41 and 0x01 non-IDR slices.
+# P-only by default: the checkpoint is FIM-trained on P-slices (nal type 1) only, so
+# corrupting the IDR is out-of-distribution and unfair to the model. "1" covers both
+# 0x41 and 0x01 non-IDR slices. Set "1 5" for the keyframe-inclusive BSCV-faithful
+# variant (reproduces BSCV's ~6-12% catastrophic IDR-hit tail).
 # corr_len 2048 BYTES = BSCV's 4096 hex chars = their `_144096` config.
-TARGET_NAL_TYPES=${TARGET_NAL_TYPES:-"1 5"}
+TARGET_NAL_TYPES=${TARGET_NAL_TYPES:-"1"}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-0}
 TIMEOUT_SEC=${TIMEOUT_SEC:-60}
 
