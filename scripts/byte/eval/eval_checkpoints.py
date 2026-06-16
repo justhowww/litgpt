@@ -90,6 +90,7 @@ def require_png_writer() -> None:
 
 
 def load_model(checkpoint_dir: Path, device: torch.device) -> GPT:
+    print(f"Loading checkpoint: {checkpoint_dir}", flush=True)
     config = Config.from_file(checkpoint_dir / "model_config.yaml")
     model = GPT(config)
     checkpoint = torch.load(
@@ -101,7 +102,9 @@ def load_model(checkpoint_dir: Path, device: torch.device) -> GPT:
     state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
     state_dict = {_strip_compile_prefix(key): value for key, value in state_dict.items()}
     model.load_state_dict(state_dict)
-    return model.to(device).eval()
+    model = model.to(device).eval()
+    print(f"Loaded checkpoint: {checkpoint_dir.name}", flush=True)
+    return model
 
 
 def _strip_compile_prefix(key: str) -> str:
@@ -112,6 +115,7 @@ def _strip_compile_prefix(key: str) -> str:
 
 
 def build_eval_samples(args: argparse.Namespace) -> list[ReconstructionSample]:
+    print("Building byte validation dataset...", flush=True)
     data_config = ByteDataConfig(
         p_fim=args.p_fim,
         fim_format=args.fim_format,
@@ -136,9 +140,11 @@ def build_eval_samples(args: argparse.Namespace) -> list[ReconstructionSample]:
         nal_index_path=args.nal_index_path,
     )
     data.connect(tokenizer=None, batch_size=1, max_seq_length=args.block_size)
+    print("Setting up ByteDataModule...", flush=True)
     data.setup()
     if data.val_dataset is None:
         raise RuntimeError("ByteDataModule did not produce a validation dataset")
+    print("Selecting fixed reconstruction samples...", flush=True)
     samples = select_reconstruction_samples(
         data.val_dataset,
         args.num_samples,
@@ -148,6 +154,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[ReconstructionSample]:
     )
     if not samples:
         raise RuntimeError("No reconstruction samples matched the requested filters")
+    print(f"Selected {len(samples)} reconstruction samples", flush=True)
     return samples
 
 
@@ -276,6 +283,11 @@ def evaluate_checkpoint(
     frames: dict[int, dict[str, Tensor | str]] = {}
 
     for sample_index, sample in enumerate(samples):
+        if sample_index == 0 or (sample_index + 1) % 10 == 0:
+            print(
+                f"  {checkpoint_name}: sample {sample_index + 1}/{len(samples)}",
+                flush=True,
+            )
         stream = sample.h264_path.read_bytes()
         reference, reference_status = decode_frame(
             stream, sample.frame_index, args.ffmpeg_binary, args.timeout_sec, strict_syntax=True
@@ -310,6 +322,8 @@ def evaluate_checkpoint(
 
         greedy_record: dict[str, Any] = {"decoded": False}
         if "greedy" in args.strategies:
+            if sample_index == 0:
+                print(f"  {checkpoint_name}: running greedy decoding", flush=True)
             greedy_candidates = generate_bytes(model, sample, device, strategy="greedy")
             if greedy_candidates:
                 greedy_stream = replace_target_nal(stream, sample, greedy_candidates[0])
@@ -332,6 +346,11 @@ def evaluate_checkpoint(
 
         best_record: dict[str, Any] = {"decoded": False, "num_valid": 0}
         if "best_of_n" in args.strategies:
+            if sample_index == 0:
+                print(
+                    f"  {checkpoint_name}: running best@{args.best_of_n} sampling",
+                    flush=True,
+                )
             sampled = generate_bytes(
                 model,
                 sample,
@@ -456,6 +475,8 @@ def _delta_mean(left: Any, right: Any) -> float | None:
 def save_panels(
     frames: dict[int, dict[str, Tensor | str]], checkpoint_dir: Path, checkpoint_name: str
 ) -> None:
+    if frames:
+        print(f"Saving {len(frames)} visual panels for {checkpoint_name}", flush=True)
     for sample_index, sample_frames in frames.items():
         reference = sample_frames["ground_truth"]
         assert isinstance(reference, Tensor)
@@ -536,6 +557,7 @@ def main() -> None:
 
     samples = build_eval_samples(args)
     save_reconstruction_sample_manifest(samples, args.out_dir / "samples.json")
+    print(f"Saved fixed sample manifest to {args.out_dir / 'samples.json'}", flush=True)
     summaries: list[dict[str, Any]] = []
     metrics_path = args.out_dir / "metrics.jsonl"
     details_path = args.out_dir / "sample_details.jsonl"
