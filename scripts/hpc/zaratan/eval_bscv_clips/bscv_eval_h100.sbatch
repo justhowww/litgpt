@@ -29,9 +29,9 @@ OUT_ROOT=${OUT_ROOT:-"${RUN_DIR}/offline_bscv_eval"}
 CHECKPOINT_STEPS=${CHECKPOINT_STEPS:-"5000 5500 6000 6500"}
 NUM_CLIPS=${NUM_CLIPS:-20}
 NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
-# Sweep the per-GOP hit count to see how the concealment floor collapses with
-# corruption density. 1 = single hit (mild), 4/8 = multi-hit accumulation.
-CORR_PROB_SWEEP=${CORR_PROB_SWEEP:-"1 4 8"}
+# BSCV only ever evaluates corr_prob 1 (and one config at 2), so we reproduce the
+# faithful single-hit point rather than the synthetic 4/8 density stress test.
+CORR_PROB_SWEEP=${CORR_PROB_SWEEP:-"1"}
 # random | early (worst-case forward propagation) | late (minimal propagation).
 GOP_POSITION_MODE=${GOP_POSITION_MODE:-random}
 CORR_POS=${CORR_POS:-0.4}
@@ -40,7 +40,11 @@ MAX_SPANS_PER_CLIP=${MAX_SPANS_PER_CLIP:-0}
 MAX_FRAMES=${MAX_FRAMES:-96}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 NUM_REF_SLICES=${NUM_REF_SLICES:-1}
-TARGET_NAL_TYPES=${TARGET_NAL_TYPES:-"1"}
+# BSCV samples corruption from the whole GOP including the IDR (nal type 5), so
+# the ~6-12% keyframe-hit catastrophic tail is part of its degraded set. Include
+# 5 to reproduce that tail; 1 covers both 0x41 and 0x01 non-IDR slices.
+# corr_len 2048 BYTES = BSCV's 4096 hex chars = their `_144096` config.
+TARGET_NAL_TYPES=${TARGET_NAL_TYPES:-"1 5"}
 SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-0}
 TIMEOUT_SEC=${TIMEOUT_SEC:-60}
 

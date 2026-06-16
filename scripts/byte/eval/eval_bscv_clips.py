@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-manifest-rows", type=int, default=0)
     parser.add_argument("--num-clips", type=int, default=20)
     parser.add_argument("--num-visualizations", type=int, default=8)
+    parser.add_argument("--viz-fps", type=int, default=6, help="Frame rate for the per-GOP comparison videos.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--block-size", type=int, default=16384)
     parser.add_argument("--num-ref-slices", type=int, default=1)
@@ -154,6 +155,7 @@ def main() -> None:
         frame_dir = args.out_dir / "frames" / checkpoint_name
         frame_dir.mkdir(parents=True, exist_ok=True)
         save_panels(frames, frame_dir, checkpoint_name)
+        save_videos(frames, frame_dir, checkpoint_name, args)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -278,10 +280,10 @@ def evaluate_checkpoint(
     args: argparse.Namespace,
     device: torch.device,
     checkpoint_name: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, dict[str, Tensor | str]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, dict[str, Any]]]:
     accum = {name: empty_accumulator() for name in ("deleted_default", "deleted_strict", "model_default", "model_strict")}
     details: list[dict[str, Any]] = []
-    frames: dict[int, dict[str, Tensor | str]] = {}
+    frames: dict[int, dict[str, Any]] = {}
 
     for clip_idx, clip in enumerate(clips):
         print(f"  {checkpoint_name}: clip {clip_idx + 1}/{len(clips)}", flush=True)
@@ -322,7 +324,7 @@ def evaluate_checkpoint(
             }
         )
         if clip_idx < args.num_visualizations:
-            frames[clip_idx] = build_visual_frames(clean_frames, decoded, clip.spans)
+            frames[clip_idx] = build_visual_sequence(clean_frames, decoded, clip.spans, clip.frame_gop_distances)
             frames[clip_idx]["h264_path"] = str(clip.h264_path)
 
     attempted = len(clips)
@@ -338,6 +340,12 @@ def evaluate_checkpoint(
 
 
 GOP_BUCKETS = ("idr", "near", "mid", "far", "unknown")
+
+# image_psnr returns +inf for a byte-identical frame (MSE == 0), which is common
+# for uncorrupted IDR frames. A single inf poisons every mean it lands in (sum/len
+# -> inf). Clamp to a finite sentinel so perfect frames count as "very high PSNR"
+# the same way SSIM counts them as 1.0, instead of nuking the aggregate.
+PSNR_PERFECT_CAP = 100.0
 
 
 def gop_distance_bucket(distance: int) -> str:
@@ -401,6 +409,8 @@ def update_accumulator(
             continue
         matched += 1
         psnr = image_psnr(reference, candidate)
+        if psnr == float("inf"):
+            psnr = PSNR_PERFECT_CAP
         ssim = image_ssim(reference, candidate)
         accum["psnr"].append(psnr)
         accum["ssim"].append(ssim)
@@ -684,45 +694,144 @@ def parse_one_ppm(data: bytes, start: int) -> tuple[Tensor, int]:
     return frame, cursor + payload_len
 
 
-def build_visual_frames(
-    clean_frames: list[Tensor], decoded: dict[str, list[Tensor]], spans: list[CorruptionSpan]
-) -> dict[str, Tensor | str]:
-    frame_idx = min(spans[0].frame_index if spans else 0, len(clean_frames) - 1)
-    output: dict[str, Tensor | str] = {"ground_truth": clean_frames[frame_idx].cpu(), "frame_index": str(frame_idx)}
-    for method, frames in decoded.items():
-        if frame_idx < len(frames) and frames[frame_idx].shape == clean_frames[frame_idx].shape:
-            output[method] = frames[frame_idx].cpu()
-    return output
+VIZ_COLUMNS = ("ground_truth", "deleted_strict", "deleted_default", "model_strict", "model_default")
+VIZ_COLUMN_LABELS = ("GT", "deleted strict", "deleted FFmpeg default", "model strict", "model FFmpeg default")
 
 
-def save_panels(frames: dict[int, dict[str, Tensor | str]], frame_dir: Path, checkpoint_name: str) -> None:
-    if frames:
-        print(f"Saving {len(frames)} BSCV visual panels for {checkpoint_name}", flush=True)
-    columns = ["ground_truth", "deleted_strict", "deleted_default", "model_strict", "model_default"]
-    for clip_idx, sample_frames in frames.items():
-        reference = sample_frames["ground_truth"]
-        assert isinstance(reference, Tensor)
-        missing = torch.zeros_like(reference)
-        missing[..., 0] = 1.0
-        separator = torch.ones((reference.shape[0], 4, reference.shape[2]), dtype=reference.dtype)
-        parts: list[Tensor] = []
-        for col_idx, column in enumerate(columns):
-            if col_idx:
-                parts.append(separator)
-            frame = sample_frames.get(column, missing)
-            assert isinstance(frame, Tensor)
-            parts.append(frame)
-        panel = torch.cat(parts, dim=1).clamp(0, 1)
+def gop_window(distances: list[int], frame_index: int, n_frames: int) -> tuple[int, int]:
+    """[start, end) of the GOP containing ``frame_index`` — from its IDR (distance 0)
+    to the frame just before the next IDR — clamped to the decoded frame count."""
+    if not distances or n_frames <= 0:
+        return 0, n_frames
+    fi = min(frame_index, len(distances) - 1, n_frames - 1)
+    start = fi
+    while start > 0 and distances[start] != 0:
+        start -= 1
+    end = fi + 1
+    while end < len(distances) and distances[end] != 0:
+        end += 1
+    return start, min(end, n_frames)
+
+
+def build_visual_sequence(
+    clean_frames: list[Tensor],
+    decoded: dict[str, list[Tensor]],
+    spans: list[CorruptionSpan],
+    distances: list[int],
+) -> dict[str, Any]:
+    """Collect every frame of the GOP containing the first corruption, per method,
+    so the cascade can be played as a side-by-side video. Missing/shape-mismatched
+    frames (e.g. truncated strict decodes) become ``None`` -> red tile."""
+    n = len(clean_frames)
+    frame_idx = min(spans[0].frame_index if spans else 0, max(n - 1, 0))
+    start, end = gop_window(distances, frame_idx, n)
+    indices = list(range(start, end))
+    seq: dict[str, Any] = {
+        "frame_indices": indices,
+        "corrupted_frames": sorted({s.frame_index for s in spans if start <= s.frame_index < end}),
+        "gop_distances": [distances[i] if i < len(distances) else -1 for i in indices],
+        "ground_truth": [clean_frames[i].cpu() for i in indices],
+    }
+    for method, mframes in decoded.items():
+        seq[method] = [
+            mframes[i].cpu() if i < len(mframes) and mframes[i].shape == clean_frames[i].shape else None
+            for i in indices
+        ]
+    return seq
+
+
+def composite_panel(seq: dict[str, Any], t: int) -> Tensor:
+    """One side-by-side frame: GT | deleted strict | deleted default | model strict | model default."""
+    reference = seq["ground_truth"][t]
+    missing = torch.zeros_like(reference)
+    missing[..., 0] = 1.0
+    separator = torch.ones((reference.shape[0], 4, reference.shape[2]), dtype=reference.dtype)
+    parts: list[Tensor] = []
+    for col_idx, column in enumerate(VIZ_COLUMNS):
+        if col_idx:
+            parts.append(separator)
+        frame = seq["ground_truth"][t] if column == "ground_truth" else seq[column][t]
+        parts.append(frame if isinstance(frame, Tensor) else missing)
+    return torch.cat(parts, dim=1).clamp(0, 1)
+
+
+def save_panels(sequences: dict[int, dict[str, Any]], frame_dir: Path, checkpoint_name: str) -> None:
+    if sequences:
+        print(f"Saving {len(sequences)} BSCV visual panels for {checkpoint_name}", flush=True)
+    for clip_idx, seq in sequences.items():
+        indices = seq["frame_indices"]
+        if not indices:
+            continue
+        corrupted = seq.get("corrupted_frames") or []
+        t = indices.index(corrupted[0]) if corrupted and corrupted[0] in indices else 0
+        panel = composite_panel(seq, t)
         save_png(panel, frame_dir / f"clip_{clip_idx:04d}_panel.png")
         (frame_dir / f"clip_{clip_idx:04d}_panel.json").write_text(
             json.dumps(
                 {
                     "checkpoint": checkpoint_name,
                     "clip_index": clip_idx,
-                    "frame_index": sample_frames.get("frame_index"),
-                    "columns": ["GT", "deleted strict", "deleted FFmpeg default", "model strict", "model FFmpeg default"],
+                    "frame_index": indices[t],
+                    "columns": list(VIZ_COLUMN_LABELS),
                     "red_tile": "decode failed or missing frame",
-                    "h264_path": sample_frames.get("h264_path"),
+                    "h264_path": seq.get("h264_path"),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+
+def save_videos(
+    sequences: dict[int, dict[str, Any]], frame_dir: Path, checkpoint_name: str, args: argparse.Namespace
+) -> None:
+    """Encode the whole-GOP side-by-side comparison as an mp4 per clip, so error
+    propagation across the GOP is visible rather than a single corrupted frame."""
+    if not sequences:
+        return
+    print(f"Saving {len(sequences)} BSCV GOP videos for {checkpoint_name}", flush=True)
+    for clip_idx, seq in sequences.items():
+        indices = seq["frame_indices"]
+        if not indices:
+            continue
+        panels = [composite_panel(seq, t) for t in range(len(indices))]
+        # rawvideo -> mpeg4 needs even dimensions; pad the bottom/right edge if odd.
+        h, w = panels[0].shape[0], panels[0].shape[1]
+        pad_h, pad_w = h % 2, w % 2
+        if pad_h or pad_w:
+            panels = [
+                torch.nn.functional.pad(p.permute(2, 0, 1), (0, pad_w, 0, pad_h)).permute(1, 2, 0).contiguous()
+                for p in panels
+            ]
+        height, width = panels[0].shape[0], panels[0].shape[1]
+        buffer = b"".join(
+            p.mul(255).round().clamp(0, 255).to(torch.uint8).contiguous().numpy().tobytes() for p in panels
+        )
+        out_path = frame_dir / f"clip_{clip_idx:04d}_gop.mp4"
+        command = [
+            args.ffmpeg_binary, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(args.viz_fps),
+            "-i", "pipe:0", "-an", "-c:v", "mpeg4", "-q:v", "3", "-pix_fmt", "yuv420p", str(out_path),
+        ]
+        try:
+            subprocess.run(command, input=buffer, capture_output=True, check=True, timeout=args.timeout_sec)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            detail = exc.stderr.decode("utf-8", "ignore") if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else exc
+            print(f"  GOP video encode failed for clip {clip_idx}: {detail}", flush=True)
+            continue
+        (frame_dir / f"clip_{clip_idx:04d}_gop.json").write_text(
+            json.dumps(
+                {
+                    "checkpoint": checkpoint_name,
+                    "clip_index": clip_idx,
+                    "frame_indices": indices,
+                    "corrupted_frames": seq.get("corrupted_frames"),
+                    "gop_distances": seq.get("gop_distances"),
+                    "fps": args.viz_fps,
+                    "columns": list(VIZ_COLUMN_LABELS),
+                    "red_tile": "decode failed or missing frame",
+                    "h264_path": seq.get("h264_path"),
                 },
                 indent=2,
             )
