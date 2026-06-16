@@ -14,7 +14,7 @@ import json
 import random
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +73,10 @@ class ClipExample:
     nals: list[NALUnit]
     spans: list[CorruptionSpan]
     frame_gop_distances: list[int]
+    # BSCV corrupt_Gen.py-faithful spans (IDR-eligible pool + small-frame fallback),
+    # used for the side-by-side "BSCV FFmpeg default" reference column. Empty unless
+    # --bscv-reference is set.
+    bscv_spans: list[CorruptionSpan] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-nal-types", type=int, nargs="+", default=[1], help="NAL types eligible for corruption. Default 1 matches current P-slice-only FIM training; add 5 only after training includes IDR/I-slice FIM.")
     parser.add_argument("--condition-on-sps-pps", action="store_true", default=True)
     parser.add_argument("--no-sps-pps-conditioning", dest="condition_on_sps_pps", action="store_false")
+    parser.add_argument("--bscv-reference", action="store_true", default=True, help="Add a faithful BSCV corrupt_Gen.py corruption (IDR-eligible + small-frame fallback) decoded ffmpeg-default, as the 'BSCV FFmpeg default' column next to our 'deleted FFmpeg default'.")
+    parser.add_argument("--no-bscv-reference", dest="bscv_reference", action="store_false")
     parser.add_argument("--corr-prob", type=int, default=1, help="Number of VCL frames corrupted per GOP, matching BSCV corr_prob semantics.")
     parser.add_argument("--corr-pos", type=float, default=0.4, help="Relative deletion position inside each selected VCL NAL payload.")
     parser.add_argument("--corr-len-bytes", type=int, default=2048, help="Deleted payload bytes per selected frame. BSCV's corr_len is hex chars, so divide their value by two.")
@@ -171,6 +177,9 @@ def select_clip_examples(
     args: argparse.Namespace,
 ) -> list[ClipExample]:
     rng = random.Random(args.seed)
+    # Separate stream so enabling --bscv-reference never perturbs the main clip/span
+    # draws — the two corruptions overlay on the exact same selected clips.
+    bscv_rng = random.Random(args.seed + 9973)
     candidate_rows = list(rows)
     rng.shuffle(candidate_rows)
     examples: list[ClipExample] = []
@@ -181,7 +190,8 @@ def select_clip_examples(
         spans = select_bscv_spans(nals, distances, rng, args)
         if not spans:
             continue
-        examples.append(ClipExample(path, nals, spans, distances))
+        bscv_spans = bscv_reference_spans(nals, distances, bscv_rng, args) if args.bscv_reference else []
+        examples.append(ClipExample(path, nals, spans, distances, bscv_spans))
         if len(examples) >= args.num_clips:
             break
     return examples
@@ -274,6 +284,75 @@ def eligible_payload_space(nal: NALUnit, args: argparse.Namespace) -> int:
     return max(0, nal.end - (nal.payload_start + args.slice_header_guard_bytes))
 
 
+def bscv_reference_spans(
+    nals: list[NALUnit],
+    distances: list[int],
+    rng: random.Random,
+    args: argparse.Namespace,
+) -> list[CorruptionSpan]:
+    """Faithful port of BSCV's corrupt_Gen.py span selection
+    (tests/eval/reference/bscv_corrupt_gen.py). It differs from select_bscv_spans in
+    the two ways that actually change the corrupted bytes:
+
+    1. the per-GOP sample pool is *every* VCL frame including the IDR (nal type 5) —
+       BSCV draws from ``I + P + B`` uniformly, so the ~corr_prob/|GOP| keyframe-hit
+       catastrophic tail is included rather than excluded;
+    2. an undersized frame (payload <= corr_len) triggers BSCV's fallback — delete the
+       payload *through the next start code*, wrecking NAL framing for the following
+       frame — instead of being skipped.
+
+    Placement and length otherwise match select_bscv_spans; ``corr_len_bytes`` is
+    BSCV's hex ``corr_len`` halved (their offsets are hex chars, two per byte).
+    """
+    vcl_indices = [idx for idx, nal in enumerate(nals) if nal.nal_type in VCL_NAL_TYPES]
+    if not vcl_indices:
+        return []
+    frame_index_by_nal = {nal_idx: frame_idx for frame_idx, nal_idx in enumerate(vcl_indices)}
+    gops: list[list[int]] = []
+    current: list[int] = []
+    for nal_idx in vcl_indices:
+        if nals[nal_idx].nal_type == 5 and current:
+            gops.append(current)
+            current = []
+        current.append(nal_idx)
+    if current:
+        gops.append(current)
+
+    corr_len = args.corr_len_bytes
+    spans: list[CorruptionSpan] = []
+    for gop in gops:
+        pool = [nal_idx for nal_idx in gop if frame_index_by_nal[nal_idx] < args.max_frames]
+        if not pool:
+            continue
+        k = min(args.corr_prob, len(pool))
+        selected = rng.sample(pool, k=k)  # BSCV: uniform over the whole GOP, IDR included
+        for nal_idx in selected:
+            nal = nals[nal_idx]
+            payload_start = nal.payload_start + args.slice_header_guard_bytes
+            frame_index = frame_index_by_nal[nal_idx]
+            if nal.end - payload_start > corr_len:
+                max_start = nal.end - corr_len
+                start = payload_start + int((max_start - payload_start) * args.corr_pos)
+                end = start + corr_len
+            else:
+                # Fallback: excise through the first byte of the next start code so the
+                # following frame's framing desyncs (delete_spans tolerates end > len).
+                start = payload_start
+                end = nal.end + 1
+            spans.append(
+                CorruptionSpan(
+                    nal_index=nal_idx,
+                    frame_index=frame_index,
+                    start=start,
+                    end=end,
+                    offset_in_nal=start - nal.start,
+                    length=end - start,
+                    gop_distance=distances[frame_index] if frame_index < len(distances) else -1,
+                )
+            )
+    return spans
+
+
 def evaluate_checkpoint(
     model: torch.nn.Module,
     clips: list[ClipExample],
@@ -281,7 +360,10 @@ def evaluate_checkpoint(
     device: torch.device,
     checkpoint_name: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, dict[str, Any]]]:
-    accum = {name: empty_accumulator() for name in ("deleted_default", "deleted_strict", "model_default", "model_strict")}
+    method_names = ["deleted_default", "deleted_strict", "model_default", "model_strict"]
+    if args.bscv_reference:
+        method_names.append("bscv_default")
+    accum = {name: empty_accumulator() for name in method_names}
     details: list[dict[str, Any]] = []
     frames: dict[int, dict[str, Any]] = {}
 
@@ -302,6 +384,8 @@ def evaluate_checkpoint(
             "model_default": (model_stream, False),
             "model_strict": (model_stream, True),
         }
+        if args.bscv_reference:
+            method_streams["bscv_default"] = (delete_spans(stream, clip.bscv_spans), False)
         decoded: dict[str, list[Tensor]] = {}
         statuses: dict[str, str] = {"clean": clean_status}
         for method, (candidate_stream, strict) in method_streams.items():
@@ -694,8 +778,27 @@ def parse_one_ppm(data: bytes, start: int) -> tuple[Tensor, int]:
     return frame, cursor + payload_len
 
 
-VIZ_COLUMNS = ("ground_truth", "deleted_strict", "deleted_default", "model_strict", "model_default")
-VIZ_COLUMN_LABELS = ("GT", "deleted strict", "deleted FFmpeg default", "model strict", "model FFmpeg default")
+VIZ_COLUMN_ORDER = (
+    "ground_truth",
+    "deleted_strict",
+    "deleted_default",
+    "bscv_default",
+    "model_strict",
+    "model_default",
+)
+VIZ_COLUMN_LABELS = {
+    "ground_truth": "GT",
+    "deleted_strict": "our deleted strict",
+    "deleted_default": "our deleted FFmpeg default",
+    "bscv_default": "BSCV FFmpeg default",
+    "model_strict": "model strict",
+    "model_default": "model FFmpeg default",
+}
+
+
+def visible_columns(seq: dict[str, Any]) -> list[str]:
+    """Columns in display order that this sequence actually has frames for."""
+    return [column for column in VIZ_COLUMN_ORDER if column in seq]
 
 
 def gop_window(distances: list[int], frame_index: int, n_frames: int) -> tuple[int, int]:
@@ -747,10 +850,10 @@ def composite_panel(seq: dict[str, Any], t: int) -> Tensor:
     missing[..., 0] = 1.0
     separator = torch.ones((reference.shape[0], 4, reference.shape[2]), dtype=reference.dtype)
     parts: list[Tensor] = []
-    for col_idx, column in enumerate(VIZ_COLUMNS):
+    for col_idx, column in enumerate(visible_columns(seq)):
         if col_idx:
             parts.append(separator)
-        frame = seq["ground_truth"][t] if column == "ground_truth" else seq[column][t]
+        frame = seq[column][t]
         parts.append(frame if isinstance(frame, Tensor) else missing)
     return torch.cat(parts, dim=1).clamp(0, 1)
 
@@ -772,7 +875,7 @@ def save_panels(sequences: dict[int, dict[str, Any]], frame_dir: Path, checkpoin
                     "checkpoint": checkpoint_name,
                     "clip_index": clip_idx,
                     "frame_index": indices[t],
-                    "columns": list(VIZ_COLUMN_LABELS),
+                    "columns": [VIZ_COLUMN_LABELS[c] for c in visible_columns(seq)],
                     "red_tile": "decode failed or missing frame",
                     "h264_path": seq.get("h264_path"),
                 },
@@ -829,7 +932,7 @@ def save_videos(
                     "corrupted_frames": seq.get("corrupted_frames"),
                     "gop_distances": seq.get("gop_distances"),
                     "fps": args.viz_fps,
-                    "columns": list(VIZ_COLUMN_LABELS),
+                    "columns": [VIZ_COLUMN_LABELS[c] for c in visible_columns(seq)],
                     "red_tile": "decode failed or missing frame",
                     "h264_path": seq.get("h264_path"),
                 },
