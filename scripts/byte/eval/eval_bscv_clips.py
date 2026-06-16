@@ -56,6 +56,7 @@ class CorruptionSpan:
     end: int
     offset_in_nal: int
     length: int
+    gop_distance: int
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ class ClipExample:
     h264_path: Path
     nals: list[NALUnit]
     spans: list[CorruptionSpan]
+    frame_gop_distances: list[int]
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corr-len-bytes", type=int, default=2048, help="Deleted payload bytes per selected frame. BSCV's corr_len is hex chars, so divide their value by two.")
     parser.add_argument("--slice-header-guard-bytes", type=int, default=0, help="Optional extra guard after the NAL header before deletion. Use 0 for closest BSCV-style corruption.")
     parser.add_argument("--max-spans-per-clip", type=int, default=0, help="Optional cap on corrupted spans per clip after BSCV-style GOP sampling. 0 keeps all selected spans.")
+    parser.add_argument("--gop-position-mode", choices=("random", "early", "late"), default="random", help="Which frames in each GOP to corrupt: random (uniform over eligible), early (earliest eligible — worst-case forward propagation), or late (latest eligible — minimal propagation before the next IDR).")
     parser.add_argument("--max-frames", type=int, default=96, help="Maximum decoded frames per clip for metric computation and memory control.")
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
     parser.add_argument("--timeout-sec", type=int, default=60)
@@ -164,17 +167,39 @@ def select_clip_examples(
     for row in candidate_rows:
         path = Path(row["h264_path"])
         nals = nal_index[str(path)]
-        spans = select_bscv_spans(nals, rng, args)
+        distances = compute_frame_gop_distances(nals)
+        spans = select_bscv_spans(nals, distances, rng, args)
         if not spans:
             continue
-        examples.append(ClipExample(path, nals, spans))
+        examples.append(ClipExample(path, nals, spans, distances))
         if len(examples) >= args.num_clips:
             break
     return examples
 
 
+def compute_frame_gop_distances(nals: list[NALUnit]) -> list[int]:
+    """Distance in decoded frames from the most recent IDR, one entry per VCL frame.
+
+    Decode order equals display order because B-frames are disabled, so the i-th
+    entry corresponds to the i-th decoded frame. The IDR frame itself is 0; each
+    subsequent inter frame increments until the next IDR resets the reference
+    chain. This is the propagation depth a concealment error inherits.
+    """
+    distances: list[int] = []
+    distance = 0
+    for nal in nals:
+        if nal.nal_type not in VCL_NAL_TYPES:
+            continue
+        distance = 0 if nal.nal_type == 5 else distance + 1
+        distances.append(distance)
+    return distances
+
+
 def select_bscv_spans(
-    nals: list[NALUnit], rng: random.Random, args: argparse.Namespace
+    nals: list[NALUnit],
+    distances: list[int],
+    rng: random.Random,
+    args: argparse.Namespace,
 ) -> list[CorruptionSpan]:
     target_nal_types = set(args.target_nal_types)
     vcl_indices = [idx for idx, nal in enumerate(nals) if nal.nal_type in VCL_NAL_TYPES]
@@ -203,7 +228,13 @@ def select_bscv_spans(
         ]
         if not eligible:
             continue
-        selected = rng.sample(eligible, k=min(args.corr_prob, len(eligible)))
+        k = min(args.corr_prob, len(eligible))
+        if args.gop_position_mode == "early":
+            selected = sorted(eligible, key=lambda nal_idx: frame_index_by_nal[nal_idx])[:k]
+        elif args.gop_position_mode == "late":
+            selected = sorted(eligible, key=lambda nal_idx: frame_index_by_nal[nal_idx], reverse=True)[:k]
+        else:
+            selected = rng.sample(eligible, k=k)
         for nal_idx in selected:
             nal = nals[nal_idx]
             payload_start = nal.payload_start + args.slice_header_guard_bytes
@@ -212,14 +243,16 @@ def select_bscv_spans(
                 continue
             start = payload_start + int((max_start - payload_start) * args.corr_pos)
             end = start + args.corr_len_bytes
+            frame_index = frame_index_by_nal[nal_idx]
             spans.append(
                 CorruptionSpan(
                     nal_index=nal_idx,
-                    frame_index=frame_index_by_nal[nal_idx],
+                    frame_index=frame_index,
                     start=start,
                     end=end,
                     offset_in_nal=start - nal.start,
                     length=args.corr_len_bytes,
+                    gop_distance=distances[frame_index] if frame_index < len(distances) else -1,
                 )
             )
     if args.max_spans_per_clip > 0 and len(spans) > args.max_spans_per_clip:
@@ -265,7 +298,7 @@ def evaluate_checkpoint(
             candidate_frames, status = decode_stream_frames(candidate_stream, args, strict=strict)
             decoded[method] = candidate_frames
             statuses[method] = status
-            update_accumulator(accum[method], clean_frames, candidate_frames, status)
+            update_accumulator(accum[method], clean_frames, candidate_frames, status, clip.frame_gop_distances)
 
         details.append(
             {
@@ -274,6 +307,7 @@ def evaluate_checkpoint(
                 "h264_path": str(clip.h264_path),
                 "num_spans": len(clip.spans),
                 "span_frames": [span.frame_index for span in clip.spans],
+                "span_gop_distances": [span.gop_distance for span in clip.spans],
                 "span_lengths": [span.length for span in clip.spans],
                 "statuses": statuses,
                 "generations": generation_records,
@@ -290,14 +324,50 @@ def evaluate_checkpoint(
     summary["corr_prob"] = args.corr_prob
     summary["corr_len_bytes"] = args.corr_len_bytes
     summary["corr_pos"] = args.corr_pos
+    summary["gop_position_mode"] = args.gop_position_mode
+    summary["target_nal_types"] = ",".join(str(t) for t in args.target_nal_types)
     return summary, details, frames
 
 
+GOP_BUCKETS = ("idr", "near", "mid", "far", "unknown")
+
+
+def gop_distance_bucket(distance: int) -> str:
+    """Bucket a frame by its propagation depth from the last IDR (GOP ~16)."""
+    if distance < 0:
+        return "unknown"
+    if distance == 0:
+        return "idr"
+    if distance <= 3:
+        return "near"
+    if distance <= 9:
+        return "mid"
+    return "far"
+
+
 def empty_accumulator() -> dict[str, Any]:
-    return {"decoded": 0, "timeouts": 0, "no_frame": 0, "decoder_error": 0, "other_failures": 0, "frame_count_match": 0, "frame_coverage": [], "psnr": [], "ssim": []}
+    return {
+        "decoded": 0,
+        "timeouts": 0,
+        "no_frame": 0,
+        "decoder_error": 0,
+        "other_failures": 0,
+        "frame_count_match": 0,
+        "frame_coverage": [],
+        "psnr": [],
+        "ssim": [],
+        "bucket_psnr": {bucket: [] for bucket in GOP_BUCKETS},
+        "bucket_ssim": {bucket: [] for bucket in GOP_BUCKETS},
+    }
 
 
-def update_accumulator(accum: dict[str, Any], clean_frames: list[Tensor], candidate_frames: list[Tensor], status: str) -> None:
+def update_accumulator(
+    accum: dict[str, Any],
+    clean_frames: list[Tensor],
+    candidate_frames: list[Tensor],
+    status: str,
+    frame_gop_distances: list[int],
+) -> None:
     if status == "timeout":
         accum["timeouts"] += 1
         return
@@ -308,19 +378,33 @@ def update_accumulator(accum: dict[str, Any], clean_frames: list[Tensor], candid
             accum["other_failures"] += 1
         return
 
-    if candidate_frames:
-        accum["decoded"] += 1
+    accum["decoded"] += 1
     if len(candidate_frames) == len(clean_frames):
         accum["frame_count_match"] += 1
-    pairs = align_frames(clean_frames, candidate_frames)
-    accum["frame_coverage"].append(len(pairs) / max(len(clean_frames), 1))
-    for reference, candidate in pairs:
-        accum["psnr"].append(image_psnr(reference, candidate))
-        accum["ssim"].append(image_ssim(reference, candidate))
+    # Positional alignment is only trustworthy when frame counts match; PSNR for
+    # mismatched-count clips is reported but should be read against
+    # frame_count_match_rate.
+    matched = 0
+    limit = min(len(clean_frames), len(candidate_frames))
+    for index in range(limit):
+        reference = clean_frames[index]
+        candidate = candidate_frames[index]
+        if reference.shape != candidate.shape:
+            continue
+        matched += 1
+        psnr = image_psnr(reference, candidate)
+        ssim = image_ssim(reference, candidate)
+        accum["psnr"].append(psnr)
+        accum["ssim"].append(ssim)
+        distance = frame_gop_distances[index] if index < len(frame_gop_distances) else -1
+        bucket = gop_distance_bucket(distance)
+        accum["bucket_psnr"][bucket].append(psnr)
+        accum["bucket_ssim"][bucket].append(ssim)
+    accum["frame_coverage"].append(matched / max(len(clean_frames), 1))
 
 
 def flatten_accumulator(prefix: str, values: dict[str, Any], attempted: int) -> dict[str, Any]:
-    return {
+    flat = {
         f"{prefix}_decode_rate": values["decoded"] / attempted if attempted else 0.0,
         f"{prefix}_frame_coverage_mean": mean(values["frame_coverage"]),
         f"{prefix}_frame_count_match_rate": values["frame_count_match"] / attempted if attempted else 0.0,
@@ -331,6 +415,11 @@ def flatten_accumulator(prefix: str, values: dict[str, Any], attempted: int) -> 
         f"{prefix}_decoder_error": values["decoder_error"],
         f"{prefix}_other_failures": values["other_failures"],
     }
+    for bucket in GOP_BUCKETS:
+        flat[f"{prefix}_gop_{bucket}_psnr_mean"] = mean(values["bucket_psnr"][bucket])
+        flat[f"{prefix}_gop_{bucket}_ssim_mean"] = mean(values["bucket_ssim"][bucket])
+        flat[f"{prefix}_gop_{bucket}_frames"] = len(values["bucket_psnr"][bucket])
+    return flat
 
 
 def fill_spans_with_model(
@@ -585,14 +674,6 @@ def parse_one_ppm(data: bytes, start: int) -> tuple[Tensor, int]:
         raise ValueError("PPM pixel payload has the wrong size")
     frame = parse_ppm(data[start : cursor + payload_len])
     return frame, cursor + payload_len
-
-
-def align_frames(reference: list[Tensor], candidate: list[Tensor]) -> list[tuple[Tensor, Tensor]]:
-    pairs: list[tuple[Tensor, Tensor]] = []
-    for ref_frame, cand_frame in zip(reference, candidate):
-        if ref_frame.shape == cand_frame.shape:
-            pairs.append((ref_frame, cand_frame))
-    return pairs
 
 
 def build_visual_frames(

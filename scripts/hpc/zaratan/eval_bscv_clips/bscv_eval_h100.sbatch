@@ -29,7 +29,11 @@ OUT_ROOT=${OUT_ROOT:-"${RUN_DIR}/offline_bscv_eval"}
 CHECKPOINT_STEPS=${CHECKPOINT_STEPS:-"5000 5500 6000 6500"}
 NUM_CLIPS=${NUM_CLIPS:-20}
 NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
-CORR_PROB=${CORR_PROB:-1}
+# Sweep the per-GOP hit count to see how the concealment floor collapses with
+# corruption density. 1 = single hit (mild), 4/8 = multi-hit accumulation.
+CORR_PROB_SWEEP=${CORR_PROB_SWEEP:-"1 4 8"}
+# random | early (worst-case forward propagation) | late (minimal propagation).
+GOP_POSITION_MODE=${GOP_POSITION_MODE:-random}
 CORR_POS=${CORR_POS:-0.4}
 CORR_LEN_BYTES=${CORR_LEN_BYTES:-2048}
 MAX_SPANS_PER_CLIP=${MAX_SPANS_PER_CLIP:-0}
@@ -69,25 +73,31 @@ echo "Repository: ${REPO_ROOT}"
 echo "Run dir: ${RUN_DIR}"
 echo "Output root: ${OUT_ROOT}"
 echo "Checkpoints: ${checkpoint_dirs[*]}"
-echo "NUM_CLIPS=${NUM_CLIPS} CORR_PROB=${CORR_PROB} CORR_LEN_BYTES=${CORR_LEN_BYTES} CORR_POS=${CORR_POS}"
+echo "NUM_CLIPS=${NUM_CLIPS} CORR_PROB_SWEEP=${CORR_PROB_SWEEP} GOP_POSITION_MODE=${GOP_POSITION_MODE} TARGET_NAL_TYPES=${TARGET_NAL_TYPES} CORR_LEN_BYTES=${CORR_LEN_BYTES} CORR_POS=${CORR_POS}"
 
-srun python scripts/byte/eval/eval_bscv_clips.py \
-    "${MANIFEST}" \
-    --nal-index-path "${NAL_INDEX}" \
-    --checkpoint-dirs "${checkpoint_dirs[@]}" \
-    --out-dir "${OUT_ROOT}" \
-    --num-clips "${NUM_CLIPS}" \
-    --num-visualizations "${NUM_VISUALIZATIONS}" \
-    --corr-prob "${CORR_PROB}" \
-    --corr-pos "${CORR_POS}" \
-    --corr-len-bytes "${CORR_LEN_BYTES}" \
-    --max-spans-per-clip "${MAX_SPANS_PER_CLIP}" \
-    --max-frames "${MAX_FRAMES}" \
-    --block-size "${BLOCK_SIZE}" \
-    --num-ref-slices "${NUM_REF_SLICES}" \
-    --target-nal-types ${TARGET_NAL_TYPES} \
-    --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}" \
-    --timeout-sec "${TIMEOUT_SEC}" \
-    --ffmpeg-binary "${FFMPEG_BINARY}"
+for corr_prob in ${CORR_PROB_SWEEP}; do
+    out_dir="${OUT_ROOT}/corrprob_${corr_prob}_${GOP_POSITION_MODE}"
+    mkdir -p "${out_dir}"
+    echo "=== corr_prob=${corr_prob} mode=${GOP_POSITION_MODE} -> ${out_dir} ==="
+    srun python scripts/byte/eval/eval_bscv_clips.py \
+        "${MANIFEST}" \
+        --nal-index-path "${NAL_INDEX}" \
+        --checkpoint-dirs "${checkpoint_dirs[@]}" \
+        --out-dir "${out_dir}" \
+        --num-clips "${NUM_CLIPS}" \
+        --num-visualizations "${NUM_VISUALIZATIONS}" \
+        --corr-prob "${corr_prob}" \
+        --corr-pos "${CORR_POS}" \
+        --corr-len-bytes "${CORR_LEN_BYTES}" \
+        --max-spans-per-clip "${MAX_SPANS_PER_CLIP}" \
+        --max-frames "${MAX_FRAMES}" \
+        --block-size "${BLOCK_SIZE}" \
+        --num-ref-slices "${NUM_REF_SLICES}" \
+        --target-nal-types ${TARGET_NAL_TYPES} \
+        --gop-position-mode "${GOP_POSITION_MODE}" \
+        --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}" \
+        --timeout-sec "${TIMEOUT_SEC}" \
+        --ffmpeg-binary "${FFMPEG_BINARY}"
+done
 
 echo "Whole-clip BSCV-style evaluation complete: ${OUT_ROOT}"
