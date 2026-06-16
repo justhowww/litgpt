@@ -1,0 +1,93 @@
+#!/bin/bash
+# Whole-clip BSCV-style byte reconstruction evaluation.
+
+#SBATCH --job-name=byte-bscv-eval
+#SBATCH --account=metzler-prj-cmsc
+#SBATCH --partition=gpu
+#SBATCH --gpus=h100:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --output=slurm-%x-%j.out
+
+set -euo pipefail
+export SLURM_EXPORT_ENV=ALL
+
+REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
+source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
+
+STAGED_CORPUS=${STAGED_CORPUS:-"/home/${USER}/scratch.metzler-prj/OpenVid-1M_Data/data"}
+RUN_NAME=${RUN_NAME:-"byte-stage2-fim-psm-ce-only-within-video-1k-8k"}
+RUN_DIR=${RUN_DIR:-"${STAGED_CORPUS}/runs/${RUN_NAME}"}
+MANIFEST=${MANIFEST:-"${STAGED_CORPUS}/manifest.jsonl"}
+NAL_INDEX=${NAL_INDEX:-"${STAGED_CORPUS}/nal_index.sqlite"}
+FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
+OUT_ROOT=${OUT_ROOT:-"${RUN_DIR}/offline_bscv_eval"}
+
+CHECKPOINT_STEPS=${CHECKPOINT_STEPS:-"5000 5500 6000 6500"}
+NUM_CLIPS=${NUM_CLIPS:-20}
+NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
+CORR_PROB=${CORR_PROB:-1}
+CORR_POS=${CORR_POS:-0.4}
+CORR_LEN_BYTES=${CORR_LEN_BYTES:-2048}
+MAX_SPANS_PER_CLIP=${MAX_SPANS_PER_CLIP:-0}
+MAX_FRAMES=${MAX_FRAMES:-96}
+BLOCK_SIZE=${BLOCK_SIZE:-16384}
+NUM_REF_SLICES=${NUM_REF_SLICES:-1}
+TARGET_NAL_TYPES=${TARGET_NAL_TYPES:-"1"}
+SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-0}
+TIMEOUT_SEC=${TIMEOUT_SEC:-60}
+
+if [[ ! -r "${MANIFEST}" ]]; then
+    echo "Manifest is not readable: ${MANIFEST}" >&2
+    exit 1
+fi
+if [[ ! -r "${NAL_INDEX}" ]]; then
+    echo "NAL index is not readable: ${NAL_INDEX}" >&2
+    exit 1
+fi
+if [[ ! -x "${FFMPEG_BINARY}" ]]; then
+    echo "FFmpeg executable is not available: ${FFMPEG_BINARY}" >&2
+    exit 1
+fi
+
+checkpoint_dirs=()
+for step in ${CHECKPOINT_STEPS}; do
+    printf -v step_dir "step-%08d" "${step}"
+    checkpoint_dir="${RUN_DIR}/${step_dir}"
+    if [[ ! -r "${checkpoint_dir}/lit_model.pth" ]]; then
+        echo "Checkpoint is missing: ${checkpoint_dir}/lit_model.pth" >&2
+        exit 1
+    fi
+    checkpoint_dirs+=("${checkpoint_dir}")
+done
+
+mkdir -p "${OUT_ROOT}"
+echo "Repository: ${REPO_ROOT}"
+echo "Run dir: ${RUN_DIR}"
+echo "Output root: ${OUT_ROOT}"
+echo "Checkpoints: ${checkpoint_dirs[*]}"
+echo "NUM_CLIPS=${NUM_CLIPS} CORR_PROB=${CORR_PROB} CORR_LEN_BYTES=${CORR_LEN_BYTES} CORR_POS=${CORR_POS}"
+
+srun python scripts/byte/eval/eval_bscv_clips.py \
+    "${MANIFEST}" \
+    --nal-index-path "${NAL_INDEX}" \
+    --checkpoint-dirs "${checkpoint_dirs[@]}" \
+    --out-dir "${OUT_ROOT}" \
+    --num-clips "${NUM_CLIPS}" \
+    --num-visualizations "${NUM_VISUALIZATIONS}" \
+    --corr-prob "${CORR_PROB}" \
+    --corr-pos "${CORR_POS}" \
+    --corr-len-bytes "${CORR_LEN_BYTES}" \
+    --max-spans-per-clip "${MAX_SPANS_PER_CLIP}" \
+    --max-frames "${MAX_FRAMES}" \
+    --block-size "${BLOCK_SIZE}" \
+    --num-ref-slices "${NUM_REF_SLICES}" \
+    --target-nal-types ${TARGET_NAL_TYPES} \
+    --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}" \
+    --timeout-sec "${TIMEOUT_SEC}" \
+    --ffmpeg-binary "${FFMPEG_BINARY}"
+
+echo "Whole-clip BSCV-style evaluation complete: ${OUT_ROOT}"
