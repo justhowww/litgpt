@@ -15,6 +15,7 @@ from litgpt.args import EvalArgs, TrainArgs
 from litgpt.byte.mrt import MRTConfig, MRT_RISK_MODES
 from litgpt.config import Config
 from litgpt.byte.data import (
+    DATASET_MODES,
     FIM_FORMATS,
     REFERENCE_MODES,
     ByteDataConfig,
@@ -124,6 +125,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-ref-slices", type=int, default=1)
     parser.add_argument("--reference-mode", choices=REFERENCE_MODES, default="normal")
     parser.add_argument("--target-nal-types", type=int, nargs="+", default=[1, 5])
+    parser.add_argument(
+        "--dataset-mode",
+        choices=DATASET_MODES,
+        default="slice",
+        help="'slice' = ByteSliceDataset (ref+target slice). 'window' = "
+        "ByteStreamWindowDataset, the multi-frame contiguous-stream AR objective "
+        "(H0). In window mode p_fim must be 0 and slice-only flags are ignored.",
+    )
+    parser.add_argument(
+        "--window-min-frames",
+        type=int,
+        default=2,
+        help="Minimum VCL frames per stream window (dataset-mode=window).",
+    )
     parser.add_argument("--p-fim", type=float, default=0.0)
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="bridge")
     parser.add_argument(
@@ -315,6 +330,8 @@ def main() -> None:
         default_max_seq_length=args.block_size,
         val_fraction=args.val_fraction,
         split_by_video=args.split_by_video,
+        dataset_mode=args.dataset_mode,
+        window_min_frames=args.window_min_frames,
     )
     max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
     data = ByteDataModule(

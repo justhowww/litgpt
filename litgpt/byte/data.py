@@ -57,6 +57,8 @@ REFERENCE_MODES = ("normal", "no_ref", "zero_ref", "shuffled_ref")
 ReferenceMode = Literal["normal", "no_ref", "zero_ref", "shuffled_ref"]
 FIM_FORMATS = ("bridge", "psm")
 FIMFormat = Literal["bridge", "psm"]
+DATASET_MODES = ("slice", "window")
+DatasetMode = Literal["slice", "window"]
 
 
 def vocab_size_for_fim_format(fim_format: FIMFormat, use_eos: bool = False) -> int:
@@ -111,6 +113,11 @@ class ByteDataConfig:
     default_max_seq_length: int = (
         32768  # Used when LitGPT connect() does not provide max_seq_length.
     )
+    # "slice" = ByteSliceDataset (one ref slice + one target slice). "window" =
+    # ByteStreamWindowDataset: the multi-frame contiguous-stream AR objective used
+    # for H0 (verifying the AVC-LM/JPEG-LM generation legacy). See 0616.md.
+    dataset_mode: DatasetMode = "slice"
+    window_min_frames: int = 2  # Minimum VCL frames per stream window ("window" mode).
 
 
 @dataclass(frozen=True)
@@ -825,6 +832,182 @@ class ByteSliceDataset(Dataset):
         }
 
 
+@dataclass(frozen=True)
+class WindowSample:
+    h264_path: Path
+    start_nal: int  # inclusive NAL index where the window begins (a GOP boundary)
+    end_nal: int  # exclusive NAL index where the window ends
+    num_frames: int  # number of VCL NALs in the window
+
+
+class ByteStreamWindowDataset(Dataset):
+    """Contiguous multi-frame stream-window dataset for AR pretraining (H0).
+
+    Where ``ByteSliceDataset`` conditions on one reference slice and supervises one
+    target slice, each sample here is a contiguous Annex-B byte window that begins
+    at a GOP boundary (the parameter sets preceding an IDR, then the IDR) and packs
+    complete NAL units until ``max_seq_length`` is reached -- never splitting a NAL
+    or crossing a video. Next-byte loss is applied across the whole window: the
+    AVC-LM full-stream objective. Previous frames are simply the causal context, so
+    no reference slice is duplicated; offset ids reset at each NAL boundary.
+
+    AR layout (``p_fim == 0``):
+        window    = concat(bytes[NAL.start:NAL.end] for NAL in window)
+        input_ids = [SLICE_BOS, window[:-1]]   # SLICE_BOS reused as stream-start
+        labels    = window
+        region    = REGION_META for parameter sets, REGION_TARGET for VCL bytes
+        offset    = arange within each NAL, reset to 0 at every NAL boundary
+
+    The masked-span FIM-over-windows mode (``p_fim > 0`` -- hole in the window's
+    last VCL frame, prior frames as causal context) is the planned parallel mode;
+    not implemented yet (see 0616.md design note).
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        max_seq_length: int,
+        *,
+        min_frames: int = 2,
+        p_fim: float = 0.0,
+        nal_index: dict[str, list[NALUnit]] | None = None,
+        seed: int = 42,
+        ignore_index: int = IGNORE_INDEX,
+    ) -> None:
+        if max_seq_length < 4:
+            raise ValueError("max_seq_length must be at least 4")
+        if min_frames < 1:
+            raise ValueError("min_frames must be positive")
+        if p_fim != 0.0:
+            raise NotImplementedError(
+                "ByteStreamWindowDataset FIM-over-windows mode is not implemented yet; "
+                "see the 0616.md design note. Use p_fim=0 for the AR/H0 objective."
+            )
+        self.rows = rows
+        self.max_seq_length = max_seq_length
+        self.min_frames = min_frames
+        self.p_fim = p_fim
+        self.seed = seed
+        self.ignore_index = ignore_index
+        self.samples, self.nal_index = self._build_index(nal_index)
+        if not self.samples:
+            raise ValueError(
+                "No usable stream windows found. Check max_seq_length, min_frames, "
+                "and that the corpus contains IDR-anchored GOPs."
+            )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _build_index(
+        self, cached_nal_index: dict[str, list[NALUnit]] | None
+    ) -> tuple[list[WindowSample], dict[str, list[NALUnit]]]:
+        samples: list[WindowSample] = []
+        nal_index = cached_nal_index if cached_nal_index is not None else {}
+        for row in self.rows:
+            path = Path(row["h264_path"])
+            path_key = str(path)
+            if cached_nal_index is None:
+                nals = parse_annexb_nals(path.read_bytes())
+                nal_index[path_key] = nals
+            else:
+                try:
+                    nals = nal_index[path_key]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Cached NAL index has no entry for {path}"
+                    ) from exc
+            samples.extend(self._windows_for_video(path, nals))
+        return samples, nal_index
+
+    def _windows_for_video(
+        self, path: Path, nals: list[NALUnit]
+    ) -> list[WindowSample]:
+        """Non-overlapping windows, each beginning at an IDR boundary and packed
+        forward by whole NALs until the byte budget is hit."""
+        windows: list[WindowSample] = []
+        n = len(nals)
+        idr_positions = [k for k, nal in enumerate(nals) if nal.nal_type == 5]
+        used_until = 0  # next window must start at or after this NAL index
+        for k in idr_positions:
+            # Back up to include the parameter sets immediately preceding the IDR
+            # so the window is self-contained and decodable from its first byte.
+            start = k
+            while start - 1 >= 0 and nals[start - 1].nal_type in PARAMETER_SET_NAL_TYPES:
+                start -= 1
+            if start < used_until:
+                continue  # this GOP is already inside a previously packed window
+            total = 0
+            vcl = 0
+            end = start
+            while end < n:
+                nal_len = nals[end].end - nals[end].start
+                if total + nal_len > self.max_seq_length:
+                    break
+                total += nal_len
+                if nals[end].nal_type in VCL_NAL_TYPES:
+                    vcl += 1
+                end += 1
+            if vcl >= self.min_frames:
+                windows.append(WindowSample(path, start, end, vcl))
+            used_until = max(used_until, end)
+        return windows
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        nals = self.nal_index[str(sample.h264_path)]
+
+        byte_chunks: list[Tensor] = []
+        region_chunks: list[Tensor] = []
+        offset_chunks: list[Tensor] = []
+        for nal in nals[sample.start_nal : sample.end_nal]:
+            length = nal.end - nal.start
+            byte_chunks.append(bytes_to_ids(data[nal.start : nal.end]))
+            region = (
+                REGION_META
+                if nal.nal_type in PARAMETER_SET_NAL_TYPES
+                else REGION_TARGET
+            )
+            region_chunks.append(torch.full((length,), region, dtype=torch.long))
+            offset_chunks.append(torch.arange(length, dtype=torch.long))
+
+        window = torch.cat(byte_chunks)
+        raw_region = torch.cat(region_chunks)
+        raw_offset = torch.cat(offset_chunks)
+
+        # Teacher forcing across the whole window. SLICE_BOS is reused as the
+        # stream-start marker (this dataset never emits a slice-level BOS), so the
+        # AR vocabulary is unchanged.
+        bos = torch.tensor([SLICE_BOS_ID], dtype=torch.long)
+        input_ids = torch.cat((bos, window[:-1]))
+        labels = window.clone()
+        region_ids = torch.cat(
+            (torch.tensor([REGION_TARGET], dtype=torch.long), raw_region[:-1])
+        )
+        offset_ids = torch.cat(
+            (torch.tensor([0], dtype=torch.long), raw_offset[:-1])
+        )
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "region_ids": region_ids,
+            "offset_ids": offset_ids,
+            "token_counts": {
+                "raw": int(input_ids.numel()),
+                "raw_plus_prompt_template": int(input_ids.numel()),
+            },
+            "sample_meta": {
+                "task": "ar",
+                "fim_format": "stream",
+                "h264_path": str(sample.h264_path),
+                "start_nal": sample.start_nal,
+                "end_nal": sample.end_nal,
+                "num_frames": sample.num_frames,
+            },
+        }
+
+
 def collate_byte_samples(
     samples: list[dict[str, Any]], max_seq_length: int
 ) -> dict[str, Tensor | dict[str, Tensor]]:
@@ -904,7 +1087,16 @@ class ByteDataModule(DataModule):
         )
         if self.nal_index_path is not None and nal_index is None:
             raise FileNotFoundError(f"NAL index does not exist: {index_path}")
-        def _build_dataset(rows_subset: list[dict[str, Any]]) -> ByteSliceDataset:
+        def _build_dataset(rows_subset: list[dict[str, Any]]) -> Dataset:
+            if self.config.dataset_mode == "window":
+                return ByteStreamWindowDataset(
+                    rows_subset,
+                    max_seq_length=self.max_seq_length,
+                    min_frames=self.config.window_min_frames,
+                    p_fim=self.config.p_fim,
+                    nal_index=nal_index,
+                    seed=self.config.seed,
+                )
             return ByteSliceDataset(
                 rows_subset,
                 max_seq_length=self.max_seq_length,
