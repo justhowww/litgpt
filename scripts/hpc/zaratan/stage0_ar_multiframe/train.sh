@@ -40,7 +40,7 @@ fi
 mkdir -p "${OUT_DIR}"
 
 cmd=(
-    python scripts/byte/train.py
+    python -u scripts/byte/train.py
     "${MANIFEST}"
     --nal-index-path "${NAL_INDEX}"
     --out-dir "${OUT_DIR}"
@@ -58,15 +58,23 @@ cmd=(
     --eval-interval 250
     --eval-iters 20
     --save-interval 500
-    --compile
     --resume
 )
+
+# torch.compile is the prime suspect for a silent multi-minute first step; toggle
+# it off with COMPILE=0 to isolate startup hangs.
+COMPILE=${COMPILE:-1}
+if [[ "${COMPILE}" == "1" ]]; then
+    cmd+=(--compile)
+fi
 
 # Window-level random split (within-video) is the default (no --split-by-video).
 # The reconstruction-eval probe is left at its default of 0 (off): it is a
 # slice/FIM probe and does not apply to stream-window AR.
 
-flock -n "${OUT_DIR}/.training.lock" srun "${cmd[@]}" || {
+# -u (python) and --unbuffered (srun) stream manifest/indexing/step logs live so
+# a startup stall is visible instead of a 0-byte slurm file.
+flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2
     exit 1
 }
