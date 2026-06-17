@@ -20,7 +20,7 @@ NAL_INDEX=${NAL_INDEX:-"$(dirname "${MANIFEST}")/nal_index.sqlite"}
 # Reuse the Stage 1 context budget; in window mode this sets how many frames a
 # window holds, not a per-slice cap.
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
-STEPS=${STEPS:-60000}            # "train longer" to a CE plateau (overridable)
+STEPS=${STEPS:-200000}           # extended run; resumes across job restarts until reached
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
