@@ -26,6 +26,22 @@ Overridable: `STEPS`, `BLOCK_SIZE`, `WINDOW_MIN_FRAMES`, `GLOBAL_BATCH_SIZE`,
 
 ## Evaluate (continuation probe, post-hoc on checkpoints)
 
+Launcher (Zaratan, H100). `CHECKPOINT_STEPS` selects which `step-XXXXXXXX`
+snapshots under the run to evaluate; the rest default to the continuation-probe
+defaults (8-frame clean prefix, 4-frame continuation, 20 clips, intra mode on):
+
+```bash
+STAGED_CORPUS=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data \
+CHECKPOINT_STEPS="2000 4000 6000" \
+bash scripts/hpc/zaratan/stage0_ar_multiframe/submit_eval_h100.sh
+```
+
+Overridable: `RUN_NAME`/`RUN_DIR`, `OUT_DIR`, `NUM_CLIPS`, `NUM_VISUALIZATIONS`,
+`PREFIX_FRAMES`, `CONT_FRAMES`, `TEMPERATURE`, `EVAL_INTRA` (`0` to skip intra).
+Output lands in `${RUN_DIR}/continuation_eval` by default.
+
+Raw command (no Slurm):
+
 ```bash
 python scripts/byte/eval/eval_stream_continuation.py \
     /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
