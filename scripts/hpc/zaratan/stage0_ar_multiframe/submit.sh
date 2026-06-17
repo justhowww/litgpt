@@ -23,6 +23,11 @@ sbatch_args=(--parsable --export=ALL)
 if [[ -n "${SBATCH_ACCOUNT}" ]]; then
     sbatch_args+=(--account="${SBATCH_ACCOUNT}")
 fi
+# Steer off nodes with a degraded scratch/Lustre mount, e.g. EXCLUDE_NODES=gpu-a6-2.
+EXCLUDE_NODES=${EXCLUDE_NODES:-}
+if [[ -n "${EXCLUDE_NODES}" ]]; then
+    sbatch_args+=(--exclude="${EXCLUDE_NODES}")
+fi
 
 job_id=$(sbatch "${sbatch_args[@]}" "${JOB_SCRIPT}")
 echo "Submitted Stage 0 multi-frame AR training job ${job_id}"
