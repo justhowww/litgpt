@@ -357,6 +357,7 @@ def model_max_gen(model: torch.nn.Module, prefix_bytes: bytes) -> int:
     return max(0, int(raw.max_seq_length) - len(prefix_bytes) - 1)
 
 
+@torch.inference_mode()
 def generate_continuation(
     model: torch.nn.Module,
     prefix_bytes: bytes,
