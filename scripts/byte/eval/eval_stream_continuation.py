@@ -257,6 +257,7 @@ def evaluate_checkpoint(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, dict[str, Any]]]:
     decode_ok = 0
     full_count = 0
+    skipped_no_budget = 0
     cont_psnr: list[float] = []
     cont_ssim: list[float] = []
     frames_made: list[int] = []
@@ -284,6 +285,18 @@ def evaluate_checkpoint(
             continue
 
         max_gen = min(int(gt_cont_len * args.max_gen_multiple) + 512, model_max_gen(model, prefix_bytes))
+        if max_gen <= 0:
+            # Prefix fills (or exceeds) the model context: there is no room to
+            # generate, so model_bytes would equal the GT prefix and score a
+            # spurious perfect 100. Exclude rather than contaminate the metric.
+            skipped_no_budget += 1
+            details.append({
+                "checkpoint": checkpoint_name,
+                "clip_index": clip_idx,
+                "status": "skipped_no_budget",
+                "prefix_bytes": len(prefix_bytes),
+            })
+            continue
         gen_bytes, gen_frames_emitted = generate_continuation(
             model, prefix_bytes, nals, clip.prefix_end_nal, device, args, clip.cont_frames, max_gen
         )
@@ -334,11 +347,12 @@ def evaluate_checkpoint(
                 "h264_path": str(clip.h264_path),
             }
 
-    attempted = len(clips)
+    attempted = len(clips) - skipped_no_budget
     summary = {
         "checkpoint": checkpoint_name,
         "mode": mode,
         "num_clips": attempted,
+        "num_skipped_no_budget": skipped_no_budget,
         "decode_rate": decode_ok / attempted if attempted else 0.0,
         "full_continuation_rate": full_count / attempted if attempted else 0.0,
         "frames_generated_mean": mean(frames_made),
