@@ -11,6 +11,19 @@ H0 pass = decode-valid + plausible continuation; PSNR/SSIM vs GT is secondary
 for good generation). The headline signal is the validity rate + the side-by-side
 GT-vs-model continuation video.
 
+Plausibility is quantified by a *distributional* score (the FVD/MAUVE analog for
+generation, where there is no per-sample reference): a Fréchet distance between
+the population of real continuation frames and the population of model-generated
+ones, in a cheap, dependency-free feature space (per-frame appearance + frame-to-
+frame motion). It separates "valid bytes" from "valid video": the two component
+metrics, ``frechet_appearance`` and ``frechet_motion``, plus the interpretable
+``motion_energy_*`` / ``grad_energy_*`` means, catch the frozen (motion ~ 0),
+runaway (motion >> real), and blur (low gradient) failures that decode cleanly
+but are implausible. The feature extractor is deliberately swappable: drop in an
+I3D/Inception embedding here later for an FVD/FID comparable to published numbers.
+Note this score is conditional on decode success -- it only sees frames that
+decoded, so the validity rate above is what accounts for outright failures.
+
 Usage:
     python scripts/byte/eval/eval_stream_continuation.py MANIFEST \
         --checkpoint-dirs RUN/step-XXXX [...] --out-dir OUT \
@@ -249,6 +262,13 @@ def evaluate_checkpoint(
     frames_made: list[int] = []
     details: list[dict[str, Any]] = []
     viz: dict[int, dict[str, Any]] = {}
+    # Distributional-plausibility feature populations (metric 3). Appearance is
+    # per-frame; motion is per frame-to-frame transition (the n-th continuation
+    # frame's transition is measured against frame n-1, i.e. the prefix seam).
+    real_app: list[list[float]] = []
+    gen_app: list[list[float]] = []
+    real_mot: list[list[float]] = []
+    gen_mot: list[list[float]] = []
 
     for clip_idx, clip in enumerate(clips):
         print(f"  {checkpoint_name}: clip {clip_idx + 1}/{len(clips)}", flush=True)
@@ -289,6 +309,9 @@ def evaluate_checkpoint(
         cont_psnr.extend(clip_psnr)
         cont_ssim.extend(clip_ssim)
 
+        _collect_distribution(gt_frames, n, m, real_app, real_mot)
+        _collect_distribution(model_frames, n, m, gen_app, gen_mot)
+
         details.append({
             "checkpoint": checkpoint_name,
             "clip_index": clip_idx,
@@ -325,6 +348,7 @@ def evaluate_checkpoint(
         "prefix_frames": clips[0].prefix_frames if clips else 0,
         "temperature": args.temperature,
     }
+    summary.update(distribution_metrics(real_app, gen_app, real_mot, gen_mot))
     return summary, details, viz
 
 
@@ -554,6 +578,99 @@ def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
         writer.writeheader()
         for summary in summaries:
             writer.writerow(summary)
+
+
+# --- Distributional plausibility (metric 3) -------------------------------------
+# A self-contained FVD/MAUVE analog: compare the *population* of real continuation
+# frames to the population of generated ones via a Fréchet distance in a cheap,
+# dependency-free feature space. No per-sample reference (generation invents a new
+# future), and no I3D/Inception download. Swap the two feature fns for a learned
+# embedding to get a published-comparable FVD/FID.
+
+
+def _luma(frame: Tensor) -> Tensor:
+    """Rec.601 luma of an [H, W, 3] frame in [0, 1]."""
+    f = frame.float()
+    return 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
+
+
+def appearance_features(frame: Tensor) -> list[float]:
+    """Per-frame appearance: luma mean/std + gradient energy (blur collapses it)."""
+    y = _luma(frame)
+    dx = (y[:, 1:] - y[:, :-1]).abs().mean()
+    dy = (y[1:, :] - y[:-1, :]).abs().mean()
+    return [float(y.mean()), float(y.std()), float(0.5 * (dx + dy))]
+
+
+def motion_features(curr: Tensor, prev: Tensor) -> list[float] | None:
+    """Per-transition motion: mean/std of |luma_t - luma_{t-1}| (flow-magnitude
+    proxy). ~0 => frozen, >> real => runaway. None if shapes differ."""
+    if curr.shape != prev.shape:
+        return None
+    d = (_luma(curr) - _luma(prev)).abs()
+    return [float(d.mean()), float(d.std())]
+
+
+def _collect_distribution(
+    frames: list[Tensor], start: int, count: int,
+    app_acc: list[list[float]], mot_acc: list[list[float]],
+) -> None:
+    """Accumulate appearance/motion features over continuation frames [start, start+count).
+    Motion at the first continuation frame is measured against frame start-1 (the seam)."""
+    for t in range(start, start + count):
+        if t >= len(frames):
+            break
+        app_acc.append(appearance_features(frames[t]))
+        if t - 1 >= 0 and t - 1 < len(frames):
+            mf = motion_features(frames[t], frames[t - 1])
+            if mf is not None:
+                mot_acc.append(mf)
+
+
+def _cov(x: Tensor) -> Tensor:
+    xc = x - x.mean(0, keepdim=True)
+    cov = (xc.t() @ xc) / max(x.shape[0] - 1, 1)
+    return cov + 1e-6 * torch.eye(x.shape[1], dtype=x.dtype)
+
+
+def _sqrtm_psd(m: Tensor) -> Tensor:
+    vals, vecs = torch.linalg.eigh(m)
+    return (vecs * vals.clamp_min(0).sqrt()) @ vecs.t()
+
+
+def _frechet(real: list[list[float]], gen: list[list[float]]) -> float | None:
+    """Fréchet distance between two Gaussians fit to small feature populations.
+    trace((AB)^{1/2}) is computed as trace((A^{1/2} B A^{1/2})^{1/2})."""
+    dim = len(real[0]) if real else 0
+    if len(real) < dim + 1 or len(gen) < dim + 1:
+        return None
+    r = torch.tensor(real, dtype=torch.float64)
+    g = torch.tensor(gen, dtype=torch.float64)
+    diff = r.mean(0) - g.mean(0)
+    cov_r, cov_g = _cov(r), _cov(g)
+    sa = _sqrtm_psd(cov_r)
+    covmean = _sqrtm_psd(sa @ cov_g @ sa)
+    fid = float(diff.dot(diff) + torch.trace(cov_r + cov_g - 2 * covmean))
+    return max(fid, 0.0)
+
+
+def distribution_metrics(
+    real_app: list[list[float]], gen_app: list[list[float]],
+    real_mot: list[list[float]], gen_mot: list[list[float]],
+) -> dict[str, Any]:
+    # Keys are kept uniform across modes (None when unavailable) so the summary
+    # CSV writer, which fixes columns from the first row, never sees a key drift
+    # between continuation (has motion) and intra (no transitions) summaries.
+    return {
+        "frechet_appearance": _frechet(real_app, gen_app),
+        "frechet_motion": _frechet(real_mot, gen_mot),
+        "dist_frames_real": len(real_app),
+        "dist_frames_gen": len(gen_app),
+        "grad_energy_real_mean": mean([f[2] for f in real_app]),
+        "grad_energy_gen_mean": mean([f[2] for f in gen_app]),
+        "motion_energy_real_mean": mean([f[0] for f in real_mot]),
+        "motion_energy_gen_mean": mean([f[0] for f in gen_mot]),
+    }
 
 
 def mean(values: list[float]) -> float | None:

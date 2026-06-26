@@ -57,14 +57,14 @@ class Category(str, Enum):
     PPS = "pps"
     SEI = "sei"
     SLICE_HEADER = "slice_header"
-    MB_HEADER = "mb_header"          # mb_type / mb_skip_run / sub_mb_type
-    MB_PRED = "mb_pred"              # intra modes, ref_idx, mvd
-    CBP = "cbp"                      # coded_block_pattern
+    MB_HEADER = "mb_header"  # mb_type / mb_skip_run / sub_mb_type
+    MB_PRED = "mb_pred"  # intra modes, ref_idx, mvd
+    CBP = "cbp"  # coded_block_pattern
     MB_QP_DELTA = "mb_qp_delta"
     RESIDUAL_LUMA = "residual_luma"
     RESIDUAL_CHROMA = "residual_chroma"
     RBSP_TRAILING = "rbsp_trailing"
-    SLICE_DATA = "slice_data"        # opaque fallback (only if MB parse disabled)
+    SLICE_DATA = "slice_data"  # opaque fallback (only if MB parse disabled)
     UNKNOWN = "unknown"
 
 
@@ -80,10 +80,10 @@ class SyntaxSpan:
 
     name: str
     category: Category
-    bit_start: int          # inclusive, RBSP bit offset
-    bit_end: int            # exclusive, RBSP bit offset
-    byte_start: int         # inclusive, Annex-B on-disk offset
-    byte_end: int           # exclusive, Annex-B on-disk offset
+    bit_start: int  # inclusive, RBSP bit offset
+    bit_end: int  # exclusive, RBSP bit offset
+    byte_start: int  # inclusive, Annex-B on-disk offset
+    byte_end: int  # exclusive, Annex-B on-disk offset
     value: object = None
     mb_addr: int | None = None
 
@@ -93,10 +93,10 @@ class NALInfo:
     index: int
     nal_type: int
     ref_idc: int
-    start_code_start: int   # Annex-B offset of the 00 00 01 / 00 00 00 01
-    start_code_len: int     # 3 or 4
-    payload_start: int      # Annex-B offset of the NAL header byte
-    payload_end: int        # exclusive Annex-B offset (next start code / EOF)
+    start_code_start: int  # Annex-B offset of the 00 00 01 / 00 00 00 01
+    start_code_len: int  # 3 or 4
+    payload_start: int  # Annex-B offset of the NAL header byte
+    payload_end: int  # exclusive Annex-B offset (next start code / EOF)
 
 
 @dataclass
@@ -124,6 +124,7 @@ def iter_nals(data: bytes) -> list[NALInfo]:
     i, n = 0, len(data)
     while i + 2 < n:
         if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
+            # check if it's a 4-byte start code (00 00 00 01)  or 3-byte (00 00 01)
             sc_len = 3
             sc_start = i
             if i >= 1 and data[i - 1] == 0:
@@ -131,7 +132,7 @@ def iter_nals(data: bytes) -> list[NALInfo]:
                 sc_start = i - 1
             starts.append((sc_start, sc_len))
             i += 3
-        else:
+        else:  # not a start code, move forward
             i += 1
     nals: list[NALInfo] = []
     for k, (sc_start, sc_len) in enumerate(starts):
@@ -141,8 +142,10 @@ def iter_nals(data: bytes) -> list[NALInfo]:
         nals.append(
             NALInfo(
                 index=k,
-                nal_type=header & 0x1F,
-                ref_idc=(header >> 5) & 0x3,
+                nal_type=header
+                & 0x1F,  # forbidden_zero_bit | nal_ref_idc | nal_unit_type  with 1 bit    |   2 bits    |    5 bits
+                ref_idc=(header >> 5)
+                & 0x3,  # forbidden_zero_bit | nal_ref_idc | nal_unit_type  with 1 bit    |   2 bits    |    5 bits
                 start_code_start=sc_start,
                 start_code_len=sc_len,
                 payload_start=payload_start,
@@ -152,7 +155,9 @@ def iter_nals(data: bytes) -> list[NALInfo]:
     return nals
 
 
-def unescape_rbsp(data: bytes, payload_start: int, payload_end: int) -> tuple[bytes, list[int], list[int]]:
+def unescape_rbsp(
+    data: bytes, payload_start: int, payload_end: int
+) -> tuple[bytes, list[int], list[int]]:
     """Strip emulation-prevention bytes from a NAL payload (after the header byte).
 
     Returns (rbsp, byte_map, epb_offsets) where rbsp[i]'s source Annex-B offset is
@@ -304,30 +309,44 @@ def parse_sps(reader: BitReader, record: "_Recorder") -> SPS:
         record.ue("bit_depth_luma_minus8", reader, Category.SPS)
         record.ue("bit_depth_chroma_minus8", reader, Category.SPS)
         record.u("qpprime_y_zero_transform_bypass_flag", reader, 1, Category.SPS)
-        seq_scaling_matrix_present = record.u("seq_scaling_matrix_present_flag", reader, 1, Category.SPS)
+        seq_scaling_matrix_present = record.u(
+            "seq_scaling_matrix_present_flag", reader, 1, Category.SPS
+        )
         if seq_scaling_matrix_present:
             raise _Unsupported("seq_scaling_matrix_present")
-    log2_max_frame_num = record.ue("log2_max_frame_num_minus4", reader, Category.SPS) + 4
+    log2_max_frame_num = (
+        record.ue("log2_max_frame_num_minus4", reader, Category.SPS) + 4
+    )
     pic_order_cnt_type = record.ue("pic_order_cnt_type", reader, Category.SPS)
     log2_max_poc_lsb = 0
     delta_pic_order_always_zero_flag = 0
     if pic_order_cnt_type == 0:
-        log2_max_poc_lsb = record.ue("log2_max_pic_order_cnt_lsb_minus4", reader, Category.SPS) + 4
+        log2_max_poc_lsb = (
+            record.ue("log2_max_pic_order_cnt_lsb_minus4", reader, Category.SPS) + 4
+        )
     elif pic_order_cnt_type == 1:
-        delta_pic_order_always_zero_flag = record.u("delta_pic_order_always_zero_flag", reader, 1, Category.SPS)
+        delta_pic_order_always_zero_flag = record.u(
+            "delta_pic_order_always_zero_flag", reader, 1, Category.SPS
+        )
         record.se("offset_for_non_ref_pic", reader, Category.SPS)
         record.se("offset_for_top_to_bottom_field", reader, Category.SPS)
-        num_ref_frames_in_poc_cycle = record.ue("num_ref_frames_in_pic_order_cnt_cycle", reader, Category.SPS)
+        num_ref_frames_in_poc_cycle = record.ue(
+            "num_ref_frames_in_pic_order_cnt_cycle", reader, Category.SPS
+        )
         for _ in range(num_ref_frames_in_poc_cycle):
             record.se("offset_for_ref_frame", reader, Category.SPS)
     record.ue("max_num_ref_frames", reader, Category.SPS)
     record.u("gaps_in_frame_num_value_allowed_flag", reader, 1, Category.SPS)
     pic_width_in_mbs = record.ue("pic_width_in_mbs_minus1", reader, Category.SPS) + 1
-    pic_height_in_map_units = record.ue("pic_height_in_map_units_minus1", reader, Category.SPS) + 1
+    pic_height_in_map_units = (
+        record.ue("pic_height_in_map_units_minus1", reader, Category.SPS) + 1
+    )
     frame_mbs_only_flag = record.u("frame_mbs_only_flag", reader, 1, Category.SPS)
     if not frame_mbs_only_flag:
         raise _Unsupported("interlaced (frame_mbs_only_flag=0)")
-    pic_height_in_mbs = pic_height_in_map_units  # frame_mbs_only => map units == MB rows
+    pic_height_in_mbs = (
+        pic_height_in_map_units  # frame_mbs_only => map units == MB rows
+    )
     record.u("direct_8x8_inference_flag", reader, 1, Category.SPS)
     frame_cropping = record.u("frame_cropping_flag", reader, 1, Category.SPS)
     if frame_cropping:
@@ -358,23 +377,35 @@ def parse_sps(reader: BitReader, record: "_Recorder") -> SPS:
 def parse_pps(reader: BitReader, record: "_Recorder") -> PPS:
     pps_id = record.ue("pic_parameter_set_id", reader, Category.PPS)
     sps_id = record.ue("seq_parameter_set_id", reader, Category.PPS)
-    entropy_coding_mode_flag = record.u("entropy_coding_mode_flag", reader, 1, Category.PPS)
+    entropy_coding_mode_flag = record.u(
+        "entropy_coding_mode_flag", reader, 1, Category.PPS
+    )
     if entropy_coding_mode_flag:
         raise _Unsupported("CABAC (entropy_coding_mode_flag=1)")
-    bottom_field = record.u("bottom_field_pic_order_in_frame_present_flag", reader, 1, Category.PPS)
+    bottom_field = record.u(
+        "bottom_field_pic_order_in_frame_present_flag", reader, 1, Category.PPS
+    )
     num_slice_groups = record.ue("num_slice_groups_minus1", reader, Category.PPS) + 1
     if num_slice_groups > 1:
         raise _Unsupported("multiple slice groups (FMO)")
-    num_ref_l0 = record.ue("num_ref_idx_l0_default_active_minus1", reader, Category.PPS) + 1
-    num_ref_l1 = record.ue("num_ref_idx_l1_default_active_minus1", reader, Category.PPS) + 1
+    num_ref_l0 = (
+        record.ue("num_ref_idx_l0_default_active_minus1", reader, Category.PPS) + 1
+    )
+    num_ref_l1 = (
+        record.ue("num_ref_idx_l1_default_active_minus1", reader, Category.PPS) + 1
+    )
     weighted_pred = record.u("weighted_pred_flag", reader, 1, Category.PPS)
     weighted_bipred = record.u("weighted_bipred_idc", reader, 2, Category.PPS)
     pic_init_qp = record.se("pic_init_qp_minus26", reader, Category.PPS) + 26
     record.se("pic_init_qs_minus26", reader, Category.PPS)
     record.se("chroma_qp_index_offset", reader, Category.PPS)
-    deblocking = record.u("deblocking_filter_control_present_flag", reader, 1, Category.PPS)
+    deblocking = record.u(
+        "deblocking_filter_control_present_flag", reader, 1, Category.PPS
+    )
     constrained_intra = record.u("constrained_intra_pred_flag", reader, 1, Category.PPS)
-    redundant_pic_cnt = record.u("redundant_pic_cnt_present_flag", reader, 1, Category.PPS)
+    redundant_pic_cnt = record.u(
+        "redundant_pic_cnt_present_flag", reader, 1, Category.PPS
+    )
     if reader.more_rbsp_data():
         # transform_8x8_mode_flag etc. (high profile); not in baseline. Cover it.
         record.fill_to_trailing("pps_extension", reader, Category.PPS)
@@ -403,7 +434,7 @@ def parse_pps(reader: BitReader, record: "_Recorder") -> PPS:
 @dataclass
 class SliceHeader:
     first_mb_in_slice: int
-    slice_type: int           # already mod-5
+    slice_type: int  # already mod-5
     pps_id: int
     frame_num: int
     field_pic_flag: int
@@ -419,7 +450,9 @@ def parse_slice_header(
     slice_type_raw = record.ue("slice_type", reader, Category.SLICE_HEADER)
     slice_type = slice_type_raw % 5
     pps_id = record.ue("pic_parameter_set_id", reader, Category.SLICE_HEADER)
-    frame_num = record.u("frame_num", reader, sps.log2_max_frame_num, Category.SLICE_HEADER)
+    frame_num = record.u(
+        "frame_num", reader, sps.log2_max_frame_num, Category.SLICE_HEADER
+    )
     field_pic_flag = 0
     if not sps.frame_mbs_only_flag:
         field_pic_flag = record.u("field_pic_flag", reader, 1, Category.SLICE_HEADER)
@@ -429,7 +462,12 @@ def parse_slice_header(
     if nal.nal_type == NAL_SLICE_IDR:
         idr_pic_id = record.ue("idr_pic_id", reader, Category.SLICE_HEADER)
     if sps.pic_order_cnt_type == 0:
-        record.u("pic_order_cnt_lsb", reader, sps.log2_max_pic_order_cnt_lsb, Category.SLICE_HEADER)
+        record.u(
+            "pic_order_cnt_lsb",
+            reader,
+            sps.log2_max_pic_order_cnt_lsb,
+            Category.SLICE_HEADER,
+        )
         if pps.bottom_field_pic_order_in_frame_present_flag and not field_pic_flag:
             record.se("delta_pic_order_cnt_bottom", reader, Category.SLICE_HEADER)
     elif sps.pic_order_cnt_type == 1 and not sps.delta_pic_order_always_zero_flag:
@@ -440,9 +478,14 @@ def parse_slice_header(
         record.ue("redundant_pic_cnt", reader, Category.SLICE_HEADER)
     num_ref_idx_l0_active = pps.num_ref_idx_l0_default_active
     if slice_type == SLICE_TYPE_P or slice_type == SLICE_TYPE_SP:
-        override = record.u("num_ref_idx_active_override_flag", reader, 1, Category.SLICE_HEADER)
+        override = record.u(
+            "num_ref_idx_active_override_flag", reader, 1, Category.SLICE_HEADER
+        )
         if override:
-            num_ref_idx_l0_active = record.ue("num_ref_idx_l0_active_minus1", reader, Category.SLICE_HEADER) + 1
+            num_ref_idx_l0_active = (
+                record.ue("num_ref_idx_l0_active_minus1", reader, Category.SLICE_HEADER)
+                + 1
+            )
         _parse_ref_pic_list_modification(reader, record)
     if nal.ref_idc != 0:
         _parse_dec_ref_pic_marking(reader, record, nal)
@@ -466,10 +509,14 @@ def parse_slice_header(
 
 
 def _parse_ref_pic_list_modification(reader: BitReader, record: "_Recorder") -> None:
-    flag = record.u("ref_pic_list_modification_flag_l0", reader, 1, Category.SLICE_HEADER)
+    flag = record.u(
+        "ref_pic_list_modification_flag_l0", reader, 1, Category.SLICE_HEADER
+    )
     if flag:
         while True:
-            idc = record.ue("modification_of_pic_nums_idc", reader, Category.SLICE_HEADER)
+            idc = record.ue(
+                "modification_of_pic_nums_idc", reader, Category.SLICE_HEADER
+            )
             if idc == 3:
                 break
             if idc in (0, 1):
@@ -478,25 +525,35 @@ def _parse_ref_pic_list_modification(reader: BitReader, record: "_Recorder") -> 
                 record.ue("long_term_pic_num", reader, Category.SLICE_HEADER)
 
 
-def _parse_dec_ref_pic_marking(reader: BitReader, record: "_Recorder", nal: NALInfo) -> None:
+def _parse_dec_ref_pic_marking(
+    reader: BitReader, record: "_Recorder", nal: NALInfo
+) -> None:
     if nal.nal_type == NAL_SLICE_IDR:
         record.u("no_output_of_prior_pics_flag", reader, 1, Category.SLICE_HEADER)
         record.u("long_term_reference_flag", reader, 1, Category.SLICE_HEADER)
     else:
-        adaptive = record.u("adaptive_ref_pic_marking_mode_flag", reader, 1, Category.SLICE_HEADER)
+        adaptive = record.u(
+            "adaptive_ref_pic_marking_mode_flag", reader, 1, Category.SLICE_HEADER
+        )
         if adaptive:
             while True:
-                op = record.ue("memory_management_control_operation", reader, Category.SLICE_HEADER)
+                op = record.ue(
+                    "memory_management_control_operation", reader, Category.SLICE_HEADER
+                )
                 if op == 0:
                     break
                 if op in (1, 3):
-                    record.ue("difference_of_pic_nums_minus1", reader, Category.SLICE_HEADER)
+                    record.ue(
+                        "difference_of_pic_nums_minus1", reader, Category.SLICE_HEADER
+                    )
                 if op == 2:
                     record.ue("long_term_pic_num", reader, Category.SLICE_HEADER)
                 if op in (3, 6):
                     record.ue("long_term_frame_idx", reader, Category.SLICE_HEADER)
                 if op == 4:
-                    record.ue("max_long_term_frame_idx_plus1", reader, Category.SLICE_HEADER)
+                    record.ue(
+                        "max_long_term_frame_idx_plus1", reader, Category.SLICE_HEADER
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +578,9 @@ class _Recorder:
         self.spans: list[SyntaxSpan] = []
 
     # -- low-level element readers that also record a span --
-    def _span(self, name: str, cat: Category, b0: int, b1: int, value, mb_addr=None) -> None:
+    def _span(
+        self, name: str, cat: Category, b0: int, b1: int, value, mb_addr=None
+    ) -> None:
         byte_start = self.byte_map[b0 >> 3]
         last_bit = b1 - 1
         byte_end = self.byte_map[last_bit >> 3] + 1
@@ -547,7 +606,9 @@ class _Recorder:
         self._span(name, cat, b0, reader.pos, v, mb_addr)
         return v
 
-    def te(self, name, reader: BitReader, x_max: int, cat: Category, mb_addr=None) -> int:
+    def te(
+        self, name, reader: BitReader, x_max: int, cat: Category, mb_addr=None
+    ) -> int:
         b0 = reader.pos
         v = reader.read_te(x_max)
         self._span(name, cat, b0, reader.pos, v, mb_addr)
@@ -609,20 +670,42 @@ def parse_nal(
     spans: list[SyntaxSpan] = []
     # Start code + NAL header live in Annex-B byte space (not RBSP bits).
     spans.append(
-        SyntaxSpan("start_code", Category.START_CODE, -1, -1,
-                   nal.start_code_start, nal.payload_start, None)
+        SyntaxSpan(
+            "start_code",
+            Category.START_CODE,
+            -1,
+            -1,
+            nal.start_code_start,
+            nal.payload_start,
+            None,
+        )
     )
     spans.append(
-        SyntaxSpan("nal_header", Category.NAL_HEADER, -1, -1,
-                   nal.payload_start, nal.payload_start + 1,
-                   {"nal_type": nal.nal_type, "ref_idc": nal.ref_idc})
+        SyntaxSpan(
+            "nal_header",
+            Category.NAL_HEADER,
+            -1,
+            -1,
+            nal.payload_start,
+            nal.payload_start + 1,
+            {"nal_type": nal.nal_type, "ref_idc": nal.ref_idc},
+        )
     )
 
-    rbsp, byte_map, epb_offsets = unescape_rbsp(data, nal.payload_start + 1, nal.payload_end)
+    rbsp, byte_map, epb_offsets = unescape_rbsp(
+        data, nal.payload_start + 1, nal.payload_end
+    )
     for off in epb_offsets:
         spans.append(
-            SyntaxSpan("emulation_prevention_three_byte", Category.EMULATION_PREVENTION,
-                       -1, -1, off, off + 1, 0x03)
+            SyntaxSpan(
+                "emulation_prevention_three_byte",
+                Category.EMULATION_PREVENTION,
+                -1,
+                -1,
+                off,
+                off + 1,
+                0x03,
+            )
         )
 
     result = NALParse(nal=nal, status=ParseStatus.OK, spans=spans)
@@ -642,7 +725,9 @@ def parse_nal(
             pps_map[pps.pps_id] = pps
             _emit_trailing(record, reader)
         elif nal.nal_type in VCL_NAL_TYPES:
-            _parse_slice(data, nal, reader, record, sps_map, pps_map, result, parse_slice_data)
+            _parse_slice(
+                data, nal, reader, record, sps_map, pps_map, result, parse_slice_data
+            )
         else:
             # SEI / AUD / other: opaque payload span, no bit parse.
             cat = Category.SEI if nal.nal_type == NAL_SEI else Category.UNKNOWN
@@ -708,7 +793,9 @@ def parse_stream(data: bytes, *, parse_slice_data: bool = True) -> StreamParse:
     pps_map: dict[int, PPS] = {}
     parses: list[NALParse] = []
     for nal in iter_nals(data):
-        parses.append(parse_nal(data, nal, sps_map, pps_map, parse_slice_data=parse_slice_data))
+        parses.append(
+            parse_nal(data, nal, sps_map, pps_map, parse_slice_data=parse_slice_data)
+        )
     return StreamParse(nals=parses, sps=sps_map, pps=pps_map)
 
 
@@ -721,8 +808,13 @@ class _DesyncError(Exception):
 # ---------------------------------------------------------------------------
 
 # P macroblock partition prediction: mb_type -> (num_parts, name)
-_P_MB = {0: (1, "P_L0_16x16"), 1: (2, "P_L0_L0_16x8"), 2: (2, "P_L0_L0_8x16"),
-         3: (4, "P_8x8"), 4: (4, "P_8x8ref0")}
+_P_MB = {
+    0: (1, "P_L0_16x16"),
+    1: (2, "P_L0_L0_16x8"),
+    2: (2, "P_L0_L0_8x16"),
+    3: (4, "P_8x8"),
+    4: (4, "P_8x8ref0"),
+}
 _SUB_MB_NUM_PARTS = {0: 1, 1: 2, 2: 2, 3: 4}  # P sub_mb_type -> sub-partitions
 
 
@@ -733,7 +825,9 @@ class _NNZ:
         self.lw = width_mb * 4
         self.luma = [[-1] * (width_mb * 4) for _ in range(height_mb * 4)]
         self.cw = width_mb * 2
-        self.chroma = [[[-1] * (width_mb * 2) for _ in range(height_mb * 2)] for _ in range(2)]
+        self.chroma = [
+            [[-1] * (width_mb * 2) for _ in range(height_mb * 2)] for _ in range(2)
+        ]
 
     @staticmethod
     def _predict(grid, x: int, y: int) -> int:
@@ -779,20 +873,42 @@ class _NNZ:
                 self.set_chroma(c, mbx, mby, b, chroma_val)
 
 
-def _residual_block(reader: BitReader, record: _Recorder, nc: int, max_coeff: int,
-                    mb_addr: int, cat: Category, name: str) -> int:
+def _residual_block(
+    reader: BitReader,
+    record: _Recorder,
+    nc: int,
+    max_coeff: int,
+    mb_addr: int,
+    cat: Category,
+    name: str,
+) -> int:
     """Parse one CAVLC residual block; record sub-element spans; return TotalCoeff."""
     label = T.coeff_token_label(nc)
     b0 = reader.pos
-    (total_coeff, trailing_ones), _ = T.decode_vlc(reader.read_bit, T.code_map(label), label)
-    record.raw(f"{name}.coeff_token", cat, b0, reader.pos,
-               {"total_coeff": total_coeff, "trailing_ones": trailing_ones, "nC": nc}, mb_addr)
+    (total_coeff, trailing_ones), _ = T.decode_vlc(
+        reader.read_bit, T.code_map(label), label
+    )
+    record.raw(
+        f"{name}.coeff_token",
+        cat,
+        b0,
+        reader.pos,
+        {"total_coeff": total_coeff, "trailing_ones": trailing_ones, "nC": nc},
+        mb_addr,
+    )
     if total_coeff == 0:
         return 0
     if trailing_ones > 0:
         s0 = reader.pos
         reader.read_bits(trailing_ones)
-        record.raw(f"{name}.trailing_ones_sign_flag", cat, s0, reader.pos, trailing_ones, mb_addr)
+        record.raw(
+            f"{name}.trailing_ones_sign_flag",
+            cat,
+            s0,
+            reader.pos,
+            trailing_ones,
+            mb_addr,
+        )
     suffix_length = 1 if (total_coeff > 10 and trailing_ones < 3) else 0
     for i in range(total_coeff - trailing_ones):
         ls = reader.pos
@@ -824,8 +940,11 @@ def _residual_block(reader: BitReader, record: _Recorder, nc: int, max_coeff: in
     total_zeros = 0
     if total_coeff < max_coeff:
         tz0 = reader.pos
-        tz_label = (f"total_zeros_cdc_{total_coeff}" if max_coeff == 4
-                    else f"total_zeros_4x4_{total_coeff}")
+        tz_label = (
+            f"total_zeros_cdc_{total_coeff}"
+            if max_coeff == 4
+            else f"total_zeros_4x4_{total_coeff}"
+        )
         total_zeros, _ = T.decode_vlc(reader.read_bit, T.code_map(tz_label), tz_label)
         record.raw(f"{name}.total_zeros", cat, tz0, reader.pos, total_zeros, mb_addr)
     zeros_left = total_zeros
@@ -840,8 +959,18 @@ def _residual_block(reader: BitReader, record: _Recorder, nc: int, max_coeff: in
     return total_coeff
 
 
-def _parse_residual(reader, record, nnz: _NNZ, mbx, mby, mb_addr, *,
-                    intra16x16: bool, cbp_luma: int, cbp_chroma: int) -> None:
+def _parse_residual(
+    reader,
+    record,
+    nnz: _NNZ,
+    mbx,
+    mby,
+    mb_addr,
+    *,
+    intra16x16: bool,
+    cbp_luma: int,
+    cbp_chroma: int,
+) -> None:
     lcat, ccat = Category.RESIDUAL_LUMA, Category.RESIDUAL_CHROMA
     if intra16x16:
         nc = nnz.predict_luma(mbx, mby, 0)
@@ -849,7 +978,9 @@ def _parse_residual(reader, record, nnz: _NNZ, mbx, mby, mb_addr, *,
         for blk in range(16):
             if cbp_luma & (1 << (blk >> 2)):
                 nc = nnz.predict_luma(mbx, mby, blk)
-                tc = _residual_block(reader, record, nc, 15, mb_addr, lcat, f"luma_ac[{blk}]")
+                tc = _residual_block(
+                    reader, record, nc, 15, mb_addr, lcat, f"luma_ac[{blk}]"
+                )
             else:
                 tc = 0
             nnz.set_luma(mbx, mby, blk, tc)
@@ -857,7 +988,9 @@ def _parse_residual(reader, record, nnz: _NNZ, mbx, mby, mb_addr, *,
         for blk in range(16):
             if cbp_luma & (1 << (blk >> 2)):
                 nc = nnz.predict_luma(mbx, mby, blk)
-                tc = _residual_block(reader, record, nc, 16, mb_addr, lcat, f"luma[{blk}]")
+                tc = _residual_block(
+                    reader, record, nc, 16, mb_addr, lcat, f"luma[{blk}]"
+                )
             else:
                 tc = 0
             nnz.set_luma(mbx, mby, blk, tc)
@@ -869,7 +1002,9 @@ def _parse_residual(reader, record, nnz: _NNZ, mbx, mby, mb_addr, *,
         for comp in range(2):
             for blk in range(4):
                 nc = nnz.predict_chroma(comp, mbx, mby, blk)
-                tc = _residual_block(reader, record, nc, 15, mb_addr, ccat, f"chroma_ac[{comp}][{blk}]")
+                tc = _residual_block(
+                    reader, record, nc, 15, mb_addr, ccat, f"chroma_ac[{comp}][{blk}]"
+                )
                 nnz.set_chroma(comp, mbx, mby, blk, tc)
     else:
         for comp in range(2):
@@ -877,8 +1012,9 @@ def _parse_residual(reader, record, nnz: _NNZ, mbx, mby, mb_addr, *,
                 nnz.set_chroma(comp, mbx, mby, blk, 0)
 
 
-def _parse_macroblock(reader, record, sps: SPS, pps: PPS, header: SliceHeader,
-                      nnz: _NNZ, mb_addr: int) -> None:
+def _parse_macroblock(
+    reader, record, sps: SPS, pps: PPS, header: SliceHeader, nnz: _NNZ, mb_addr: int
+) -> None:
     mbx, mby = mb_addr % sps.pic_width_in_mbs, mb_addr // sps.pic_width_in_mbs
     mb_type = record.ue("mb_type", reader, Category.MB_HEADER, mb_addr)
 
@@ -914,15 +1050,31 @@ def _parse_macroblock(reader, record, sps: SPS, pps: PPS, header: SliceHeader,
 
     if inter:
         _parse_inter_pred(reader, record, header, mb_type, mb_addr)
-        cbp = T.GOLOMB_TO_INTER_CBP[record.ue("coded_block_pattern", reader, Category.CBP, mb_addr)]
+        cbp = T.GOLOMB_TO_INTER_CBP[
+            record.ue("coded_block_pattern", reader, Category.CBP, mb_addr)
+        ]
         cbp_luma, cbp_chroma = cbp & 15, cbp >> 4
     elif mb_mode == "I_NxN":
         for blk in range(16):
-            prev = record.u(f"prev_intra4x4_pred_mode_flag[{blk}]", reader, 1, Category.MB_PRED, mb_addr)
+            prev = record.u(
+                f"prev_intra4x4_pred_mode_flag[{blk}]",
+                reader,
+                1,
+                Category.MB_PRED,
+                mb_addr,
+            )
             if not prev:
-                record.u(f"rem_intra4x4_pred_mode[{blk}]", reader, 3, Category.MB_PRED, mb_addr)
+                record.u(
+                    f"rem_intra4x4_pred_mode[{blk}]",
+                    reader,
+                    3,
+                    Category.MB_PRED,
+                    mb_addr,
+                )
         record.ue("intra_chroma_pred_mode", reader, Category.MB_PRED, mb_addr)
-        cbp = T.GOLOMB_TO_INTRA_CBP[record.ue("coded_block_pattern", reader, Category.CBP, mb_addr)]
+        cbp = T.GOLOMB_TO_INTRA_CBP[
+            record.ue("coded_block_pattern", reader, Category.CBP, mb_addr)
+        ]
         cbp_luma, cbp_chroma = cbp & 15, cbp >> 4
     else:  # I_16x16
         record.ue("intra_chroma_pred_mode", reader, Category.MB_PRED, mb_addr)
@@ -930,13 +1082,24 @@ def _parse_macroblock(reader, record, sps: SPS, pps: PPS, header: SliceHeader,
 
     if cbp_luma > 0 or cbp_chroma > 0 or intra16x16:
         record.se("mb_qp_delta", reader, Category.MB_QP_DELTA, mb_addr)
-        _parse_residual(reader, record, nnz, mbx, mby, mb_addr,
-                        intra16x16=intra16x16, cbp_luma=cbp_luma, cbp_chroma=cbp_chroma)
+        _parse_residual(
+            reader,
+            record,
+            nnz,
+            mbx,
+            mby,
+            mb_addr,
+            intra16x16=intra16x16,
+            cbp_luma=cbp_luma,
+            cbp_chroma=cbp_chroma,
+        )
     else:
         nnz.set_mb(mbx, mby, 0, 0)
 
 
-def _parse_inter_pred(reader, record, header: SliceHeader, mb_type: int, mb_addr: int) -> None:
+def _parse_inter_pred(
+    reader, record, header: SliceHeader, mb_type: int, mb_addr: int
+) -> None:
     num_parts, name = _P_MB[mb_type]
     num_ref = header.num_ref_idx_l0_active
     if mb_type in (3, 4):  # P_8x8 / P_8x8ref0
@@ -947,7 +1110,9 @@ def _parse_inter_pred(reader, record, header: SliceHeader, mb_type: int, mb_addr
         # ref_idx per 8x8 (not for ref0), then mvd per sub-partition.
         if mb_type == 3 and num_ref > 1:
             for p in range(4):
-                record.te(f"ref_idx_l0[{p}]", reader, num_ref - 1, Category.MB_PRED, mb_addr)
+                record.te(
+                    f"ref_idx_l0[{p}]", reader, num_ref - 1, Category.MB_PRED, mb_addr
+                )
         for p in range(4):
             for _ in range(_SUB_MB_NUM_PARTS[sub_types[p]]):
                 record.se(f"mvd_l0[{p}].x", reader, Category.MB_PRED, mb_addr)
@@ -955,14 +1120,17 @@ def _parse_inter_pred(reader, record, header: SliceHeader, mb_type: int, mb_addr
         return
     if num_ref > 1:
         for p in range(num_parts):
-            record.te(f"ref_idx_l0[{p}]", reader, num_ref - 1, Category.MB_PRED, mb_addr)
+            record.te(
+                f"ref_idx_l0[{p}]", reader, num_ref - 1, Category.MB_PRED, mb_addr
+            )
     for p in range(num_parts):
         record.se(f"mvd_l0[{p}].x", reader, Category.MB_PRED, mb_addr)
         record.se(f"mvd_l0[{p}].y", reader, Category.MB_PRED, mb_addr)
 
 
-def _parse_slice_data_cavlc(reader: BitReader, record: _Recorder, sps: SPS,
-                            pps: PPS, header: SliceHeader) -> int:
+def _parse_slice_data_cavlc(
+    reader: BitReader, record: _Recorder, sps: SPS, pps: PPS, header: SliceHeader
+) -> int:
     pic_size = sps.pic_width_in_mbs * sps.pic_height_in_mbs
     nnz = _NNZ(sps.pic_width_in_mbs, sps.pic_height_in_mbs)
     reader.compute_stop_bit()
