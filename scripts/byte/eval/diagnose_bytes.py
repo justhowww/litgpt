@@ -158,6 +158,47 @@ def category_accuracy(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _name_stem(name: str) -> str:
+    """Normalize a syntax-element name into a grouping key by dropping array
+    indices and block numbers: ``mvd_l0[0].x`` -> ``mvd_l0.x``, ``sub_mb_type[1]``
+    -> ``sub_mb_type``. Keeps ``mb_type`` distinct from ``mb_skip_run`` etc. so the
+    per-element view isolates the structural decisions the category view bundles."""
+    import re
+
+    s = re.sub(r"\[\d+\]", "", name)
+    s = re.sub(r"_\d+(?=\b|\.|$)", "", s)
+    return s
+
+
+def element_accuracy(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-syntax-ELEMENT top-1 + mean bits/byte (teacher-forced), keyed by the
+    normalized element name rather than the (coarser) category. This separates,
+    e.g., ``mb_type`` from the rest of ``mb_header`` so a low category number can
+    be attributed to the element that actually carries it."""
+    agg: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        if "p_target" not in rec:
+            continue
+        stem = _name_stem(rec["syntax"]["name"])
+        cat = rec["syntax"]["category"]
+        a = agg.setdefault(stem, {"n": 0, "correct": 0, "bits": 0.0, "category": cat})
+        a["n"] += 1
+        a["correct"] += 1 if rec.get("correct") else 0
+        a["bits"] += -math.log2(max(rec["p_target"], 1e-12))
+    rows = []
+    for stem, a in agg.items():
+        n = a["n"]
+        rows.append({
+            "element": stem,
+            "category": a["category"],
+            "bytes": int(n),
+            "top1_acc": a["correct"] / n if n else 0.0,
+            "bits_per_byte": a["bits"] / n if n else 0.0,
+        })
+    rows.sort(key=lambda r: -r["bytes"])
+    return rows
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -202,8 +243,10 @@ def render_html(
     summary: dict[str, Any],
     cat_rows: list[dict[str, Any]],
     freerun: dict[str, Any] | None,
+    elem_rows: list[dict[str, Any]] | None = None,
     bytes_per_row: int = 32,
 ) -> str:
+    elem_rows = elem_rows or []
     has_preds = any("p_target" in r for r in records)
     # Group bytes by NAL for collapsible sections (nal_addr inferred from spans
     # is not per-byte; instead break on start_code category boundaries).
@@ -234,6 +277,14 @@ def render_html(
         f"{html.escape(r['category'])}</td><td>{r['bytes']}</td>"
         f"<td>{r['top1_acc']*100:.1f}%</td><td>{r['bits_per_byte']:.2f}</td></tr>"
         for r in cat_rows
+    )
+
+    elem_table = "".join(
+        f"<tr><td>{html.escape(r['element'])}</td>"
+        f"<td><span class='swatch' style='background:{CATEGORY_COLORS.get(r['category'], '#94a3b8')}'></span>"
+        f"{html.escape(r['category'])}</td><td>{r['bytes']}</td>"
+        f"<td>{r['top1_acc']*100:.1f}%</td><td>{r['bits_per_byte']:.2f}</td></tr>"
+        for r in elem_rows
     )
 
     summary_rows = "".join(
@@ -278,6 +329,9 @@ def render_html(
 {('<h2>Per-syntax-category accuracy (teacher-forced)</h2>'
   '<table><tr><th>category</th><th>bytes</th><th>top-1</th><th>bits/byte</th></tr>'
   + cat_table + '</table>') if has_preds else ''}
+{('<h2>Per-syntax-element accuracy (teacher-forced)</h2>'
+  '<table><tr><th>element</th><th>category</th><th>bytes</th><th>top-1</th><th>bits/byte</th></tr>'
+  + elem_table + '</table>') if has_preds else ''}
 {freerun_html}
 <h2>Byte grid (GT bytes, coloured by syntax; hover for details)</h2>
 {toggle}
@@ -367,6 +421,7 @@ def main() -> None:
 
     records = build_records(window_bytes, spans, preds, region_ids, offset_ids)
     cat_rows = category_accuracy(records)
+    elem_rows = element_accuracy(records)
     overall_acc = sum(1 for r in records if r.get("correct")) / max(1, len(records))
     overall_bits = sum(-math.log2(max(r["p_target"], 1e-12)) for r in records) / max(1, len(records))
 
@@ -386,11 +441,15 @@ def main() -> None:
         freerun = _freerun_diff(model, item, dataset, device, args)
 
     title = f"Byte diagnosis - {args.checkpoint_dir.name} - {Path(summary['h264_path']).name}"
-    htmlout = render_html(records, title=title, summary=summary, cat_rows=cat_rows, freerun=freerun)
+    htmlout = render_html(
+        records, title=title, summary=summary, cat_rows=cat_rows,
+        elem_rows=elem_rows, freerun=freerun,
+    )
     stem = f"diagnose_{args.checkpoint_dir.name}_w{args.window_index}"
     (args.out_dir / f"{stem}.html").write_text(htmlout, encoding="utf-8")
     (args.out_dir / f"{stem}_bytes.json").write_text(
         json.dumps({"summary": summary, "category_accuracy": cat_rows,
+                    "element_accuracy": elem_rows,
                     "records": [_record_json(r) for r in records], "freerun": freerun},
                    indent=2), encoding="utf-8")
     (args.out_dir / "config.json").write_text(json.dumps(jsonable(vars(args)), indent=2), encoding="utf-8")
