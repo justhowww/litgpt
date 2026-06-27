@@ -737,7 +737,10 @@ def parse_nal(
         result.reason = str(exc)
         result.desync_bit = reader.pos
         record.fill_to_trailing("unsupported_remainder", reader, Category.UNKNOWN)
-    except (BitReaderError, _DesyncError) as exc:
+    except (BitReaderError, _DesyncError, ValueError) as exc:
+        # ValueError covers a CAVLC VLC-table miss (h264_cavlc_tables.decode_vlc)
+        # on an invalid bitstream -- e.g. the model's free-run output. That is a
+        # desync, not a crash: report the location like any other desync.
         result.status = ParseStatus.DESYNC
         result.reason = str(exc)
         result.desync_bit = reader.pos
