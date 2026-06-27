@@ -403,10 +403,11 @@ def _teacher_forced(model, item, device, top_k: int) -> list[dict[str, Any]]:
     region = item["region_ids"].to(device).unsqueeze(0)
     offset = item["offset_ids"].to(device).unsqueeze(0)
     labels = item["labels"]
-    L = input_ids.size(1)
+    # Full teacher-forced forward: no input_pos (that path demands a KV cache);
+    # input_pos=None gives the default causal mask + arange positions, which is
+    # exactly teacher forcing.
     with torch.no_grad():
-        logits = raw(input_ids, input_pos=torch.arange(L, device=device),
-                     input_pos_maxp1=L, region_ids=region, offset_ids=offset)
+        logits = raw(input_ids, region_ids=region, offset_ids=offset)
     logits = logits[0, :, :256].float()
     probs = torch.softmax(logits, dim=-1)
     argmax = probs.argmax(dim=-1)
