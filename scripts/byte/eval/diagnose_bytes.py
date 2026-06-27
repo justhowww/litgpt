@@ -338,9 +338,20 @@ def main() -> None:
         rows, args.max_window_bytes, min_frames=args.min_frames, nal_index=nal_index
     )
     needed = args.prefix_frames + args.cont_frames
-    qualifying = [i for i, s in enumerate(dataset.samples) if s.num_frames >= needed]
+    # Only windows that begin at the SPS are self-contained (parseable / decodable).
+    # ~27% of windows start at the IDR because _windows_for_video's back-up stops at
+    # an intervening SEI/AUD and drops the SPS/PPS; those can't be parsed, so skip
+    # them here. (See the _windows_for_video back-up note.)
+    qualifying = [
+        i for i, s in enumerate(dataset.samples)
+        if s.num_frames >= needed
+        and nal_index[str(s.h264_path)][s.start_nal].nal_type == HS.NAL_SPS
+    ]
     if not qualifying:
-        raise SystemExit(f"No window has >= {needed} frames; lower --prefix/--cont-frames.")
+        raise SystemExit(
+            f"No self-contained (SPS-anchored) window has >= {needed} frames; "
+            "lower --prefix/--cont-frames."
+        )
     item = dataset[qualifying[min(args.window_index, len(qualifying) - 1)]]
 
     window_bytes = bytes(item["labels"].tolist())
