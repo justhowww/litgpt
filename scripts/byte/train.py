@@ -23,6 +23,7 @@ from litgpt.byte.data import (
     vocab_size_for_fim_format,
 )
 from litgpt.byte.reconstruction import ReconstructionEvalConfig
+from litgpt.byte.free_run_eval import FreeRunEvalConfig
 from litgpt.pretrain import setup
 
 
@@ -80,6 +81,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reconstruction-timeout-sec", type=int, default=30)
     parser.add_argument("--reconstruction-max-target-bytes", type=int, default=2048)
+    # Free-running (H0 generation) validation probe: parser-based survival-length +
+    # validity on a fixed SPS-anchored continuation set. Measures what val CE
+    # cannot (exposure-bias / illegal-token tail). 0 disables. Window/AR only.
+    parser.add_argument("--free-run-eval-interval", type=int, default=0)
+    parser.add_argument("--free-run-eval-clips", type=int, default=8)
+    parser.add_argument("--free-run-prefix-frames", type=int, default=8)
+    parser.add_argument("--free-run-cont-frames", type=int, default=4)
+    parser.add_argument("--free-run-temperature", type=float, default=1.0)
+    parser.add_argument("--free-run-max-gen-multiple", type=float, default=2.0)
     parser.add_argument(
         "--reconstruction-oracle-length",
         action="store_true",
@@ -382,6 +392,19 @@ def main() -> None:
         if args.reconstruction_eval_interval > 0
         else None
     )
+    free_run_eval = (
+        FreeRunEvalConfig(
+            interval=args.free_run_eval_interval,
+            num_clips=args.free_run_eval_clips,
+            prefix_frames=args.free_run_prefix_frames,
+            cont_frames=args.free_run_cont_frames,
+            temperature=args.free_run_temperature,
+            max_gen_multiple=args.free_run_max_gen_multiple,
+            seed=args.seed,
+        )
+        if args.free_run_eval_interval > 0
+        else None
+    )
     mrt = MRTConfig(
         interval=args.mrt_interval,
         start_step=args.mrt_start_step,
@@ -429,6 +452,7 @@ def main() -> None:
         eos_loss_weight=args.eos_loss_weight,
         eos_aux_loss_weight=args.eos_aux_loss_weight,
         mrt=mrt,
+        free_run_eval=free_run_eval,
     )
 
 

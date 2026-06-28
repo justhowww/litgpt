@@ -20,6 +20,7 @@ from torchmetrics.aggregation import RunningMean
 
 from litgpt import Tokenizer
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
+from litgpt.byte.free_run_eval import FreeRunEvalConfig
 from litgpt.byte.mrt import MRTConfig
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
@@ -92,6 +93,7 @@ def setup(
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
+    free_run_eval: FreeRunEvalConfig | None = None,
 ):
     """Pretrain a model.
 
@@ -198,6 +200,7 @@ def setup(
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
         mrt=mrt,
+        free_run_eval=free_run_eval,
     )
 
 
@@ -224,6 +227,7 @@ def main(
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
+    free_run_eval: FreeRunEvalConfig | None = None,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -268,6 +272,7 @@ def main(
         eos_aux_loss_weight=eos_aux_loss_weight,
         reconstruction_config=reconstruction_eval,
         mrt_config=mrt,
+        free_run_config=free_run_eval,
     )
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
@@ -574,6 +579,14 @@ def fit(
                 fabric, model, state["iter_num"] - 1
             )
             last_reconstruction_step = state["step_count"]
+
+        if (
+            byte_runtime.free_run_due(state["step_count"])
+            and not is_accumulating
+        ):
+            byte_runtime.evaluate_free_run(
+                fabric, model, state["iter_num"] - 1
+            )
 
     # Final validation
     if eval.final_validation:

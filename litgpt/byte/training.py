@@ -36,6 +36,12 @@ from litgpt.byte.reconstruction import (
     save_reconstruction_sample_manifest,
     select_reconstruction_samples,
 )
+from litgpt.byte.free_run_eval import (
+    FreeRunEvalConfig,
+    FreeRunSample,
+    prepare_free_run_samples,
+    run_free_run_eval,
+)
 from litgpt.utils import chunked_cross_entropy
 
 
@@ -53,6 +59,8 @@ class ByteTrainingRuntime:
     )
     mrt_config: MRTConfig | None = None
     mrt_samples: list[ReconstructionSample] = field(default_factory=list)
+    free_run_config: FreeRunEvalConfig | None = None
+    free_run_samples: list[FreeRunSample] = field(default_factory=list)
 
     @classmethod
     def prepare(
@@ -68,6 +76,7 @@ class ByteTrainingRuntime:
         eos_aux_loss_weight: float,
         reconstruction_config: ReconstructionEvalConfig | None,
         mrt_config: MRTConfig | None,
+        free_run_config: FreeRunEvalConfig | None = None,
     ) -> "ByteTrainingRuntime":
         """Select fixed probe/MRT contexts once before distributed wrapping."""
         reconstruction_samples: dict[str, list[ReconstructionSample]] = {}
@@ -131,6 +140,23 @@ class ByteTrainingRuntime:
                 f"{mrt_config.interval} steps, risk={mrt_config.risk_mode}"
             )
 
+        free_run_samples: list[FreeRunSample] = []
+        if free_run_config is not None and free_run_config.enabled:
+            if fabric.world_size != 1:
+                fabric.print(
+                    "Free-run validation currently requires a single-device run; "
+                    "disabling it."
+                )
+                free_run_config = None
+            else:
+                free_run_samples = prepare_free_run_samples(val_dataset, free_run_config)
+                fabric.print(
+                    f"Free-run validation: {len(free_run_samples)} SPS-anchored "
+                    f"continuation clips every {free_run_config.interval} steps"
+                )
+                if not free_run_samples:
+                    free_run_config = None
+
         if ce_loss_weight < 0:
             raise ValueError("CE loss weight must be non-negative")
         return cls(
@@ -142,6 +168,8 @@ class ByteTrainingRuntime:
             reconstruction_samples=reconstruction_samples,
             mrt_config=mrt_config,
             mrt_samples=mrt_samples,
+            free_run_config=free_run_config,
+            free_run_samples=free_run_samples,
         )
 
     def loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -328,6 +356,42 @@ class ByteTrainingRuntime:
             self._log_reconstruction_visualizations(
                 fabric, task, visualizations, log_step
             )
+
+    def free_run_due(self, step: int) -> bool:
+        return (
+            self.free_run_config is not None
+            and bool(self.free_run_samples)
+            and step % self.free_run_config.interval == 0
+        )
+
+    def evaluate_free_run(
+        self, fabric: Fabric, model: nn.Module, log_step: int
+    ) -> None:
+        """Free-run generation probe: parser-based survival-length + validity.
+
+        Measures what val CE cannot (exposure-bias / the illegal-token tail). See
+        litgpt/byte/free_run_eval.py.
+        """
+        if self.free_run_config is None or not self.free_run_samples:
+            return
+        try:
+            metrics = run_free_run_eval(
+                model, self.free_run_samples, fabric.device, self.free_run_config
+            )
+        except Exception as exc:  # a probe must never crash training
+            fabric.print(
+                f"Free-run validation failed ({type(exc).__name__}: {exc}); skipping."
+            )
+            return
+        if not metrics:
+            return
+        fabric.print(
+            "Free-run validation | survival_bytes "
+            f"{metrics.get('val_freerun/survival_bytes', 0.0):.0f} | "
+            f"full_cont_rate {metrics.get('val_freerun/full_continuation_rate', 0.0):.3f} | "
+            f"start_codes {metrics.get('val_freerun/start_codes_emitted', 0.0):.2f}"
+        )
+        fabric.log_dict(metrics, step=log_step)
 
     @staticmethod
     def _log_reconstruction_visualizations(
