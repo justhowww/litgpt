@@ -43,6 +43,13 @@ BLOCK_SIZE=${BLOCK_SIZE:-16384}
 STEPS=${STEPS:-400000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+# Distributed: DEVICES GPUs per node, NUM_NODES nodes. devices*num_nodes>1 makes
+# litgpt switch to FSDP (HYBRID_SHARD, per-Block) automatically. The sbatch MUST
+# request --ntasks-per-node=DEVICES (one rank per GPU) or srun gives only 1 rank.
+# GLOBAL_BATCH_SIZE must stay divisible by MICRO_BATCH_SIZE*DEVICES*NUM_NODES
+# (64/(1*4)=16 accumulation steps per GPU).
+DEVICES=${DEVICES:-1}
+NUM_NODES=${NUM_NODES:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
 WINDOW_MIN_FRAMES=${WINDOW_MIN_FRAMES:-2}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
@@ -84,6 +91,8 @@ cmd=(
     --steps "${STEPS}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --micro-batch-size "${MICRO_BATCH_SIZE}"
+    --devices "${DEVICES}"
+    --num-nodes "${NUM_NODES}"
     --precision bf16-mixed
     --logger-name "${LOGGER_NAME}"
     --num-workers "${NUM_WORKERS}"
@@ -103,7 +112,7 @@ if [[ "${COMPILE}" == "1" ]]; then
     cmd+=(--compile)
 fi
 
-echo "[stage0-1p3b] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} (head_dim $((N_EMBD / N_HEAD))) block=${BLOCK_SIZE} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} free_run_interval=${FREE_RUN_INTERVAL}"
+echo "[stage0-1p3b] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} (head_dim $((N_EMBD / N_HEAD))) block=${BLOCK_SIZE} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} devices=${DEVICES} num_nodes=${NUM_NODES} free_run_interval=${FREE_RUN_INTERVAL}"
 
 flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2

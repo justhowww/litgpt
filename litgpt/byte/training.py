@@ -142,20 +142,22 @@ class ByteTrainingRuntime:
 
         free_run_samples: list[FreeRunSample] = []
         if free_run_config is not None and free_run_config.enabled:
-            if fabric.world_size != 1:
-                fabric.print(
-                    "Free-run validation currently requires a single-device run; "
-                    "disabling it."
-                )
+            # Selection is deterministic, so every rank builds the same fixed clips.
+            # On multi-GPU the probe runs on rank 0 via FSDP summon_full_params
+            # (see evaluate_free_run), so it is NOT disabled for world_size > 1.
+            free_run_samples = prepare_free_run_samples(val_dataset, free_run_config)
+            fabric.print(
+                f"Free-run validation: {len(free_run_samples)} SPS-anchored "
+                f"continuation clips every {free_run_config.interval} steps"
+            )
+            if not free_run_samples:
                 free_run_config = None
-            else:
-                free_run_samples = prepare_free_run_samples(val_dataset, free_run_config)
+            elif fabric.world_size > 1:
                 fabric.print(
-                    f"Free-run validation: {len(free_run_samples)} SPS-anchored "
-                    f"continuation clips every {free_run_config.interval} steps"
+                    "Free-run validation will run on rank 0 via FSDP "
+                    "summon_full_params on multi-GPU; verify the first probe does "
+                    "not hang (else set --free-run-eval-interval 0 and eval offline)."
                 )
-                if not free_run_samples:
-                    free_run_config = None
 
         if ce_loss_weight < 0:
             raise ValueError("CE loss weight must be non-negative")
@@ -374,24 +376,51 @@ class ByteTrainingRuntime:
         """
         if self.free_run_config is None or not self.free_run_samples:
             return
+        metrics: dict[str, float] = {}
+        if fabric.world_size > 1:
+            # FSDP shards params across ranks, so a plain forward needs all ranks.
+            # Gather full params on every rank (a collective ALL must enter), then
+            # generate + log on rank 0 only. _fsdp_summon_full_params is
+            # deterministic across ranks, so all ranks take the same branch (no
+            # mixed enter/return -> no deadlock); it returns None -> skip (not hang)
+            # if the FSDP module can't be located.
+            summon = _fsdp_summon_full_params(model)
+            if summon is None:
+                if fabric.global_rank == 0:
+                    fabric.print(
+                        "Free-run validation: FSDP module not found for summon; "
+                        "skipping on multi-GPU."
+                    )
+                return
+            with summon:
+                if fabric.global_rank == 0:
+                    metrics = self._run_free_run_guarded(fabric, model)
+        else:
+            metrics = self._run_free_run_guarded(fabric, model)
+
+        if fabric.global_rank == 0 and metrics:
+            fabric.print(
+                "Free-run validation | survival_bytes "
+                f"{metrics.get('val_freerun/survival_bytes', 0.0):.0f} | "
+                f"full_cont_rate {metrics.get('val_freerun/full_continuation_rate', 0.0):.3f} | "
+                f"start_codes {metrics.get('val_freerun/start_codes_emitted', 0.0):.2f}"
+            )
+            fabric.log_dict(metrics, step=log_step)
+        if fabric.world_size > 1:
+            fabric.barrier()
+
+    def _run_free_run_guarded(
+        self, fabric: Fabric, model: nn.Module
+    ) -> dict[str, float]:
         try:
-            metrics = run_free_run_eval(
+            return run_free_run_eval(
                 model, self.free_run_samples, fabric.device, self.free_run_config
             )
         except Exception as exc:  # a probe must never crash training
             fabric.print(
                 f"Free-run validation failed ({type(exc).__name__}: {exc}); skipping."
             )
-            return
-        if not metrics:
-            return
-        fabric.print(
-            "Free-run validation | survival_bytes "
-            f"{metrics.get('val_freerun/survival_bytes', 0.0):.0f} | "
-            f"full_cont_rate {metrics.get('val_freerun/full_continuation_rate', 0.0):.3f} | "
-            f"start_codes {metrics.get('val_freerun/start_codes_emitted', 0.0):.2f}"
-        )
-        fabric.log_dict(metrics, step=log_step)
+            return {}
 
     @staticmethod
     def _log_reconstruction_visualizations(
@@ -463,6 +492,30 @@ class ByteTrainingRuntime:
                         f"{task} sample {visualization.sample_index}: "
                         f"{type(exc).__name__}: {exc}"
                     )
+
+
+def _fsdp_summon_full_params(model: nn.Module):
+    """Return an all-ranks context that materializes full FSDP params (so rank 0
+    can run a local forward for the free-run probe), or ``None`` if no FSDP module
+    is found. MUST be entered by every rank together — call it on all ranks and
+    enter the resulting context on all ranks to avoid a collective deadlock.
+    """
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    except Exception:
+        return None
+    seen: list[int] = []
+    stack: list[nn.Module | None] = [model]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.append(id(current))
+        if isinstance(current, FSDP):
+            return FSDP.summon_full_params(current, writeback=False, recurse=True)
+        for attr in ("_forward_module", "module", "_orig_mod"):
+            stack.append(getattr(current, attr, None))
+    return None
 
 
 def get_model_inputs_and_targets(
