@@ -28,6 +28,14 @@ EXCLUDE_NODES=${EXCLUDE_NODES:-}
 if [[ -n "${EXCLUDE_NODES}" ]]; then
     sbatch_args+=(--exclude="${EXCLUDE_NODES}")
 fi
+# Extra sbatch CLI flags from a parametric wrapper (e.g. submit_multigpu.sh sets
+# --gpus=<type>:<n> --ntasks-per-node=<n>). CLI flags override the job script's
+# #SBATCH defaults, so the generic train_multigpu.sbatch needs no per-run edit.
+SBATCH_OVERRIDES=${SBATCH_OVERRIDES:-}
+if [[ -n "${SBATCH_OVERRIDES}" ]]; then
+    # shellcheck disable=SC2206
+    sbatch_args+=(${SBATCH_OVERRIDES})
+fi
 
 job_id=$(sbatch "${sbatch_args[@]}" "${JOB_SCRIPT}")
 echo "Submitted Stage 0 multi-frame AR-1p3b training job ${job_id}"
