@@ -8,7 +8,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=96G
+# Host RAM (not VRAM). seff on a full 1-GPU run measured 61.78 GB peak; 80 GB
+# leaves ~30% headroom for the checkpoint-save spike. (Was 96 GB / 64% used.)
+#SBATCH --mem=80G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=slurm-%x-%j.out
 

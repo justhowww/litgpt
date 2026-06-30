@@ -28,8 +28,21 @@ fi
 export JOB_SCRIPT="${SCRIPT_DIR}/train_multigpu.sbatch"
 # One rank per GPU; FSDP shards across them. DEVICES is read by train.sh.
 export DEVICES="${NGPU}"
-# Override the job script's GRES + task count on the sbatch CLI (handled in submit.sh).
-export SBATCH_OVERRIDES="--gpus=${GPU_TYPE}:${NGPU} --ntasks-per-node=${NGPU}"
+# Override the job script's GRES + task count on the sbatch CLI (handled in
+# submit.sh). A config-specific job name makes concurrent variants (e.g. a race)
+# distinguishable in squeue. Override with JOB_NAME=... if desired.
+JOB_NAME=${JOB_NAME:-"byte-stage0-1p3b-${GPU_TYPE}-${NGPU}gpu"}
 
-echo "[multigpu] GPU_TYPE=${GPU_TYPE} NGPU=${NGPU} (1 rank/GPU, single node)"
+# Host RAM scales ~per-rank: each rank runs its own dataloaders and loads the
+# manifest/NAL-index, plus a rank-0 spike when the fp32 state is gathered for
+# checkpointing. A full 1-GPU run measured 61.78 GB peak, so default to ~56 GB
+# per rank + 16 GB headroom. NUM_WORKERS is per-rank; 4 is plenty once NGPU>1 and
+# meaningfully cuts host RAM vs the single-GPU default of 8. Tune MEM/NUM_WORKERS
+# after `seff`-ing a real multi-GPU run; all three are overridable via env.
+MEM=${MEM:-"$(( NGPU * 56 + 16 ))G"}
+CPUS_PER_TASK=${CPUS_PER_TASK:-8}
+export NUM_WORKERS=${NUM_WORKERS:-4}
+export SBATCH_OVERRIDES="--gpus=${GPU_TYPE}:${NGPU} --ntasks-per-node=${NGPU} --job-name=${JOB_NAME} --mem=${MEM} --cpus-per-task=${CPUS_PER_TASK}"
+
+echo "[multigpu] GPU_TYPE=${GPU_TYPE} NGPU=${NGPU} mem=${MEM} cpus/task=${CPUS_PER_TASK} workers/rank=${NUM_WORKERS} (1 rank/GPU, single node)"
 exec bash "${SCRIPT_DIR}/submit.sh"
