@@ -61,6 +61,7 @@ from litgpt.byte.data import (  # noqa: E402
     load_manifest_rows,
     load_nal_index,
 )
+from litgpt.byte.free_run_eval import _survival_and_validity, free_run_rollout  # noqa: E402
 from litgpt.byte.reconstruction import image_psnr, image_ssim, parse_ppm  # noqa: E402
 from scripts.byte.eval.eval_checkpoints import jsonable, load_model, save_png  # noqa: E402
 
@@ -101,6 +102,16 @@ def parse_args() -> argparse.Namespace:
         "intra generation). Reported separately as mode=intra.",
     )
     parser.add_argument("--no-eval-intra", dest="eval_intra", action="store_false")
+    parser.add_argument(
+        "--eval-teacher-forced",
+        action="store_true",
+        default=True,
+        help="Also run a teacher-forced pass over the continuation clips: one "
+        "full-window forward with GT bytes always fed in, reporting per-byte top-1 "
+        "accuracy and whether the argmax reconstruction decodes. Isolates local "
+        "bit-fidelity from free-run error accumulation (mode=teacher_forced).",
+    )
+    parser.add_argument("--no-eval-teacher-forced", dest="eval_teacher_forced", action="store_false")
     parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy.")
     parser.add_argument("--viz-fps", type=int, default=6)
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
@@ -151,6 +162,14 @@ def main() -> None:
             append_jsonl(metrics_path, [summary])
             append_jsonl(details_path, details)
             print(json.dumps(summary, indent=2), flush=True)
+        if args.eval_teacher_forced:
+            tf_summary, tf_details = evaluate_teacher_forced(
+                model, clips, nal_index, args, device, name
+            )
+            summaries.append(tf_summary)
+            append_jsonl(metrics_path, [tf_summary])
+            append_jsonl(details_path, tf_details)
+            print(json.dumps(tf_summary, indent=2), flush=True)
         del model
 
     write_summary_csv(args.out_dir / "summary.csv", summaries)
@@ -261,6 +280,7 @@ def evaluate_checkpoint(
     cont_psnr: list[float] = []
     cont_ssim: list[float] = []
     frames_made: list[int] = []
+    survivals: list[int] = []
     details: list[dict[str, Any]] = []
     viz: dict[int, dict[str, Any]] = {}
     # Distributional-plausibility feature populations (metric 3). Appearance is
@@ -312,6 +332,11 @@ def evaluate_checkpoint(
         decode_ok += int(model_status == "decoded")
         full_count += int(strict_valid)
 
+        # Byte-level survival: bytes generated before the first CAVLC desync in a
+        # generated VCL NAL (same definition as the in-loop val_freerun probe).
+        survival, _valid_cont, _sc = _survival_and_validity(prefix_bytes, gen_bytes, m)
+        survivals.append(survival)
+
         clip_psnr: list[float] = []
         clip_ssim: list[float] = []
         for t in range(n, n + m):
@@ -334,6 +359,7 @@ def evaluate_checkpoint(
             "frames_target": m,
             "start_codes_emitted": gen_frames_emitted,
             "strict_valid": strict_valid,
+            "survival_bytes": survival,
             "gen_bytes": len(gen_bytes),
             "gt_cont_bytes": gt_cont_len,
             "cont_psnr_mean": mean(clip_psnr),
@@ -356,6 +382,9 @@ def evaluate_checkpoint(
         "decode_rate": decode_ok / attempted if attempted else 0.0,
         "full_continuation_rate": full_count / attempted if attempted else 0.0,
         "frames_generated_mean": mean(frames_made),
+        "survival_bytes_mean": mean([float(s) for s in survivals]),
+        "survival_bytes_median": float(sorted(survivals)[len(survivals) // 2]) if survivals else None,
+        "survival_bytes_max": float(max(survivals)) if survivals else None,
         "frames_target": clips[0].cont_frames if clips else 0,
         "cont_psnr_mean": mean(cont_psnr),
         "cont_ssim_mean": mean(cont_ssim),
@@ -364,6 +393,144 @@ def evaluate_checkpoint(
     }
     summary.update(distribution_metrics(real_app, gen_app, real_mot, gen_mot))
     return summary, details, viz
+
+
+@torch.inference_mode()
+def evaluate_teacher_forced(
+    model: torch.nn.Module,
+    clips: list[ContinuationClip],
+    nal_index: dict[str, list[NALUnit]],
+    args: argparse.Namespace,
+    device: torch.device,
+    checkpoint_name: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Teacher-forced continuation probe on the same clips as mode=continuation.
+
+    One full-window forward with the GROUND-TRUTH bytes always fed in (no
+    autoregression), then per continuation byte compare argmax(logits) to the GT
+    byte. Two readings:
+      * ``tf_byte_acc`` -- local bit-fidelity. Free-run survival is ~1/(1-acc), so
+        this predicts how far greedy free-run can stay on-manifold.
+      * ``tf_recon_*`` -- decode the argmax reconstruction (each byte conditioned
+        on GT, i.e. accumulation removed). If this decodes but free-run collapses,
+        the failure is exposure bias; if even this fails, the model cannot emit a
+        bit-exact CAVLC slice when shown the truth (a fidelity wall).
+    """
+    raw = model.module if hasattr(model, "module") else model
+    raw.eval()
+    max_seq = int(raw.max_seq_length)
+
+    details: list[dict[str, Any]] = []
+    byte_accs: list[float] = []
+    ces: list[float] = []
+    recon_psnr: list[float] = []
+    recon_ssim: list[float] = []
+    recon_decode_ok = 0
+    recon_full = 0
+    skipped = 0
+    attempted = 0
+
+    for clip_idx, clip in enumerate(clips):
+        with open(clip.h264_path, "rb") as handle:
+            data = handle.read()
+        nals = nal_index[str(clip.h264_path)]
+        prefix_bytes = _concat_nals(data, nals, 0, clip.prefix_end_nal)
+        gt_bytes = _concat_nals(data, nals, 0, clip.cont_end_nal)
+        prefix_len = len(prefix_bytes)
+        total_len = len(gt_bytes)
+        if total_len - prefix_len <= 0:
+            continue
+        # One BOS + all GT bytes must fit the context window.
+        if total_len + 1 > max_seq:
+            skipped += 1
+            details.append({
+                "checkpoint": checkpoint_name, "clip_index": clip_idx,
+                "status": "skipped_too_long", "window_bytes": total_len,
+            })
+            continue
+        attempted += 1
+
+        prompt_ids, region_ids, offset_ids = _prompt_tensors(gt_bytes, nals, clip.cont_end_nal)
+        prompt_ids = prompt_ids.to(device).unsqueeze(0)
+        region_ids = region_ids.to(device).unsqueeze(0)
+        offset_ids = offset_ids.to(device).unsqueeze(0)
+        seq_len = prompt_ids.size(1)  # BOS + total_len
+
+        cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
+        raw.set_kv_cache(batch_size=1, max_seq_length=seq_len, device=device, dtype=cache_dtype)
+        try:
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                logits = raw(
+                    prompt_ids,
+                    input_pos=torch.arange(seq_len, device=device),
+                    input_pos_maxp1=seq_len,
+                    region_ids=region_ids,
+                    offset_ids=offset_ids,
+                )
+        finally:
+            raw.clear_kv_cache()
+
+        # token = [BOS, gt_0, ..., gt_{L-1}]; logits[:, j] predicts token[j+1] = gt_j.
+        # Continuation bytes are gt_j for j in [prefix_len, total_len-1].
+        gt_ids = bytes_to_ids(gt_bytes).to(device)
+        cont_logits = logits[0, prefix_len:total_len, :BYTE_VOCAB_SIZE].float()
+        cont_targets = gt_ids[prefix_len:total_len]
+        pred_ids = cont_logits.argmax(dim=-1)
+        acc = float((pred_ids == cont_targets).float().mean())
+        ce = float(torch.nn.functional.cross_entropy(cont_logits, cont_targets))
+        byte_accs.append(acc)
+        ces.append(ce)
+
+        # Teacher-forced argmax reconstruction (accumulation removed) -> decode.
+        recon_bytes = prefix_bytes + bytes(pred_ids.tolist())
+        gt_frames, _ = decode_h264(gt_bytes, args, strict=False)
+        model_frames, status = decode_h264(recon_bytes, args, strict=True)
+        if not model_frames:
+            model_frames, status = decode_h264(recon_bytes, args, strict=False)
+        n, m = clip.prefix_frames, clip.cont_frames
+        strict_valid = status == "decoded" and len(model_frames) >= n + m
+        recon_decode_ok += int(status == "decoded")
+        recon_full += int(strict_valid)
+
+        clip_psnr: list[float] = []
+        clip_ssim: list[float] = []
+        for t in range(n, n + m):
+            if t < len(model_frames) and t < len(gt_frames) and model_frames[t].shape == gt_frames[t].shape:
+                p = image_psnr(gt_frames[t], model_frames[t])
+                clip_psnr.append(PSNR_PERFECT_CAP if p == float("inf") else p)
+                clip_ssim.append(image_ssim(gt_frames[t], model_frames[t]))
+        recon_psnr.extend(clip_psnr)
+        recon_ssim.extend(clip_ssim)
+
+        details.append({
+            "checkpoint": checkpoint_name,
+            "clip_index": clip_idx,
+            "h264_path": str(clip.h264_path),
+            "cont_bytes": total_len - prefix_len,
+            "tf_byte_acc": acc,
+            "tf_ce_nats": ce,
+            "recon_status": status,
+            "recon_frames": max(0, len(model_frames) - n),
+            "recon_strict_valid": strict_valid,
+            "recon_psnr_mean": mean(clip_psnr),
+        })
+
+    summary = {
+        "checkpoint": checkpoint_name,
+        "mode": "teacher_forced",
+        "num_clips": attempted,
+        "num_skipped_too_long": skipped,
+        "tf_byte_acc_mean": mean(byte_accs),
+        "tf_ce_nats_mean": mean(ces),
+        "tf_recon_decode_rate": recon_decode_ok / attempted if attempted else 0.0,
+        "tf_recon_full_rate": recon_full / attempted if attempted else 0.0,
+        "tf_recon_psnr_mean": mean(recon_psnr),
+        "tf_recon_ssim_mean": mean(recon_ssim),
+        "prefix_frames": clips[0].prefix_frames if clips else 0,
+        "cont_frames": clips[0].cont_frames if clips else 0,
+        "temperature": 0.0,
+    }
+    return summary, details
 
 
 def model_max_gen(model: torch.nn.Module, prefix_bytes: bytes) -> int:
@@ -392,58 +559,10 @@ def generate_continuation(
     prompt_ids = prompt_ids.to(device).unsqueeze(0)
     prompt_region = prompt_region.to(device).unsqueeze(0)
     prompt_offset = prompt_offset.to(device).unsqueeze(0)
-    prompt_len = prompt_ids.size(1)
-    if max_gen <= 0:
-        return b"", 0
-
-    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
-    raw.set_kv_cache(batch_size=1, max_seq_length=raw.max_seq_length, device=device, dtype=cache_dtype)
-    generated: list[int] = []
-    start_codes = 0
-    gen_offset = 0  # first generated byte is offset 0 of frame N's NAL
-    try:
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits = raw(
-                prompt_ids,
-                input_pos=torch.arange(prompt_len, device=device),
-                input_pos_maxp1=prompt_len,
-                region_ids=prompt_region,
-                offset_ids=prompt_offset,
-            )
-        for step in range(max_gen):
-            next_logits = logits[:, -1, :BYTE_VOCAB_SIZE]
-            if args.temperature <= 0:
-                token = int(next_logits.argmax(dim=-1))
-            else:
-                probs = torch.softmax(next_logits.float() / args.temperature, dim=-1)
-                token = int(torch.multinomial(probs, 1))
-            generated.append(token)
-
-            is_start = len(generated) >= 3 and tuple(generated[-3:]) == START_CODE
-            token_offset = gen_offset
-            if is_start:
-                start_codes += 1
-                if start_codes == cont_frames + 1:
-                    generated = generated[:-3]  # drop the partial next frame
-                    break
-                gen_offset = 3  # next byte is the header of the new NAL
-            else:
-                gen_offset = token_offset + 1
-            if step == max_gen - 1:
-                break
-
-            position = prompt_len + step
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = raw(
-                    torch.tensor([[token]], device=device),
-                    input_pos=torch.tensor([position], device=device),
-                    input_pos_maxp1=position + 1,
-                    region_ids=torch.full((1, 1), REGION_TARGET, device=device, dtype=torch.long),
-                    offset_ids=torch.full((1, 1), token_offset, device=device, dtype=torch.long),
-                )
-    finally:
-        raw.clear_kv_cache()
-    return bytes(generated), start_codes
+    # Shared rollout with the in-loop val_freerun probe -- do not reimplement here.
+    return free_run_rollout(
+        raw, prompt_ids, prompt_region, prompt_offset, device, cont_frames, max_gen, args.temperature
+    )
 
 
 def _prompt_tensors(prefix_bytes: bytes, nals: list[NALUnit], prefix_end_nal: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -587,9 +706,15 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
     if not summaries:
         return
-    fieldnames = list(summaries[0].keys())
+    # Union of keys across summaries: continuation/intra and teacher_forced report
+    # different columns, so keying off summaries[0] alone would drop or error.
+    fieldnames: list[str] = []
+    for summary in summaries:
+        for key in summary:
+            if key not in fieldnames:
+                fieldnames.append(key)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, restval="")
         writer.writeheader()
         for summary in summaries:
             writer.writerow(summary)
