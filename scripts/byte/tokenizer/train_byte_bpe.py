@@ -46,6 +46,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-videos", type=int, default=10000, help="Sample this many streams for training.")
     p.add_argument("--vocab-size", type=int, default=1024)
     p.add_argument("--min-frequency", type=int, default=2)
+    p.add_argument("--max-segment-bytes", type=int, default=1024,
+                   help="Truncate each NAL segment to this many bytes for BPE TRAINING (0 = no cap). "
+                        "Bounds peak memory (HF holds every word's symbols); merges come from frequent "
+                        "local patterns, so a prefix suffices. Does not affect the report/encoding.")
     p.add_argument("--reserve-start-code", action="store_true", default=True,
                    help="Split corpus on 00 00 01 and reserve <nal_start> (default).")
     p.add_argument("--no-reserve-start-code", dest="reserve_start_code", action="store_false")
@@ -75,11 +79,18 @@ def byte_segments(data: bytes, reserve_start_code: bool) -> list[bytes]:
     return [seg for seg in data.split(START_CODE) if seg]
 
 
-def corpus_iter(files: list[Path], reserve_start_code: bool):
-    """Yield latin-1 strings (each char == one raw byte -> lossless base alphabet)."""
+def corpus_iter(files: list[Path], reserve_start_code: bool, max_segment_bytes: int):
+    """Yield latin-1 strings (each char == one raw byte -> lossless base alphabet).
+
+    Segments are truncated to ``max_segment_bytes`` to bound trainer memory; this
+    only affects which patterns BPE *sees*, not encoding/decoding losslessness.
+    """
     for path in files:
         for seg in byte_segments(path.read_bytes(), reserve_start_code):
-            yield seg.decode("latin-1")
+            if max_segment_bytes:
+                seg = seg[:max_segment_bytes]
+            if seg:
+                yield seg.decode("latin-1")
 
 
 def encode_ids(tok: Tokenizer, data: bytes, reserve_start_code: bool, nal_start_id: int | None) -> list[int]:
@@ -128,8 +139,10 @@ def main() -> None:
         min_frequency=args.min_frequency,
         show_progress=True,
     )
-    tok.train_from_iterator(corpus_iter(files, args.reserve_start_code), trainer=trainer,
-                            length=len(files))
+    tok.train_from_iterator(
+        corpus_iter(files, args.reserve_start_code, args.max_segment_bytes),
+        trainer=trainer,
+    )
 
     tokenizer_path = args.out_dir / "tokenizer.json"
     tok.save(str(tokenizer_path))
