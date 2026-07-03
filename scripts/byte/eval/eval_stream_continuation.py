@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ from litgpt.byte.data import (  # noqa: E402
     load_manifest_rows,
     load_nal_index,
 )
+from litgpt.byte import h264_syntax as HS  # noqa: E402
 from litgpt.byte.free_run_eval import _survival_and_validity, free_run_rollout  # noqa: E402
 from litgpt.byte.reconstruction import image_psnr, image_ssim, parse_ppm  # noqa: E402
 from scripts.byte.eval.eval_checkpoints import jsonable, load_model, save_png  # noqa: E402
@@ -395,6 +397,42 @@ def evaluate_checkpoint(
     return summary, details, viz
 
 
+_INDEX_RE = re.compile(r"\[\d+\]")
+
+
+def _acc(counts: list[int]) -> float | None:
+    """Pooled accuracy hits/total, or None when the bucket is empty."""
+    return counts[0] / counts[1] if counts[1] else None
+
+
+def _syntax_buckets(gt_bytes: bytes, prefix_len: int, total_len: int) -> tuple[list[str], list[str]]:
+    """For each continuation byte offset in [prefix_len, total_len), return its H.264
+    syntax category string and normalized element name (array indices stripped).
+
+    Bytes not covered by any span -> "untagged" (GT is valid H.264, so ~0). A byte
+    straddles bit-packed elements; it is assigned to the first span (stream order)
+    that covers it -- a documented approximation, adequate for a coarse signal.
+    """
+    n = total_len - prefix_len
+    cat = ["untagged"] * n
+    elem = ["untagged"] * n
+    filled = [False] * n
+    for span in HS.parse_stream(gt_bytes, parse_slice_data=True).all_spans():
+        b0 = max(span.byte_start, prefix_len)
+        b1 = min(span.byte_end, total_len)
+        if b1 <= b0:
+            continue
+        cname = span.category.value
+        ename = _INDEX_RE.sub("", span.name)
+        for off in range(b0, b1):
+            i = off - prefix_len
+            if not filled[i]:
+                cat[i] = cname
+                elem[i] = ename
+                filled[i] = True
+    return cat, elem
+
+
 @torch.inference_mode()
 def evaluate_teacher_forced(
     model: torch.nn.Module,
@@ -408,13 +446,13 @@ def evaluate_teacher_forced(
 
     One full-window forward with the GROUND-TRUTH bytes always fed in (no
     autoregression), then per continuation byte compare argmax(logits) to the GT
-    byte. Two readings:
-      * ``tf_byte_acc`` -- local bit-fidelity. Free-run survival is ~1/(1-acc), so
-        this predicts how far greedy free-run can stay on-manifold.
-      * ``tf_recon_*`` -- decode the argmax reconstruction (each byte conditioned
-        on GT, i.e. accumulation removed). If this decodes but free-run collapses,
-        the failure is exposure bias; if even this fails, the model cannot emit a
-        bit-exact CAVLC slice when shown the truth (a fidelity wall).
+    byte. Readings:
+      * ``tf_byte_acc`` / ``tf_ce_nats`` -- overall local bit-fidelity (and a
+        cross-check that the forward is faithful: tf_ce tracks training val_loss_ar).
+      * ``syntax_acc`` / ``element_acc`` / flat ``acc_*`` -- the same top-1 accuracy
+        bucketed by H.264 syntax element, to localize where the model succeeds
+        (structural: start codes, NAL/slice headers, mb_type) vs fails (residual
+        coefficients, motion-vector deltas).
     """
     raw = model.module if hasattr(model, "module") else model
     raw.eval()
@@ -423,10 +461,9 @@ def evaluate_teacher_forced(
     details: list[dict[str, Any]] = []
     byte_accs: list[float] = []
     ces: list[float] = []
-    recon_psnr: list[float] = []
-    recon_ssim: list[float] = []
-    recon_decode_ok = 0
-    recon_full = 0
+    # Pooled (across-clip, byte-weighted) per-syntax accuracy: bucket -> [hits, total].
+    cat_acc: dict[str, list[int]] = {}
+    elem_acc: dict[str, list[int]] = {}
     skipped = 0
     attempted = 0
 
@@ -481,26 +518,17 @@ def evaluate_teacher_forced(
         byte_accs.append(acc)
         ces.append(ce)
 
-        # Teacher-forced argmax reconstruction (accumulation removed) -> decode.
-        recon_bytes = prefix_bytes + bytes(pred_ids.tolist())
-        gt_frames, _ = decode_h264(gt_bytes, args, strict=False)
-        model_frames, status = decode_h264(recon_bytes, args, strict=True)
-        if not model_frames:
-            model_frames, status = decode_h264(recon_bytes, args, strict=False)
-        n, m = clip.prefix_frames, clip.cont_frames
-        strict_valid = status == "decoded" and len(model_frames) >= n + m
-        recon_decode_ok += int(status == "decoded")
-        recon_full += int(strict_valid)
-
-        clip_psnr: list[float] = []
-        clip_ssim: list[float] = []
-        for t in range(n, n + m):
-            if t < len(model_frames) and t < len(gt_frames) and model_frames[t].shape == gt_frames[t].shape:
-                p = image_psnr(gt_frames[t], model_frames[t])
-                clip_psnr.append(PSNR_PERFECT_CAP if p == float("inf") else p)
-                clip_ssim.append(image_ssim(gt_frames[t], model_frames[t]))
-        recon_psnr.extend(clip_psnr)
-        recon_ssim.extend(clip_ssim)
+        # Per-syntax-element accuracy: parse the GT window, map each continuation
+        # byte to its syntax category / element, and bucket the argmax correctness.
+        hits = (pred_ids == cont_targets).tolist()
+        cat_of, elem_of = _syntax_buckets(gt_bytes, prefix_len, total_len)
+        for k, hit in enumerate(hits):
+            cat_acc.setdefault(cat_of[k], [0, 0])
+            cat_acc[cat_of[k]][0] += int(hit)
+            cat_acc[cat_of[k]][1] += 1
+            elem_acc.setdefault(elem_of[k], [0, 0])
+            elem_acc[elem_of[k]][0] += int(hit)
+            elem_acc[elem_of[k]][1] += 1
 
         details.append({
             "checkpoint": checkpoint_name,
@@ -509,12 +537,12 @@ def evaluate_teacher_forced(
             "cont_bytes": total_len - prefix_len,
             "tf_byte_acc": acc,
             "tf_ce_nats": ce,
-            "recon_status": status,
-            "recon_frames": max(0, len(model_frames) - n),
-            "recon_strict_valid": strict_valid,
-            "recon_psnr_mean": mean(clip_psnr),
         })
 
+    residual = [
+        cat_acc.get("residual_luma", [0, 0])[0] + cat_acc.get("residual_chroma", [0, 0])[0],
+        cat_acc.get("residual_luma", [0, 0])[1] + cat_acc.get("residual_chroma", [0, 0])[1],
+    ]
     summary = {
         "checkpoint": checkpoint_name,
         "mode": "teacher_forced",
@@ -522,10 +550,17 @@ def evaluate_teacher_forced(
         "num_skipped_too_long": skipped,
         "tf_byte_acc_mean": mean(byte_accs),
         "tf_ce_nats_mean": mean(ces),
-        "tf_recon_decode_rate": recon_decode_ok / attempted if attempted else 0.0,
-        "tf_recon_full_rate": recon_full / attempted if attempted else 0.0,
-        "tf_recon_psnr_mean": mean(recon_psnr),
-        "tf_recon_ssim_mean": mean(recon_ssim),
+        # Flat, grep-friendly headline accuracies (structure vs content).
+        "acc_start_code": _acc(cat_acc.get("start_code", [0, 0])),
+        "acc_nal_header": _acc(cat_acc.get("nal_header", [0, 0])),
+        "acc_slice_header": _acc(cat_acc.get("slice_header", [0, 0])),
+        "acc_mb_header": _acc(cat_acc.get("mb_header", [0, 0])),
+        "acc_mb_pred": _acc(cat_acc.get("mb_pred", [0, 0])),
+        "acc_cbp": _acc(cat_acc.get("cbp", [0, 0])),
+        "acc_residual": _acc(residual),
+        # Full breakdowns (nested; readable in JSONL).
+        "syntax_acc": {c: {"acc": h / t, "n": t} for c, (h, t) in sorted(cat_acc.items()) if t},
+        "element_acc": {e: {"acc": h / t, "n": t} for e, (h, t) in sorted(elem_acc.items()) if t >= 32},
         "prefix_frames": clips[0].prefix_frames if clips else 0,
         "cont_frames": clips[0].cont_frames if clips else 0,
         "temperature": 0.0,
