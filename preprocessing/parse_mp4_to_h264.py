@@ -37,11 +37,13 @@ class FFmpegConfig:
     level: str | None
     pix_fmt: str | None
     disable_audio: bool
+    disable_subtitles: bool
     disable_bframes: bool
     refs: int
     scene_cut_threshold: int
     threads: int | None
     timeout_sec: int | None
+    bitstream_filter: str | None
     x264_params: dict[str, int | str]
 
 
@@ -51,6 +53,7 @@ class PreprocessConfig:
     height: int
     resize_mode: str
     fps: int | None
+    clip_duration_sec: int | None
     rate_control: str
     qp: int
     crf: int | None
@@ -89,11 +92,13 @@ def load_config(path: Path) -> PreprocessConfig:
         level=ffmpeg_raw.get("level"),
         pix_fmt=ffmpeg_raw.get("pix_fmt"),
         disable_audio=ffmpeg_raw.get("disable_audio", True),
+        disable_subtitles=ffmpeg_raw.get("disable_subtitles", False),
         disable_bframes=ffmpeg_raw.get("disable_bframes", True),
         refs=ffmpeg_raw.get("refs", 1),
         scene_cut_threshold=ffmpeg_raw.get("scene_cut_threshold", 0),
         threads=ffmpeg_raw.get("threads"),
         timeout_sec=ffmpeg_raw.get("timeout_sec"),
+        bitstream_filter=ffmpeg_raw.get("bitstream_filter"),
         x264_params=ffmpeg_raw.get("x264_params", {}),
     )
 
@@ -102,6 +107,7 @@ def load_config(path: Path) -> PreprocessConfig:
         height=raw["height"],
         resize_mode=raw.get("resize_mode", "crop_resize"),
         fps=raw["fps"],
+        clip_duration_sec=raw.get("clip_duration_sec"),
         rate_control=raw.get("rate_control", "qp"),
         qp=raw["qp"],
         crf=raw.get("crf"),
@@ -122,6 +128,7 @@ def override_config(
             args.resize_mode if args.resize_mode is not None else config.resize_mode
         ),
         "fps": args.fps if args.fps is not None else config.fps,
+        "clip_duration_sec": config.clip_duration_sec,
         "rate_control": config.rate_control,
         "qp": args.qp if args.qp is not None else config.qp,
         "crf": config.crf,
@@ -204,6 +211,13 @@ def build_video_filter(config: PreprocessConfig) -> str:
             "x='(iw-ow)/2':y='(ih-oh)/2',"
             f"scale={config.width}:{config.height}"
         )
+    elif config.resize_mode == "scale_pad":
+        # Fit within target while preserving aspect ratio, then pad to exact size
+        # (AVC-LM style, letterbox/pillarbox with centered content).
+        spatial_filter = (
+            f"scale={config.width}:{config.height}:force_original_aspect_ratio=decrease,"
+            f"pad={config.width}:{config.height}:(ow-iw)/2:(oh-ih)/2"
+        )
     else:
         raise ValueError(f"unsupported resize_mode: {config.resize_mode}")
 
@@ -229,8 +243,14 @@ def build_encode_command(
     if video_filter:
         cmd.extend(["-vf", video_filter])
 
+    if config.clip_duration_sec is not None:
+        cmd.extend(["-t", str(config.clip_duration_sec)])
+
     if config.ffmpeg.disable_audio:
         cmd.append("-an")
+
+    if config.ffmpeg.disable_subtitles:
+        cmd.append("-sn")
 
     cmd.extend(
         [
@@ -280,6 +300,11 @@ def build_encode_command(
             *rate_control_args,
             "-preset",
             config.preset,
+            *(
+                ["-bsf:v", config.ffmpeg.bitstream_filter]
+                if config.ffmpeg.bitstream_filter
+                else []
+            ),
             "-f",
             config.ffmpeg.output_format,
             str(output_path),
@@ -347,6 +372,7 @@ def output_settings_to_manifest(config: PreprocessConfig) -> dict[str, Any]:
         "height": config.height,
         "resize_mode": config.resize_mode,
         "fps": config.fps,
+        "clip_duration_sec": config.clip_duration_sec,
         "codec": "h264_baseline_cavlc",
         "rate_control": config.rate_control,
         "qp": config.qp,
@@ -359,6 +385,7 @@ def output_settings_to_manifest(config: PreprocessConfig) -> dict[str, Any]:
         "pix_fmt": config.ffmpeg.pix_fmt,
         "refs": config.ffmpeg.refs,
         "threads": config.ffmpeg.threads,
+        "bitstream_filter": config.ffmpeg.bitstream_filter,
         "x264_params": {
             **config.ffmpeg.x264_params,
             **({"qp": config.qp} if config.rate_control == "qp" else {}),
@@ -600,6 +627,7 @@ def write_corpus_metadata(path: Path, config: PreprocessConfig) -> None:
             "height": config.height,
             "resize_mode": config.resize_mode,
             "fps": config.fps,
+            "clip_duration_sec": config.clip_duration_sec,
             "rate_control": config.rate_control,
             "qp": config.qp,
             "crf": config.crf,
@@ -615,11 +643,13 @@ def write_corpus_metadata(path: Path, config: PreprocessConfig) -> None:
                 "level": config.ffmpeg.level,
                 "pix_fmt": config.ffmpeg.pix_fmt,
                 "disable_audio": config.ffmpeg.disable_audio,
+                "disable_subtitles": config.ffmpeg.disable_subtitles,
                 "disable_bframes": config.ffmpeg.disable_bframes,
                 "refs": config.ffmpeg.refs,
                 "scene_cut_threshold": config.ffmpeg.scene_cut_threshold,
                 "threads": config.ffmpeg.threads,
                 "timeout_sec": config.ffmpeg.timeout_sec,
+                "bitstream_filter": config.ffmpeg.bitstream_filter,
                 "x264_params": config.ffmpeg.x264_params,
             },
         },

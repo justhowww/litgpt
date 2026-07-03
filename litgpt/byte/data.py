@@ -117,7 +117,9 @@ class ByteDataConfig:
     # ByteStreamWindowDataset: the multi-frame contiguous-stream AR objective used
     # for H0 (verifying the AVC-LM/JPEG-LM generation legacy). See 0616.md.
     dataset_mode: DatasetMode = "slice"
-    window_min_frames: int = 2  # Minimum VCL frames per stream window ("window" mode).
+    window_min_frames: int = 2  # Minimum VCL NALs per stream window ("window" mode).
+    # NB: counts VCL NALs, which == frames only for one-slice-per-frame corpora. Under
+    # AVC-LM's slice-max-mbs=1 (one slice per macroblock) this becomes a min-slices gate.
 
 
 @dataclass(frozen=True)
@@ -837,7 +839,8 @@ class WindowSample:
     h264_path: Path
     start_nal: int  # inclusive NAL index where the window begins (a GOP boundary)
     end_nal: int  # exclusive NAL index where the window ends
-    num_frames: int  # number of VCL NALs in the window
+    num_frames: int  # number of VCL NALs in the window (== frames iff one slice/frame;
+    # under slice-max-mbs=1 this is a slice count, not a frame count)
 
 
 class ByteStreamWindowDataset(Dataset):
