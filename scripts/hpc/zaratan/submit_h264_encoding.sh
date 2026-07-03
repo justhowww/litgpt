@@ -111,7 +111,7 @@ process_directory() {
     # --partial preserves an interrupted transfer for the next retry.
     echo "[stage] ${source_dir} -> ${staged_source_root}/${part_name}"
     mkdir -p "${staged_source_root}/${part_name}"
-    rsync -a --partial --info=progress2 \
+    rsync -rltp --no-g --no-o --partial --info=progress2 \
         "${source_dir}/" \
         "${staged_source_root}/${part_name}/"
 
@@ -148,7 +148,7 @@ process_directory() {
     if [[ "${BACKUP_TO_SHELL}" == "1" ]]; then
         echo "[copy-back] ${part_name}"
         mkdir -p "${SHELL_CORPUS}/h264/${part_name}"
-        rsync -a --partial --info=progress2 \
+        rsync -rltp --no-g --no-o --partial --info=progress2 \
             "${SCRATCH_CORPUS}/h264/${part_name}/" \
             "${SHELL_CORPUS}/h264/${part_name}/"
         cp "${scratch_part_manifest}" "${shell_part_manifest}"
