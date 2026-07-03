@@ -53,6 +53,11 @@ SBATCH_PARTITION=${SBATCH_PARTITION:-""}
 # scratch capacity can hold several staged source directories simultaneously.
 MAX_ACTIVE_DIRS=${MAX_ACTIVE_DIRS:-1}
 
+# Back up encoded H.264 + manifest to SHELL after each part. Set BACKUP_TO_SHELL=0
+# to skip the SHELL copy-back entirely (scratch corpus is still fully populated;
+# training reads scratch, not SHELL).
+BACKUP_TO_SHELL=${BACKUP_TO_SHELL:-1}
+
 # Fail before transferring data if required roots or settings are invalid.
 if [[ ! -d "${SOURCE_VIDEO_ROOT}" ]]; then
     echo "Source video root is missing: ${SOURCE_VIDEO_ROOT}" >&2
@@ -69,9 +74,12 @@ fi
 
 mkdir -p \
     "${SCRATCH_STAGE_ROOT}" \
-    "${SCRATCH_CORPUS}/h264" \
-    "${SHELL_CORPUS}/h264" \
-    "${SHELL_CORPUS}/manifest-parts"
+    "${SCRATCH_CORPUS}/h264"
+if [[ "${BACKUP_TO_SHELL}" == "1" ]]; then
+    mkdir -p \
+        "${SHELL_CORPUS}/h264" \
+        "${SHELL_CORPUS}/manifest-parts"
+fi
 
 # Each Slurm job writes an independent manifest shard. Serialize corpus-level
 # merges so concurrent directory jobs cannot overwrite one another.
@@ -131,20 +139,23 @@ process_directory() {
         return 1
     fi
 
-    # Phase 3: back up completed H.264 files to SHELL. A failed rsync exits this
-    # function before cleanup, leaving staged source and scratch H.264 intact.
-    echo "[copy-back] ${part_name}"
-    mkdir -p "${SHELL_CORPUS}/h264/${part_name}"
-    rsync -a --partial --info=progress2 \
-        "${SCRATCH_CORPUS}/h264/${part_name}/" \
-        "${SHELL_CORPUS}/h264/${part_name}/"
-    cp "${scratch_part_manifest}" "${shell_part_manifest}"
-
-    # Publish the shard into both corpus-level manifests. The scratch manifest
-    # is the one used by training; the SHELL manifest mirrors the backup copy.
+    # Publish the shard into the scratch corpus manifest that training reads.
     merge_manifest "${SCRATCH_CORPUS}" "${scratch_part_manifest}"
-    merge_manifest "${SHELL_CORPUS}" "${shell_part_manifest}"
-    cp "${SCRATCH_CORPUS}/corpus.json" "${SHELL_CORPUS}/corpus.json"
+
+    # Phase 3: optionally back up completed H.264 files to SHELL. A failed rsync
+    # exits this function before cleanup, leaving staged source and scratch H.264
+    # intact. Skipped entirely when BACKUP_TO_SHELL=0.
+    if [[ "${BACKUP_TO_SHELL}" == "1" ]]; then
+        echo "[copy-back] ${part_name}"
+        mkdir -p "${SHELL_CORPUS}/h264/${part_name}"
+        rsync -a --partial --info=progress2 \
+            "${SCRATCH_CORPUS}/h264/${part_name}/" \
+            "${SHELL_CORPUS}/h264/${part_name}/"
+        cp "${scratch_part_manifest}" "${shell_part_manifest}"
+        # Mirror the shard into the SHELL backup manifest.
+        merge_manifest "${SHELL_CORPUS}" "${shell_part_manifest}"
+        cp "${SCRATCH_CORPUS}/corpus.json" "${SHELL_CORPUS}/corpus.json"
+    fi
 
     # Phase 4: delete only temporary source data. realpath guards against an
     # empty or malformed variable turning rm into an out-of-tree deletion.
