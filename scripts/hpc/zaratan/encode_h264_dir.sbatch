@@ -15,6 +15,15 @@ set -euo pipefail
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 
+# ffmpeg/ffprobe are required before any source file can be probed. Prefer the
+# cluster module when available; conda-provided binaries still work as fallback.
+FFMPEG_MODULE=${FFMPEG_MODULE:-ffmpeg}
+if command -v module >/dev/null 2>&1; then
+    module load "${FFMPEG_MODULE}" || true
+fi
+command -v ffmpeg >/dev/null
+command -v ffprobe >/dev/null
+
 : "${STAGED_SOURCE_ROOT:?Set STAGED_SOURCE_ROOT to the scratch source root}"
 : "${SCRATCH_CORPUS:?Set SCRATCH_CORPUS to the persistent scratch H.264 corpus}"
 : "${PART_NAME:?Set PART_NAME to the staged source directory name}"
