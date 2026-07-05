@@ -107,6 +107,11 @@ class NALParse:
     desync_bit: int | None = None
     desync_byte: int | None = None
     reason: str | None = None
+    # Exception class at the desync, mapped to the failure mechanism: ValueError =
+    # VLC-table/codeword miss (the nC-governed layer for coeff_token); KeyError/
+    # IndexError = out-of-range syntax value used as a table key (within-block
+    # constraint); BitReaderError = ran off the end.
+    reason_kind: str | None = None
     mb_count: int | None = None
     # Bits of RBSP consumed when parsing stopped (for invariant A).
     consumed_bits: int | None = None
@@ -735,6 +740,7 @@ def parse_nal(
     except _Unsupported as exc:
         result.status = ParseStatus.UNSUPPORTED
         result.reason = str(exc)
+        result.reason_kind = "Unsupported"
         result.desync_bit = reader.pos
         record.fill_to_trailing("unsupported_remainder", reader, Category.UNKNOWN)
     except (BitReaderError, _DesyncError, ValueError, KeyError, IndexError) as exc:
@@ -745,6 +751,7 @@ def parse_nal(
         # location like any other desync rather than propagating.
         result.status = ParseStatus.DESYNC
         result.reason = str(exc)
+        result.reason_kind = type(exc).__name__
         result.desync_bit = reader.pos
         if reader.pos < reader.nbits and byte_map:
             result.desync_byte = byte_map[min(reader.pos, reader.nbits - 1) >> 3]

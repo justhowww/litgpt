@@ -152,6 +152,9 @@ def load_manifest_rows(
     max_rows: int | None = None,
     report_progress: bool = False,
 ) -> list[dict[str, Any]]:
+    """Each row contains a data entry. The attributes include:
+    1. id 2. src_path 3. h264_path 4. source information 5. output setting 6.
+    """
     rows: list[dict[str, Any]] = []
     manifest_dir = manifest_path.parent
     started_at = time.perf_counter()
@@ -228,7 +231,9 @@ class LazyNalIndex:
     it is safe across forked DataLoader workers.
     """
 
-    def __init__(self, index_path: Path, file_ids: dict[str, int], cache_size: int = 128) -> None:
+    def __init__(
+        self, index_path: Path, file_ids: dict[str, int], cache_size: int = 128
+    ) -> None:
         self._index_path = str(index_path)
         self._file_ids = file_ids  # path -> files.id (one small entry per file)
         self._cache: "OrderedDict[str, list[NALUnit]]" = OrderedDict()
@@ -262,11 +267,15 @@ class LazyNalIndex:
             file_id = self._file_ids[path]
         except KeyError as exc:
             raise KeyError(path) from exc
-        rows = self._connection().execute(
-            "SELECT start, end, start_code_len, nal_type FROM nals "
-            "WHERE file_id = ? ORDER BY nal_index",
-            (file_id,),
-        ).fetchall()
+        rows = (
+            self._connection()
+            .execute(
+                "SELECT start, end, start_code_len, nal_type FROM nals "
+                "WHERE file_id = ? ORDER BY nal_index",
+                (file_id,),
+            )
+            .fetchall()
+        )
         nals = [NALUnit(s, e, scl, nt) for (s, e, scl, nt) in rows]
         self._cache[path] = nals
         if len(self._cache) > self._cache_size:
