@@ -109,7 +109,9 @@ class ByteDataConfig:
     # NAL/slice header so early experiments focus on payload recovery. Future
     # evaluations should reduce this to 0 and explicitly test missing-header cases.
     slice_header_guard_bytes: int = 64
-    condition_on_sps_pps: bool = True  # Feed latest SPS/PPS NAL bytes as B_meta conditioning.
+    condition_on_sps_pps: bool = (
+        True  # Feed latest SPS/PPS NAL bytes as B_meta conditioning.
+    )
     default_max_seq_length: int = (
         32768  # Used when LitGPT connect() does not provide max_seq_length.
     )
@@ -158,7 +160,9 @@ def load_manifest_rows(
             row = json.loads(line)
             if row.get("status") == "ok" and row.get("h264_path"):
                 row = dict(row)
-                row["h264_path"] = str(resolve_manifest_path(row["h264_path"], manifest_dir))
+                row["h264_path"] = str(
+                    resolve_manifest_path(row["h264_path"], manifest_dir)
+                )
                 rows.append(row)
                 if max_rows is not None and len(rows) >= max_rows:
                     break
@@ -253,9 +257,7 @@ def load_nal_index(
             JOIN files ON files.id = nals.file_id
         """
         if len(wanted_paths) == indexed_file_count:
-            queries = [
-                (base_query + " ORDER BY files.id, nals.nal_index", ())
-            ]
+            queries = [(base_query + " ORDER BY files.id, nals.nal_index", ())]
         else:
             wanted_list = list(wanted_paths)
             queries = []
@@ -275,9 +277,7 @@ def load_nal_index(
             for path, start, end, start_code_len, nal_type in connection.execute(
                 query, parameters
             ):
-                nal_index[path].append(
-                    NALUnit(start, end, start_code_len, nal_type)
-                )
+                nal_index[path].append(NALUnit(start, end, start_code_len, nal_type))
 
     print(
         f"Loaded cached H.264 NAL index: {len(nal_index):,} files from {index_path}",
@@ -425,7 +425,9 @@ class ByteSliceDataset(Dataset):
         nals = self.nal_index[str(sample.h264_path)]
 
         meta = self._read_nal_bytes(data, nals, sample.meta_indices)
-        ref_chunks, reference_source_path = self._get_reference_chunks(idx, data, nals, sample)
+        ref_chunks, reference_source_path = self._get_reference_chunks(
+            idx, data, nals, sample
+        )
         target_nal = nals[sample.target_index]
         target = bytes_to_ids(data[target_nal.start : target_nal.end])
 
@@ -435,7 +437,9 @@ class ByteSliceDataset(Dataset):
             return self._build_fim_item(
                 meta, ref_chunks, target, target_nal, rng, sample, reference_source_path
             )
-        return self._build_ar_item(meta, ref_chunks, target, sample, reference_source_path)
+        return self._build_ar_item(
+            meta, ref_chunks, target, sample, reference_source_path
+        )
 
     def _get_reference_chunks(
         self, idx: int, data: bytes, nals: list[NALUnit], sample: SliceSample
@@ -472,7 +476,9 @@ class ByteSliceDataset(Dataset):
             if source_idx is None:
                 source_idx = self._next_other_video(idx, all_indices)
             if source_idx is None:
-                raise ValueError("shuffled_ref requires samples from at least two videos")
+                raise ValueError(
+                    "shuffled_ref requires samples from at least two videos"
+                )
             mapping[idx] = source_idx
         return mapping
 
@@ -699,9 +705,7 @@ class ByteSliceDataset(Dataset):
                         REGION_ORPHAN,
                         dtype=torch.long,
                     ),
-                    torch.full(
-                        (middle_in.numel(),), REGION_BRIDGE, dtype=torch.long
-                    ),
+                    torch.full((middle_in.numel(),), REGION_BRIDGE, dtype=torch.long),
                 )
             )
             offset_ids = torch.cat(
@@ -710,9 +714,7 @@ class ByteSliceDataset(Dataset):
                     torch.arange(ref.numel(), dtype=torch.long),
                     torch.tensor([0], dtype=torch.long),
                     torch.arange(prefix.numel(), dtype=torch.long),
-                    torch.tensor(
-                        [prefix.numel() + missing.numel()], dtype=torch.long
-                    ),
+                    torch.tensor([prefix.numel() + missing.numel()], dtype=torch.long),
                     torch.arange(
                         prefix.numel() + missing.numel(),
                         target.numel(),
@@ -737,9 +739,7 @@ class ByteSliceDataset(Dataset):
                     torch.full((ref.numel(),), REGION_REF, dtype=torch.long),
                     torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
                     torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
-                    torch.full(
-                        (middle_in.numel(),), REGION_BRIDGE, dtype=torch.long
-                    ),
+                    torch.full((middle_in.numel(),), REGION_BRIDGE, dtype=torch.long),
                 )
             )
             offset_ids = torch.cat(
@@ -825,7 +825,9 @@ class ByteSliceDataset(Dataset):
                 "num_ref_slices": len(sample.ref_indices),
                 "reference_mode": self.reference_mode,
                 "reference_source_path": (
-                    str(reference_source_path) if reference_source_path is not None else None
+                    str(reference_source_path)
+                    if reference_source_path is not None
+                    else None
                 ),
                 "dropped_ref_slices": dropped_ref_slices,
                 "num_meta_nals": len(sample.meta_indices),
@@ -923,9 +925,7 @@ class ByteStreamWindowDataset(Dataset):
             samples.extend(self._windows_for_video(path, nals))
         return samples, nal_index
 
-    def _windows_for_video(
-        self, path: Path, nals: list[NALUnit]
-    ) -> list[WindowSample]:
+    def _windows_for_video(self, path: Path, nals: list[NALUnit]) -> list[WindowSample]:
         """Non-overlapping windows, each beginning at an IDR boundary and packed
         forward by whole NALs until the byte budget is hit."""
         windows: list[WindowSample] = []
@@ -936,7 +936,9 @@ class ByteStreamWindowDataset(Dataset):
             # Back up to include the parameter sets immediately preceding the IDR
             # so the window is self-contained and decodable from its first byte.
             start = k
-            while start - 1 >= 0 and nals[start - 1].nal_type in PARAMETER_SET_NAL_TYPES:
+            while (
+                start - 1 >= 0 and nals[start - 1].nal_type in PARAMETER_SET_NAL_TYPES
+            ):
                 start -= 1
             if start < used_until:
                 continue  # this GOP is already inside a previously packed window
@@ -988,9 +990,7 @@ class ByteStreamWindowDataset(Dataset):
         region_ids = torch.cat(
             (torch.tensor([REGION_TARGET], dtype=torch.long), raw_region[:-1])
         )
-        offset_ids = torch.cat(
-            (torch.tensor([0], dtype=torch.long), raw_offset[:-1])
-        )
+        offset_ids = torch.cat((torch.tensor([0], dtype=torch.long), raw_offset[:-1]))
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -1049,7 +1049,9 @@ class ByteDataModule(DataModule):
     manifest_path: Path
     config: ByteDataConfig = field(default_factory=ByteDataConfig)
     max_manifest_rows: int | None = None  # Optional corpus limit for smoke/debug runs.
-    nal_index_path: Path | None = None  # Defaults to manifest_dir/nal_index.sqlite when present.
+    nal_index_path: Path | None = (
+        None  # Defaults to manifest_dir/nal_index.sqlite when present.
+    )
 
     batch_size: int = field(default=1, init=False, repr=False)
     max_seq_length: int = field(
@@ -1090,6 +1092,7 @@ class ByteDataModule(DataModule):
         )
         if self.nal_index_path is not None and nal_index is None:
             raise FileNotFoundError(f"NAL index does not exist: {index_path}")
+
         def _build_dataset(rows_subset: list[dict[str, Any]]) -> Dataset:
             if self.config.dataset_mode == "window":
                 return ByteStreamWindowDataset(

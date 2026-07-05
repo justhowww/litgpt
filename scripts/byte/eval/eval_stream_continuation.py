@@ -38,6 +38,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -405,19 +406,21 @@ def _acc(counts: list[int]) -> float | None:
     return counts[0] / counts[1] if counts[1] else None
 
 
-def _syntax_buckets(gt_bytes: bytes, prefix_len: int, total_len: int) -> tuple[list[str], list[str]]:
+def _syntax_buckets(spans: list, prefix_len: int, total_len: int) -> tuple[list[str], list[str]]:
     """For each continuation byte offset in [prefix_len, total_len), return its H.264
     syntax category string and normalized element name (array indices stripped).
 
     Bytes not covered by any span -> "untagged" (GT is valid H.264, so ~0). A byte
     straddles bit-packed elements; it is assigned to the first span (stream order)
-    that covers it -- a documented approximation, adequate for a coarse signal.
+    that covers it -- a documented approximation adequate for a coarse *byte-level*
+    signal. For the honest per-field number see _bit_hits (scores only a span's own
+    bits, so short sub-byte fields aren't dragged down by co-packed neighbours).
     """
     n = total_len - prefix_len
     cat = ["untagged"] * n
     elem = ["untagged"] * n
     filled = [False] * n
-    for span in HS.parse_stream(gt_bytes, parse_slice_data=True).all_spans():
+    for span in spans:
         b0 = max(span.byte_start, prefix_len)
         b1 = min(span.byte_end, total_len)
         if b1 <= b0:
@@ -431,6 +434,91 @@ def _syntax_buckets(gt_bytes: bytes, prefix_len: int, total_len: int) -> tuple[l
                 elem[i] = ename
                 filled[i] = True
     return cat, elem
+
+
+def _merge_counts(dst: dict[str, list[int]], src: dict[str, list[int]]) -> None:
+    for key, (hit, tot) in src.items():
+        acc = dst.setdefault(key, [0, 0])
+        acc[0] += hit
+        acc[1] += tot
+
+
+def _bit_hits(
+    spans: list, prefix_len: int, total_len: int, gt_list: list[int], pred_list: list[int]
+) -> tuple[dict[str, list[int]], dict[str, list[int]], int]:
+    """Bit-level top-1 accuracy per category/element: score ONLY each span's own
+    RBSP bits against the model's argmax byte, removing the byte-level co-packing
+    that sinks short sub-byte fields (mb_type, sub_mb_type, cbp).
+
+    A span's RBSP byte r (=bit>>3) maps to raw offset byte_start + (r - rb0) when the
+    field contains no emulation-prevention byte -- detectable as raw-byte count ==
+    rbsp-byte count. Spans with an interior 00-00-03 (counts differ) are skipped and
+    tallied (rare mid-field). gt_list/pred_list index by k = raw_offset - prefix_len.
+    """
+    cat_bit: dict[str, list[int]] = {}
+    elem_bit: dict[str, list[int]] = {}
+    epb_skipped = 0
+    for span in spans:
+        b0, b1 = span.bit_start, span.bit_end
+        if b1 <= b0:
+            continue
+        rb0 = b0 >> 3
+        n_rbsp = ((b1 - 1) >> 3) - rb0 + 1
+        n_raw = span.byte_end - span.byte_start
+        if n_rbsp != n_raw:
+            epb_skipped += 1  # emulation-prevention inside the field; skip
+            continue
+        cb = cat_bit.setdefault(span.category.value, [0, 0])
+        eb = elem_bit.setdefault(_INDEX_RE.sub("", span.name), [0, 0])
+        for b in range(b0, b1):
+            raw_off = span.byte_start + ((b >> 3) - rb0)
+            if not (prefix_len <= raw_off < total_len):
+                continue
+            k = raw_off - prefix_len
+            shift = 7 - (b & 7)  # bitstream is MSB-first
+            hit = int(((gt_list[k] >> shift) & 1) == ((pred_list[k] >> shift) & 1))
+            cb[0] += hit
+            cb[1] += 1
+            eb[0] += hit
+            eb[1] += 1
+    return cat_bit, elem_bit, epb_skipped
+
+
+def _copy_oracle(spans: list) -> dict[str, list[int]]:
+    """GT-only temporal-persistence oracle: for each per-MB element, the fraction of
+    macroblocks whose value equals the same mb_addr's value in the *previous* frame.
+
+    Frame boundary = a first_mb_in_slice span with value 0 (holds for one-slice-per-
+    frame and slice-max-mbs=1). Returns {element_name: [matches, comparisons]}.
+    This measures how much redundancy EXISTS in the data -- the ceiling a model that
+    merely copied the previous frame would hit -- independent of the model.
+    """
+    frames: list[dict[int, dict[str, object]]] = []
+    cur: dict[int, dict[str, object]] | None = None
+    for span in spans:
+        if span.name == "first_mb_in_slice" and span.value == 0:
+            if cur is not None:
+                frames.append(cur)
+            cur = {}
+        if cur is None or span.mb_addr is None:
+            continue
+        cur.setdefault(span.mb_addr, {})[_INDEX_RE.sub("", span.name)] = span.value
+    if cur is not None:
+        frames.append(cur)
+
+    out: dict[str, list[int]] = {}
+    for f in range(1, len(frames)):
+        prev_frame = frames[f - 1]
+        for mb, elems in frames[f].items():
+            prev = prev_frame.get(mb)
+            if not prev:
+                continue
+            for ename, val in elems.items():
+                if ename in prev:
+                    c = out.setdefault(ename, [0, 0])
+                    c[0] += int(val == prev[ename])
+                    c[1] += 1
+    return out
 
 
 @torch.inference_mode()
@@ -464,6 +552,16 @@ def evaluate_teacher_forced(
     # Pooled (across-clip, byte-weighted) per-syntax accuracy: bucket -> [hits, total].
     cat_acc: dict[str, list[int]] = {}
     elem_acc: dict[str, list[int]] = {}
+    # Bit-level accuracy (score only each field's own bits) -> bucket -> [hits, bits].
+    cat_bit: dict[str, list[int]] = {}
+    elem_bit: dict[str, list[int]] = {}
+    # Unigram/chance floor: GT byte histogram per bucket (accuracy of always guessing
+    # the bucket's most common byte).
+    cat_hist: dict[str, Counter] = {}
+    elem_hist: dict[str, Counter] = {}
+    # Temporal-copy oracle (GT-only): per-element previous-frame persistence.
+    copy_acc: dict[str, list[int]] = {}
+    bit_epb_skipped = 0
     skipped = 0
     attempted = 0
 
@@ -518,10 +616,16 @@ def evaluate_teacher_forced(
         byte_accs.append(acc)
         ces.append(ce)
 
-        # Per-syntax-element accuracy: parse the GT window, map each continuation
-        # byte to its syntax category / element, and bucket the argmax correctness.
+        # Parse the GT window ONCE; reuse the spans for byte-level buckets, bit-level
+        # accuracy, the unigram floor, and the temporal-copy oracle.
+        spans = HS.parse_stream(gt_bytes, parse_slice_data=True).all_spans()
+        gt_list = cont_targets.tolist()
+        pred_list = pred_ids.tolist()
+
+        # Byte-level accuracy (coarse; short sub-byte fields are co-packing-diluted)
+        # + unigram histogram per bucket.
         hits = (pred_ids == cont_targets).tolist()
-        cat_of, elem_of = _syntax_buckets(gt_bytes, prefix_len, total_len)
+        cat_of, elem_of = _syntax_buckets(spans, prefix_len, total_len)
         for k, hit in enumerate(hits):
             cat_acc.setdefault(cat_of[k], [0, 0])
             cat_acc[cat_of[k]][0] += int(hit)
@@ -529,6 +633,15 @@ def evaluate_teacher_forced(
             elem_acc.setdefault(elem_of[k], [0, 0])
             elem_acc[elem_of[k]][0] += int(hit)
             elem_acc[elem_of[k]][1] += 1
+            cat_hist.setdefault(cat_of[k], Counter())[gt_list[k]] += 1
+            elem_hist.setdefault(elem_of[k], Counter())[gt_list[k]] += 1
+
+        # Bit-level accuracy (honest per-field) + temporal-copy oracle.
+        cb, eb, epb = _bit_hits(spans, prefix_len, total_len, gt_list, pred_list)
+        _merge_counts(cat_bit, cb)
+        _merge_counts(elem_bit, eb)
+        bit_epb_skipped += epb
+        _merge_counts(copy_acc, _copy_oracle(spans))
 
         details.append({
             "checkpoint": checkpoint_name,
@@ -543,6 +656,15 @@ def evaluate_teacher_forced(
         cat_acc.get("residual_luma", [0, 0])[0] + cat_acc.get("residual_chroma", [0, 0])[0],
         cat_acc.get("residual_luma", [0, 0])[1] + cat_acc.get("residual_chroma", [0, 0])[1],
     ]
+    residual_bit = [
+        cat_bit.get("residual_luma", [0, 0])[0] + cat_bit.get("residual_chroma", [0, 0])[0],
+        cat_bit.get("residual_luma", [0, 0])[1] + cat_bit.get("residual_chroma", [0, 0])[1],
+    ]
+
+    def _uni(counter: Counter) -> float | None:
+        tot = sum(counter.values())
+        return max(counter.values()) / tot if tot else None
+
     summary = {
         "checkpoint": checkpoint_name,
         "mode": "teacher_forced",
@@ -558,9 +680,31 @@ def evaluate_teacher_forced(
         "acc_mb_pred": _acc(cat_acc.get("mb_pred", [0, 0])),
         "acc_cbp": _acc(cat_acc.get("cbp", [0, 0])),
         "acc_residual": _acc(residual),
+        # Bit-level accuracy: scores only each field's own RBSP bits, so short
+        # sub-byte fields (mb_type) aren't diluted by co-packed neighbours.
+        "bit_acc_start_code": _acc(cat_bit.get("start_code", [0, 0])),
+        "bit_acc_slice_header": _acc(cat_bit.get("slice_header", [0, 0])),
+        "bit_acc_mb_header": _acc(cat_bit.get("mb_header", [0, 0])),
+        "bit_acc_mb_pred": _acc(cat_bit.get("mb_pred", [0, 0])),
+        "bit_acc_residual": _acc(residual_bit),
+        "bit_acc_mb_type": _acc(elem_bit.get("mb_type", [0, 0])),
+        "bit_epb_skipped": bit_epb_skipped,  # fields skipped for interior 00-00-03
+        # Unigram/chance floor (byte-level): accuracy of always guessing the bucket's
+        # most common byte -- the floor the model's byte acc_* must beat.
+        "unigram_mb_type": _uni(elem_hist.get("mb_type", Counter())),
+        "unigram_mb_pred": _uni(cat_hist.get("mb_pred", Counter())),
+        "unigram_residual": _uni(
+            cat_hist.get("residual_luma", Counter()) + cat_hist.get("residual_chroma", Counter())
+        ),
+        # Temporal-copy oracle (GT-only): does the field persist frame-to-frame?
+        "copy_oracle_mb_type": _acc(copy_acc.get("mb_type", [0, 0])),
         # Full breakdowns (nested; readable in JSONL).
         "syntax_acc": {c: {"acc": h / t, "n": t} for c, (h, t) in sorted(cat_acc.items()) if t},
         "element_acc": {e: {"acc": h / t, "n": t} for e, (h, t) in sorted(elem_acc.items()) if t >= 32},
+        "syntax_bit_acc": {c: {"acc": h / t, "n_bits": t} for c, (h, t) in sorted(cat_bit.items()) if t},
+        "element_bit_acc": {e: {"acc": h / t, "n_bits": t} for e, (h, t) in sorted(elem_bit.items()) if t >= 64},
+        "unigram_acc": {e: {"acc": _uni(c), "n": sum(c.values())} for e, c in sorted(elem_hist.items()) if sum(c.values()) >= 32},
+        "copy_oracle": {e: {"acc": h / t, "n": t} for e, (h, t) in sorted(copy_acc.items()) if t >= 16},
         "prefix_frames": clips[0].prefix_frames if clips else 0,
         "cont_frames": clips[0].cont_frames if clips else 0,
         "temperature": 0.0,
