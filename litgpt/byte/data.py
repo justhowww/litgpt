@@ -12,9 +12,11 @@ unit used by the byte model.
 from __future__ import annotations
 
 import json
+import os
 import random
 import sqlite3
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -212,13 +214,76 @@ def default_nal_index_path(manifest_path: Path) -> Path:
     return manifest_path.with_name(DEFAULT_NAL_INDEX_NAME)
 
 
+class LazyNalIndex:
+    """Mapping ``path -> list[NALUnit]`` backed by ``nal_index.sqlite``.
+
+    Materializes a file's NALs on demand (indexed by ``file_id``) with a bounded
+    LRU cache, so host RAM does NOT scale with total corpus NAL count -- essential
+    for the AVC-LM (slice-max-mbs=1) corpus, where the fully-resident dict was tens
+    of GB and was multiplied per DataLoader worker. Only the compact per-file
+    ``path -> file_id`` map stays resident; NALUnit objects come and go.
+
+    Access matches the old dict (``nal_index[path]``, ``path in nal_index``,
+    ``len(nal_index)``). A read-only sqlite connection is (re)opened per process so
+    it is safe across forked DataLoader workers.
+    """
+
+    def __init__(self, index_path: Path, file_ids: dict[str, int], cache_size: int = 128) -> None:
+        self._index_path = str(index_path)
+        self._file_ids = file_ids  # path -> files.id (one small entry per file)
+        self._cache: "OrderedDict[str, list[NALUnit]]" = OrderedDict()
+        self._cache_size = cache_size
+        self._conn: sqlite3.Connection | None = None
+        self._pid: int | None = None
+
+    def _connection(self) -> sqlite3.Connection:
+        pid = os.getpid()
+        if self._conn is None or self._pid != pid:
+            # First use, or a forked worker inherited the parent's handle: a sqlite
+            # connection must not be shared across processes, so open a fresh one.
+            self._conn = sqlite3.connect(
+                f"file:{self._index_path}?mode=ro", uri=True, check_same_thread=False
+            )
+            self._pid = pid
+        return self._conn
+
+    def __contains__(self, path: str) -> bool:
+        return path in self._file_ids
+
+    def __len__(self) -> int:
+        return len(self._file_ids)
+
+    def __getitem__(self, path: str) -> list[NALUnit]:
+        cached = self._cache.get(path)
+        if cached is not None:
+            self._cache.move_to_end(path)
+            return cached
+        try:
+            file_id = self._file_ids[path]
+        except KeyError as exc:
+            raise KeyError(path) from exc
+        rows = self._connection().execute(
+            "SELECT start, end, start_code_len, nal_type FROM nals "
+            "WHERE file_id = ? ORDER BY nal_index",
+            (file_id,),
+        ).fetchall()
+        nals = [NALUnit(s, e, scl, nt) for (s, e, scl, nt) in rows]
+        self._cache[path] = nals
+        if len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        return nals
+
+
 def load_nal_index(
     index_path: Path, manifest_path: Path, rows: list[dict[str, Any]]
-) -> dict[str, list[NALUnit]]:
-    """Load precomputed NAL offsets after validating the source manifest."""
+) -> LazyNalIndex:
+    """Open the precomputed NAL index after validating the source manifest.
+
+    Returns a LazyNalIndex (sqlite-backed, bounded RAM) rather than materializing
+    every NALUnit -- the fully-resident dict did not scale to the per-MB corpus.
+    """
     manifest_stat = manifest_path.stat()
     wanted_paths = {str(Path(row["h264_path"])) for row in rows}
-    nal_index: dict[str, list[NALUnit]] = {path: [] for path in wanted_paths}
 
     with sqlite3.connect(index_path) as connection:
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
@@ -237,53 +302,26 @@ def load_nal_index(
                 f"{', '.join(mismatches)}. Rebuild the index."
             )
 
-        indexed_file_count = connection.execute(
-            "SELECT COUNT(*) FROM files"
-        ).fetchone()[0]
-        indexed_paths = {
-            path for (path,) in connection.execute("SELECT path FROM files")
+        # One small row per file; keep only the path -> id map resident.
+        all_file_ids = {
+            path: file_id
+            for (path, file_id) in connection.execute("SELECT path, id FROM files")
         }
-        missing = wanted_paths - indexed_paths
-        if missing:
-            example = next(iter(missing))
-            raise RuntimeError(
-                f"NAL index {index_path} is missing {len(missing):,} manifest files, "
-                f"for example {example}. Resume the index build."
-            )
 
-        base_query = """
-            SELECT files.path, nals.start, nals.end, nals.start_code_len, nals.nal_type
-            FROM nals
-            JOIN files ON files.id = nals.file_id
-        """
-        if len(wanted_paths) == indexed_file_count:
-            queries = [(base_query + " ORDER BY files.id, nals.nal_index", ())]
-        else:
-            wanted_list = list(wanted_paths)
-            queries = []
-            for start in range(0, len(wanted_list), 900):
-                path_chunk = wanted_list[start : start + 900]
-                placeholders = ",".join("?" for _ in path_chunk)
-                queries.append(
-                    (
-                        base_query
-                        + f" WHERE files.path IN ({placeholders})"
-                        + " ORDER BY files.id, nals.nal_index",
-                        path_chunk,
-                    )
-                )
-
-        for query, parameters in queries:
-            for path, start, end, start_code_len, nal_type in connection.execute(
-                query, parameters
-            ):
-                nal_index[path].append(NALUnit(start, end, start_code_len, nal_type))
+    missing = wanted_paths - set(all_file_ids)
+    if missing:
+        example = next(iter(missing))
+        raise RuntimeError(
+            f"NAL index {index_path} is missing {len(missing):,} manifest files, "
+            f"for example {example}. Resume the index build."
+        )
+    file_ids = {path: all_file_ids[path] for path in wanted_paths}
 
     print(
-        f"Loaded cached H.264 NAL index: {len(nal_index):,} files from {index_path}",
+        f"Opened lazy H.264 NAL index: {len(file_ids):,} files from {index_path}",
         flush=True,
     )
-    return nal_index
+    return LazyNalIndex(index_path, file_ids)
 
 
 def parse_annexb_nals(data: bytes) -> list[NALUnit]:
