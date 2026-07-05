@@ -284,6 +284,7 @@ def evaluate_checkpoint(
     cont_ssim: list[float] = []
     frames_made: list[int] = []
     survivals: list[int] = []
+    desync_regions: Counter = Counter()  # syntax element where free-run first desyncs
     details: list[dict[str, Any]] = []
     viz: dict[int, dict[str, Any]] = {}
     # Distributional-plausibility feature populations (metric 3). Appearance is
@@ -337,8 +338,10 @@ def evaluate_checkpoint(
 
         # Byte-level survival: bytes generated before the first CAVLC desync in a
         # generated VCL NAL (same definition as the in-loop val_freerun probe).
-        survival, _valid_cont, _sc = _survival_and_validity(prefix_bytes, gen_bytes, m)
+        survival, _valid_cont, _sc, desync_region = _survival_and_validity(prefix_bytes, gen_bytes, m)
         survivals.append(survival)
+        region = _INDEX_RE.sub("", desync_region) if desync_region else "none"
+        desync_regions[region] += 1
 
         clip_psnr: list[float] = []
         clip_ssim: list[float] = []
@@ -363,6 +366,7 @@ def evaluate_checkpoint(
             "start_codes_emitted": gen_frames_emitted,
             "strict_valid": strict_valid,
             "survival_bytes": survival,
+            "desync_region": region,
             "gen_bytes": len(gen_bytes),
             "gt_cont_bytes": gt_cont_len,
             "cont_psnr_mean": mean(clip_psnr),
@@ -388,6 +392,9 @@ def evaluate_checkpoint(
         "survival_bytes_mean": mean([float(s) for s in survivals]),
         "survival_bytes_median": float(sorted(survivals)[len(survivals) // 2]) if survivals else None,
         "survival_bytes_max": float(max(survivals)) if survivals else None,
+        # Where free-run generation first desyncs (syntax element), pooled over clips.
+        "desync_region_top": desync_regions.most_common(1)[0][0] if desync_regions else None,
+        "desync_region_hist": dict(desync_regions.most_common()),
         "frames_target": clips[0].cont_frames if clips else 0,
         "cont_psnr_mean": mean(cont_psnr),
         "cont_ssim_mean": mean(cont_ssim),
