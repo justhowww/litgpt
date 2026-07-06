@@ -241,6 +241,26 @@ class LazyNalIndex:
         self._conn: sqlite3.Connection | None = None
         self._pid: int | None = None
 
+    def __getstate__(self) -> dict:
+        # A sqlite3.Connection cannot be pickled (and must not cross processes), and
+        # the cache is just a bounded materialization. Persist only what identifies the
+        # index; the connection + cache are rebuilt lazily on first use. This keeps the
+        # object picklable for checkpoint save (fabric pickles the training state) and
+        # for spawn-based DataLoader workers.
+        return {
+            "_index_path": self._index_path,
+            "_file_ids": self._file_ids,
+            "_cache_size": self._cache_size,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        self._index_path = state["_index_path"]
+        self._file_ids = state["_file_ids"]
+        self._cache_size = state["_cache_size"]
+        self._cache = OrderedDict()
+        self._conn = None
+        self._pid = None
+
     def _connection(self) -> sqlite3.Connection:
         pid = os.getpid()
         if self._conn is None or self._pid != pid:
