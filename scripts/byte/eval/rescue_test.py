@@ -115,10 +115,13 @@ def _byte_dist_at_end(raw, stream: bytes, device: torch.device) -> list[float]:
     """Model's probability distribution over the NEXT byte after ``stream`` (i.e. the
     distribution over the byte at position len(stream)). Single teacher-forced forward."""
     prompt_ids, region_ids, offset_ids = _prompt_from_stream(stream, device)
-    seq_len = prompt_ids.size(1)
+    # Plain full-sequence forward (NO input_pos): passing input_pos routes the model
+    # into its KV-cache path (model.py:134), which requires set_kv_cache(). This is a
+    # one-shot teacher-forced forward, so run cache-free -- the causal mask makes the
+    # last position's logits identical to the cached path. free_run_rollout may have
+    # left a cache allocated; input_pos=None means attention ignores it.
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        logits = raw(prompt_ids, input_pos=torch.arange(seq_len, device=device),
-                     input_pos_maxp1=seq_len, region_ids=region_ids, offset_ids=offset_ids)
+        logits = raw(prompt_ids, region_ids=region_ids, offset_ids=offset_ids)
     row = logits[0, -1, :BYTE_VOCAB_SIZE].float()
     return torch.softmax(row, dim=-1).tolist()
 
