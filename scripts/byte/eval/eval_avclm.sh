@@ -29,14 +29,22 @@ NAL_INDEX="$AVCLM_DATA/nal_index.sqlite"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL="$SCRIPT_DIR/eval_stream_continuation.py"
 
-# Under slice-max-mbs=1, prefix/cont "frames" count VCL NAL slices (one MB each). 288/144
-# matches the earlier AVC-LM survival runs that selected 20 clips.
+# Match training exactly (stage0_ar_multiframe_xl/train.sh): dataset-mode=window,
+# BLOCK_SIZE=16384 -> --max-window-bytes 16384 (= the model's trained context / KV-cache
+# size). Clip selection is already IDR-anchored + SLICE_BOS + per-NAL offset reset, like
+# ByteStreamWindowDataset, so an IDR-anchored eval window is in-distribution.
+#
+# Under slice-max-mbs=1 a VCL NAL is one MB, so at 256x144 (144 MBs/frame) prefix/cont
+# "frames" count MB-slices: 288 = 2 frames of context, 144 = generate 1 frame. 288+144=432
+# slices sit inside one 16384-byte window -- i.e. "given 2 frames of a training window,
+# generate the 3rd", which is exactly the full-window next-byte objective the model saw.
+BLOCK_SIZE="${BLOCK_SIZE:-16384}"
 COMMON=(
   "$MANIFEST"
   --nal-index-path "$NAL_INDEX"
   --checkpoint-dirs "$CKPT"
   --survival-only --no-eval-intra
-  --num-clips 20 --prefix-frames 288 --cont-frames 144 --max-window-bytes 16000
+  --num-clips 20 --prefix-frames 288 --cont-frames 144 --max-window-bytes "$BLOCK_SIZE"
   --seed 42
 )
 
