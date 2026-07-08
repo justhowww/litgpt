@@ -1,7 +1,8 @@
 #!/bin/bash
 
 REMOTE_HOST="huangyh@login.zaratan.umd.edu"
-REMOTE_ROOT="/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data/runs"
+DATA="${2:-data}"
+REMOTE_ROOT="/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/${DATA}/runs"
 LOCAL_ROOT="/Users/justinhuang/Documents/lab/Chris/2025spring-diffusion-video-decoder/results"
 
 dir_name="$1"

@@ -144,6 +144,15 @@ def parse_args() -> argparse.Namespace:
         "--no-eval-teacher-forced", dest="eval_teacher_forced", action="store_false"
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy.")
+    parser.add_argument(
+        "--survival-only",
+        action="store_true",
+        help="Continuation mode: skip the ffmpeg GT-decode + frame-count gate and the "
+        "frame metrics (PSNR/Fréchet); report only byte/slice-level survival + desync "
+        "(survival_bytes, desync_region/reason/density, slice-level full_continuation_rate). "
+        "Needed for the per-MB (slice-max-mbs=1) corpus where 'frames' are macroblocks, and "
+        "handy without ffmpeg.",
+    )
     parser.add_argument("--viz-fps", type=int, default=6)
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
     parser.add_argument("--timeout-sec", type=int, default=60)
@@ -360,16 +369,17 @@ def evaluate_checkpoint(
         gt_bytes = _concat_nals(data, nals, 0, clip.cont_end_nal)
         gt_cont_len = len(gt_bytes) - len(prefix_bytes)
 
-        gt_frames, _ = decode_h264(gt_bytes, args, strict=False)
-        if len(gt_frames) < clip.prefix_frames + clip.cont_frames:
-            details.append(
-                {
-                    "checkpoint": checkpoint_name,
-                    "clip_index": clip_idx,
-                    "status": "gt_decode_short",
-                }
-            )
-            continue
+        if not args.survival_only:
+            gt_frames, _ = decode_h264(gt_bytes, args, strict=False)
+            if len(gt_frames) < clip.prefix_frames + clip.cont_frames:
+                details.append(
+                    {
+                        "checkpoint": checkpoint_name,
+                        "clip_index": clip_idx,
+                        "status": "gt_decode_short",
+                    }
+                )
+                continue
 
         max_gen = min(
             int(gt_cont_len * args.max_gen_multiple) + 512,
@@ -399,20 +409,9 @@ def evaluate_checkpoint(
             clip.cont_frames,
             max_gen,
         )
-        model_bytes = prefix_bytes + gen_bytes
-        model_frames, model_status = decode_h264(model_bytes, args, strict=True)
-        if not model_frames:
-            model_frames, model_status = decode_h264(model_bytes, args, strict=False)
-
         n, m = clip.prefix_frames, clip.cont_frames
-        produced = max(0, len(model_frames) - n)
-        frames_made.append(produced)
-        strict_valid = model_status == "decoded" and len(model_frames) >= n + m
-        decode_ok += int(model_status == "decoded")
-        full_count += int(strict_valid)
 
-        # Byte-level survival: bytes generated before the first CAVLC desync in a
-        # generated VCL NAL (same definition as the in-loop val_freerun probe).
+        # Byte-level survival + desync (parse-only, no ffmpeg) -- runs in BOTH modes.
         sr = _survival_and_validity(prefix_bytes, gen_bytes, m)
         survival = sr.survival
         survivals.append(survival)
@@ -423,6 +422,37 @@ def evaluate_checkpoint(
         desync_reasons[sr.desync_reason or "none"] += 1
         for cat, nbytes in sr.exposure.items():
             exposure_bytes[cat] += nbytes
+
+        if args.survival_only:
+            # Slice-level validity only; skip the ffmpeg frame decode + PSNR/Fréchet.
+            full_count += int(sr.valid_cont >= m)
+            details.append(
+                {
+                    "checkpoint": checkpoint_name,
+                    "clip_index": clip_idx,
+                    "h264_path": str(clip.h264_path),
+                    "survival_bytes": survival,
+                    "valid_cont_slices": sr.valid_cont,
+                    "start_codes_emitted": gen_frames_emitted,
+                    "desync_region": region,
+                    "desync_category": category,
+                    "desync_reason": sr.desync_reason or "none",
+                    "gen_bytes": len(gen_bytes),
+                    "gt_cont_bytes": gt_cont_len,
+                }
+            )
+            continue
+
+        # ---- frame-based path (needs ffmpeg): decode + PSNR/Fréchet ----
+        model_bytes = prefix_bytes + gen_bytes
+        model_frames, model_status = decode_h264(model_bytes, args, strict=True)
+        if not model_frames:
+            model_frames, model_status = decode_h264(model_bytes, args, strict=False)
+        produced = max(0, len(model_frames) - n)
+        frames_made.append(produced)
+        strict_valid = model_status == "decoded" and len(model_frames) >= n + m
+        decode_ok += int(model_status == "decoded")
+        full_count += int(strict_valid)
 
         clip_psnr: list[float] = []
         clip_ssim: list[float] = []
@@ -662,7 +692,7 @@ def evaluate_teacher_forced(
         (structural: start codes, NAL/slice headers, mb_type) vs fails (residual
         coefficients, motion-vector deltas).
     """
-    raw = model.module if hasattr(model, "module") else model
+    raw = model.module if hasattr(model, "module") else model  # * model
     raw.eval()
     max_seq = int(raw.max_seq_length)
 
@@ -708,7 +738,7 @@ def evaluate_teacher_forced(
             )
             continue
         attempted += 1
-
+        # * preparing for inputs and auxiliary inputs (region_ids, offset_ids)
         prompt_ids, region_ids, offset_ids = _prompt_tensors(
             gt_bytes, nals, clip.cont_end_nal
         )
