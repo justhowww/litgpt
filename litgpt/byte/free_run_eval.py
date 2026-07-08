@@ -34,6 +34,7 @@ from litgpt.byte import h264_syntax as HS
 from litgpt.byte.data import (
     BYTE_VOCAB_SIZE,
     PARAMETER_SET_NAL_TYPES,
+    REGION_META,
     REGION_TARGET,
     VCL_NAL_TYPES,
 )
@@ -240,6 +241,8 @@ def free_run_rollout(
     forced_used = 0
     prev_token = -1  # for stop_pad_run: length of the current identical-byte run
     run_len = 0
+    current_region = REGION_TARGET  # region for the current NAL's bytes (fix (c))
+    pending_header = False  # next non-start byte is a NAL header -> read its nal_type
     try:
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = raw(
@@ -273,24 +276,57 @@ def free_run_rollout(
                     break
 
             is_start = len(generated) >= 3 and tuple(generated[-3:]) == START_CODE
-            token_offset = gen_offset
             if is_start:
                 start_codes += 1
                 if start_codes == cont_frames + 1:
                     generated = generated[:-3]
                     break
-                gen_offset = 3
-            else:
-                gen_offset = token_offset + 1
             if step == max_gen - 1:
                 break
             position = prompt_len + step
+
+            if is_start:
+                # A start code just completed. Its bytes were fed with continuation
+                # offsets; re-feed the whole start code with the correct per-NAL offsets
+                # 0..sc_len-1 (fix (a)), using the TRUE start-code length -- 4 when a
+                # leading zero_byte precedes 00 00 01, matching parse_annexb_nals -- rather
+                # than a hard-coded 3 (fix (b)). KVCache.batched_index_copy_ overwrites the
+                # cache slots at these (past) input_pos, so the header/mb_type that follow
+                # attend to correctly-encoded start-code bytes.
+                sc_len = 4 if (len(generated) >= 4 and tuple(generated[-4:]) == (0, 0, 0, 1)) else 3
+                base_pos = position - (sc_len - 1)
+                for j in range(sc_len):
+                    tok_j = generated[len(generated) - sc_len + j]
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                        logits = raw(
+                            torch.tensor([[tok_j]], device=device),
+                            input_pos=torch.tensor([base_pos + j], device=device),
+                            input_pos_maxp1=base_pos + j + 1,
+                            region_ids=torch.full((1, 1), REGION_TARGET, device=device, dtype=torch.long),
+                            offset_ids=torch.full((1, 1), j, device=device, dtype=torch.long),
+                        )
+                gen_offset = sc_len  # the NAL header sits at offset sc_len
+                current_region = REGION_TARGET
+                pending_header = True
+                continue
+
+            # Non-start byte. The first byte after a start code is the NAL header; read its
+            # nal_type to set the NAL's region: META for parameter sets, TARGET for VCL,
+            # instead of hard-coding TARGET everywhere (fix (c)).
+            if pending_header:
+                nal_type = token & 0x1F
+                current_region = (
+                    REGION_META if nal_type in PARAMETER_SET_NAL_TYPES else REGION_TARGET
+                )
+                pending_header = False
+            token_offset = gen_offset
+            gen_offset = token_offset + 1
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 logits = raw(
                     torch.tensor([[token]], device=device),
                     input_pos=torch.tensor([position], device=device),
                     input_pos_maxp1=position + 1,
-                    region_ids=torch.full((1, 1), REGION_TARGET, device=device, dtype=torch.long),
+                    region_ids=torch.full((1, 1), current_region, device=device, dtype=torch.long),
                     offset_ids=torch.full((1, 1), token_offset, device=device, dtype=torch.long),
                 )
     finally:
