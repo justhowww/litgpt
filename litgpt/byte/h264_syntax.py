@@ -897,9 +897,17 @@ def _residual_block(
     """Parse one CAVLC residual block; record sub-element spans; return TotalCoeff."""
     label = T.coeff_token_label(nc)
     b0 = reader.pos
-    (total_coeff, trailing_ones), _ = T.decode_vlc(
-        reader.read_bit, T.code_map(label), label
-    )
+    try:
+        (total_coeff, trailing_ones), _ = T.decode_vlc(
+            reader.read_bit, T.code_map(label), label
+        )
+    except (ValueError, BitReaderError):
+        # Record the FAILED coeff_token span carrying the nC that selected the VLC
+        # table, so the rescue test can recover the nC-selected legal set at the crash
+        # (nC is a local that would otherwise be lost when the exception propagates).
+        record.raw(f"{name}.coeff_token", cat, b0, reader.pos,
+                   {"nC": nc, "failed": True}, mb_addr)
+        raise
     record.raw(
         f"{name}.coeff_token",
         cat,

@@ -159,6 +159,61 @@ def legal_prob_mass(
     }
 
 
+def legal_prob_mass_codewords(
+    byte_probs, bit_offset: int, fixed_high: int,
+    codewords: list, emitted_byte: int | None = None,
+) -> dict:
+    """Like ``legal_prob_mass`` but for an arbitrary VLC field (e.g. coeff_token),
+    whose legal codewords are NOT ``ue`` of an int. ``codewords`` is a list of
+    ``(value, bits)`` pairs where ``bits`` is the MSB-first codeword bit list. Returns
+    ``{p_legal, best_value, best_prob, best_legal_rank, illegal_prob}`` with the same
+    byte-level prefix approximation as ``legal_prob_mass``.
+    """
+    tail_len = 8 - bit_offset
+    prefixes = [(v, tuple(bits[: min(len(bits), tail_len)])) for v, bits in codewords]
+    per_value: dict = {}
+    legal_bytes: list[int] = []
+    for b in range(256):
+        if (b >> tail_len) != fixed_high:
+            continue
+        tail = [(b >> (tail_len - 1 - i)) & 1 for i in range(tail_len)]
+        best_v, best_k = None, -1
+        for v, pref in prefixes:
+            k = len(pref)
+            if tuple(tail[:k]) == pref and k > best_k:
+                best_v, best_k = v, k
+        if best_v is not None:
+            per_value[best_v] = per_value.get(best_v, 0.0) + byte_probs[b]
+            legal_bytes.append(b)
+
+    p_legal = sum(byte_probs[b] for b in legal_bytes)
+    best_value = max(per_value, key=lambda v: per_value[v]) if per_value else None
+    best_prob = per_value[best_value] if best_value is not None else 0.0
+    order = sorted(range(256), key=lambda b: byte_probs[b], reverse=True)
+    rank_of = {b: i for i, b in enumerate(order)}
+    best_legal_rank = min((rank_of[b] for b in legal_bytes), default=None)
+    illegal_prob = byte_probs[emitted_byte] if emitted_byte is not None else None
+    return {
+        "p_legal": p_legal,
+        "best_value": best_value,
+        "best_prob": best_prob,
+        "best_legal_rank": best_legal_rank,
+        "illegal_prob": illegal_prob,
+    }
+
+
+def legal_coeff_token(nc: int) -> list:
+    """The legal ``coeff_token`` codewords for the nC-selected CAVLC table.
+
+    Returns ``[((total_coeff, trailing_ones), bits), ...]`` where ``bits`` is the
+    MSB-first codeword. ``nc < 0`` selects the chroma-DC table (matching
+    ``h264_cavlc_tables.coeff_token_label``). Lazily imports the tables module so this
+    file stays importable stand-alone (its unit tests load it by path)."""
+    from litgpt.byte import h264_cavlc_tables as T  # lazy: avoid a package import at load
+    cmap = T.code_map(T.coeff_token_label(nc))  # {code_str: (total_coeff, trailing_ones)}
+    return [(value, [int(c) for c in code_str]) for code_str, value in cmap.items()]
+
+
 def int_to_bits(value: int, n: int) -> list[int]:
     """The ``n`` bits of ``value`` (MSB-first). Inverse of ``read_bits_int`` semantics."""
     return [(value >> (n - 1 - i)) & 1 for i in range(n)]

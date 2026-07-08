@@ -86,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rescue-gain-bytes", type=int, default=256,
                    help="a legal mb_type 'rescues' if it survives this many bytes past the original desync")
     p.add_argument("--max-backward-fields", type=int, default=8)
+    p.add_argument("--self-test", action="store_true",
+                   help="validate the sub-byte forcing path on one mb_type-desync clip, then exit")
     return p.parse_args()
 
 
@@ -323,12 +325,155 @@ def _read_prefix(clip) -> tuple[bytes, list, int]:
     return prefix, nals, clip.prefix_end_nal
 
 
+def _failed_coeff_token_span(prefix: bytes, generated: bytes):
+    """Reparse and return (span, nc) for the FAILED coeff_token at the first desync in
+    the generated region -- the span the parser records with {'nC':.., 'failed':True}
+    right before the VLC miss propagates. Returns (None, None) if the crash was not a
+    coeff_token (e.g. run_before / total_zeros)."""
+    n_prefix = len(prefix)
+    parsed = HS.parse_stream(prefix + generated, parse_slice_data=True)
+    for nal in parsed.nals:
+        if nal.status == HS.ParseStatus.OK:
+            continue
+        if nal.desync_byte is None or nal.desync_byte < n_prefix:
+            continue
+        span = None
+        for s in nal.spans:
+            if s.name.endswith(".coeff_token"):
+                span = s  # last coeff_token span before/at the crash
+        if span is None or not (isinstance(span.value, dict) and span.value.get("failed")):
+            return None, None  # last coeff_token succeeded -> crash was a later residual field
+        return span, span.value["nC"]
+    return None, None
+
+
+def _cw_mass(byte_probs, bits, bit_off, fixed_high) -> float:
+    """Summed model mass over bytes consistent with fixed_high whose tail begins codeword bits."""
+    tail_len = 8 - bit_off
+    pref = tuple(bits[: min(len(bits), tail_len)])
+    total = 0.0
+    for b in range(256):
+        if (b >> tail_len) != fixed_high:
+            continue
+        tail = [(b >> (tail_len - 1 - i)) & 1 for i in range(tail_len)]
+        if tuple(tail[: len(pref)]) == pref:
+            total += byte_probs[b]
+    return total
+
+
+def exp1_coeff_token(raw, prefix: bytes, generated: bytes, sr, device, args) -> dict:
+    """Exp 1 for a coeff_token crash: P_legal over the nC-selected VLC table + force each
+    legal codeword and continue. Directly tests the nC/parse-state hypothesis -- P_legal
+    high (model wanted a legal codeword, parser still missed) points to a wrong nC state
+    (B/C); P_legal low points to a genuinely bad residual conditional (A)."""
+    span, nc = _failed_coeff_token_span(prefix, generated)
+    out: dict[str, Any] = {"p_legal": None, "exp1_rescue": None}
+    if span is None:
+        return out
+    stream = prefix + generated
+    p_bit = span.byte_start * 8 + (span.bit_start & 7)
+    byte_b, bit_off = p_bit >> 3, p_bit & 7
+    fixed_high = HE.read_bits_int(stream, byte_b * 8, bit_off)
+    emitted_byte = stream[byte_b]
+    codewords = HE.legal_coeff_token(nc)
+
+    byte_probs = _byte_dist_at_end(raw, stream[:byte_b], device)
+    pl = HE.legal_prob_mass_codewords(byte_probs, bit_off, fixed_high, codewords, emitted_byte)
+    out["p_legal"] = {
+        "field": span.name.split("[")[0] + ".coeff_token" if "[" in span.name else span.name,
+        "nC": nc, "p_legal": pl["p_legal"],
+        "best_legal_value": list(pl["best_value"]) if pl["best_value"] is not None else None,
+        "best_legal_rank": pl["best_legal_rank"], "best_legal_prob": pl["best_prob"],
+        "illegal_prob": pl["illegal_prob"],
+    }
+
+    prompt = stream[:byte_b]
+    base_gen = generated[: byte_b - len(prefix)]
+    max_gen = min(int(len(generated) * args.max_gen_multiple) + 512, model_max_gen(raw, prompt))
+    io = _init_offset(prompt)
+    ranked = sorted(codewords, key=lambda vc: _cw_mass(byte_probs, vc[1], bit_off, fixed_high), reverse=True)
+    candidates = []
+    orig_survival = sr.survival
+    best_gain = -1
+    for value, bits in ranked[:8]:
+        forced = HE.int_to_bits(fixed_high, bit_off) + bits
+        p_ids, r_ids, o_ids = _prompt_from_stream(prompt, device)
+        gen2, _ = free_run_rollout(raw, p_ids, r_ids, o_ids, device, args.cont_frames, max_gen,
+                                   args.temperature, forced_bits=forced, init_offset=io)
+        sr2 = _survival(prefix, base_gen + gen2, args.cont_frames)
+        candidates.append({"value": list(value), "survival": sr2.survival,
+                           "next_crash_region": sr2.desync_region})
+        best_gain = max(best_gain, sr2.survival - orig_survival)
+    verdict = "A" if best_gain >= args.rescue_gain_bytes else "BC"
+    out["exp1_rescue"] = {
+        "verdict": verdict,
+        "best_rescue_survival": max((c["survival"] for c in candidates), default=orig_survival),
+        "candidates": candidates,
+    }
+    return out
+
+
+def _mb_type_value_at(stream: bytes, byte_b: int):
+    """Reparse and return the mb_type value whose span begins at on-disk byte byte_b."""
+    parsed = HS.parse_stream(stream, parse_slice_data=True)
+    for nal in parsed.nals:
+        for s in nal.spans:
+            if s.name == "mb_type" and s.byte_start == byte_b:
+                return s.value
+    return None
+
+
+@torch.inference_mode()
+def run_forcing_self_test(raw, clips, device, args) -> bool:
+    """Validate the sub-byte forcing path BEFORE trusting any rescue survival. On the
+    first clip that free-runs to an mb_type desync, force two legal mb_type values into
+    the crash boundary byte, continue, reparse, and assert the forced field decodes to
+    exactly that value (and that different forced values yield different tails, i.e. the
+    model fills the remaining bits itself). Prints PASS/FAIL. Returns True on pass."""
+    torch.manual_seed(args.seed)
+    for idx, clip in enumerate(clips):
+        prefix, nals, _ = _read_prefix(clip)
+        p_ids, r_ids, o_ids = _prompt_from_stream(prefix, device)
+        max_gen = model_max_gen(raw, prefix)
+        gen, _ = free_run_rollout(raw, p_ids, r_ids, o_ids, device, args.cont_frames, max_gen, args.temperature)
+        sr = _survival(prefix, gen, args.cont_frames)
+        span, slice_type = _failed_mb_type_span(prefix, gen)
+        if span is None or sr.desync_region != "mb_type":
+            continue
+        stream = prefix + gen
+        p_bit = span.byte_start * 8 + (span.bit_start & 7)
+        byte_b, bit_off = p_bit >> 3, p_bit & 7
+        fixed_high = HE.read_bits_int(stream, byte_b * 8, bit_off)
+        prompt = stream[:byte_b]
+        io = _init_offset(prompt)
+        legal = HE.legal_mb_type(slice_type if slice_type is not None else HE.SLICE_TYPE_P)
+        tails, ok_all = [], True
+        for v in legal[:2]:
+            forced = HE.int_to_bits(fixed_high, bit_off) + HE.encode_ue(v)
+            pp, rr, oo = _prompt_from_stream(prompt, device)
+            gen2, _ = free_run_rollout(raw, pp, rr, oo, device, args.cont_frames, max_gen,
+                                       args.temperature, forced_bits=forced, init_offset=io)
+            got = _mb_type_value_at(prompt + gen2, byte_b)
+            ok = got == v
+            ok_all = ok_all and ok
+            tails.append(bytes(gen2))
+            print(f"  self-test clip {idx}: force mb_type={v} -> reparsed={got}  {'OK' if ok else 'FAIL'}", flush=True)
+        if len(tails) == 2 and tails[0] == tails[1]:
+            print("  self-test WARN: identical continuations for different forced values "
+                  "(model may not be filling the free bits)", flush=True)
+        print(f"  self-test: {'PASS' if ok_all else 'FAIL'} -- forcing decodes to the intended field", flush=True)
+        return ok_all
+    print("  self-test: no mb_type-desync clip among the selected clips; raise --num-clips", flush=True)
+    return False
+
+
 @torch.inference_mode()
 def evaluate_checkpoint(raw, clips, device, args, name) -> tuple[dict, list]:
     clip_records = []
     survivals, regions = [], Counter()
     p_legals, case_A = [], 0
     exp2_triggered, causal_fields = 0, Counter()
+    ct_p_legals, ct_case_A, ct_n = [], 0, 0  # coeff_token probe aggregates
     for idx, clip in enumerate(clips):
         prefix, nals, prefix_end = _read_prefix(clip)
         p_ids, r_ids, o_ids = _prompt_from_stream(prefix, device)
@@ -343,26 +488,43 @@ def evaluate_checkpoint(raw, clips, device, args, name) -> tuple[dict, list]:
                      "cont_frames": args.cont_frames},
             "free_run": {"survival_bytes": sr.survival, "desync_byte": len(prefix) + sr.survival,
                          "desync_region": sr.desync_region, "desync_reason": sr.desync_reason},
-            "p_legal": None, "exp1_rescue": None, "exp2_backward": None,
+            "p_legal": None, "exp1_rescue": None, "exp2_backward": None, "field": None,
         }
         e1 = exp1_rescue(raw, prefix, gen, sr, device, args)
-        rec["p_legal"] = e1["p_legal"]
-        rec["exp1_rescue"] = e1["exp1_rescue"]
-        if e1["p_legal"] is not None:
+        if e1["p_legal"] is not None:  # mb_type crash
+            rec["field"] = "mb_type"
+            rec["p_legal"] = e1["p_legal"]
+            rec["exp1_rescue"] = e1["exp1_rescue"]
             p_legals.append(e1["p_legal"]["p_legal"])
-        verdict = (e1["exp1_rescue"] or {}).get("verdict")
-        if verdict == "A":
-            case_A += 1
-            line = f"Case A (mb_type={e1['p_legal']['best_legal_value']} rescues)"
-        elif verdict == "BC":
-            exp2_triggered += 1
-            e2 = exp2_backward(raw, prefix, gen, sr, device, args)
-            rec["exp2_backward"] = e2
-            causal_fields[e2["causal_field"] or "none"] += 1
-            line = f"Case BC -> causal field = {e2['causal_field']}"
-        else:
-            line = f"desync@{sr.desync_region} (no mb_type rescue run)"
-        pl = e1["p_legal"]["p_legal"] if e1["p_legal"] else None
+            verdict = (e1["exp1_rescue"] or {}).get("verdict")
+            if verdict == "A":
+                case_A += 1
+                line = f"Case A (mb_type={e1['p_legal']['best_legal_value']} rescues)"
+            elif verdict == "BC":
+                exp2_triggered += 1
+                e2 = exp2_backward(raw, prefix, gen, sr, device, args)
+                rec["exp2_backward"] = e2
+                causal_fields[e2["causal_field"] or "none"] += 1
+                line = f"Case BC -> causal field = {e2['causal_field']}"
+            else:
+                line = "mb_type (no rescue)"
+            pl = e1["p_legal"]["p_legal"]
+        else:  # not mb_type -> try the coeff_token / nC probe
+            ec = exp1_coeff_token(raw, prefix, gen, sr, device, args)
+            if ec["p_legal"] is not None:
+                rec["field"] = "coeff_token"
+                rec["p_legal"] = ec["p_legal"]
+                rec["exp1_rescue"] = ec["exp1_rescue"]
+                ct_n += 1
+                ct_p_legals.append(ec["p_legal"]["p_legal"])
+                v = (ec["exp1_rescue"] or {}).get("verdict")
+                if v == "A":
+                    ct_case_A += 1
+                line = f"coeff_token nC={ec['p_legal']['nC']} -> Case {v}"
+                pl = ec["p_legal"]["p_legal"]
+            else:
+                line = f"desync@{sr.desync_region} (not a rescuable field)"
+                pl = None
         print(f"  clip {idx}: desync@{sr.desync_region} P_legal={pl} -> {line}", flush=True)
         clip_records.append(rec)
 
@@ -374,10 +536,16 @@ def evaluate_checkpoint(raw, clips, device, args, name) -> tuple[dict, list]:
             "survival_median": sorted(survivals)[len(survivals) // 2] if survivals else None,
             "desync_region_hist": dict(regions.most_common()),
         },
-        "exp1": {
+        "exp1_mb_type": {
+            "n": len(p_legals),
             "case_A_rate": case_A / n,
             "case_BC_rate": exp2_triggered / n,
             "p_legal_mean": (sum(p_legals) / len(p_legals)) if p_legals else None,
+        },
+        "exp1_coeff_token": {
+            "n": ct_n,
+            "case_A_rate": (ct_case_A / ct_n) if ct_n else None,
+            "p_legal_mean": (sum(ct_p_legals) / len(ct_p_legals)) if ct_p_legals else None,
         },
         "exp2": {
             "n_triggered": exp2_triggered,
@@ -397,6 +565,16 @@ def main() -> None:
     nal_index = load_nal_index(index_path, args.manifest, rows)
     clips = select_continuation_clips(rows, nal_index, args)
     print(f"Selected {len(clips)} continuation clips", flush=True)
+
+    if args.self_test:
+        ckpt = args.checkpoint_dirs[0]
+        print(f"Loading checkpoint for self-test: {ckpt}", flush=True)
+        model = load_model(ckpt, device)
+        raw = model.module if hasattr(model, "module") else model
+        ok = run_forcing_self_test(raw, clips, device, args)
+        del model
+        print(f"Forcing self-test: {'PASS' if ok else 'FAIL'}", flush=True)
+        sys.exit(0 if ok else 1)
 
     clips_path = args.out_dir / "rescue_clips.jsonl"
     summaries = []
