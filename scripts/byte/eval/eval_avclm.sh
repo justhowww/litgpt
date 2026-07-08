@@ -62,11 +62,12 @@ echo
 echo "===================== consolidated ====================="
 python3 - "$OUT_ROOT" greedy temp1 avclm_topk <<'PY'
 import json, sys
-root, *names = sys.argv[1], sys.argv[2:]
 from pathlib import Path
+root = sys.argv[1]
+names = sys.argv[2:]
 
 def rows(name):
-    p = Path(sys.argv[1]) / name / "metrics.jsonl"
+    p = Path(root) / name / "metrics.jsonl"
     if not p.exists():
         return None, None
     tf = cont = None
