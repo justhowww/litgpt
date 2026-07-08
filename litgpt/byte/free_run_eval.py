@@ -154,6 +154,35 @@ def prepare_free_run_samples(
 
 
 @torch.inference_mode()
+def _sample_token(logits_row: Tensor, temperature: float, top_k: int, top_p: float) -> int:
+    """Sample one byte from a [1, 256] logit row with optional temperature / top-k /
+    top-p (nucleus) truncation. Order: temperature -> top-k -> top-p -> multinomial.
+
+    AVC-LM / JPEG-LM sample at temperature 1.0 with top_k=50, top_p=0.9 -- this cuts
+    the invalid tail (no tail-garbage) without collapsing to the argmax (greedy
+    degenerates for these AR byte-LMs). temperature<=0 with no truncation = greedy.
+    Any -inf entries (e.g. from forced_bits masking) stay excluded.
+    """
+    if temperature <= 0 and not top_k and not (0 < top_p < 1.0):
+        return int(logits_row.argmax(dim=-1))
+    logits = logits_row.float()
+    if temperature > 0:
+        logits = logits / temperature
+    if top_k and top_k < logits.size(-1):
+        kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+        logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
+    if 0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cum = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        # Remove tokens whose cumulative prob BEFORE them already exceeds top_p
+        # (keeps the first token that crosses the threshold -> at least one kept).
+        remove_sorted = (cum - torch.softmax(sorted_logits, dim=-1)) > top_p
+        remove = torch.zeros_like(remove_sorted).scatter(-1, sorted_idx, remove_sorted)
+        logits = torch.where(remove, torch.full_like(logits, float("-inf")), logits)
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, 1))
+
+
 def _forced_byte_mask(next_logits: Tensor, high_bits: int, n_high: int) -> Tensor:
     """Mask a [1, 256] byte-logit row to only bytes whose top ``n_high`` bits equal
     ``high_bits`` (an int of those bits, MSB-first). The model still freely chooses
@@ -178,6 +207,9 @@ def free_run_rollout(
     temperature: float,
     forced_bits: list[int] | None = None,
     init_offset: int = 0,
+    top_k: int = 0,
+    top_p: float = 0.0,
+    stop_pad_run: int = 0,
 ) -> tuple[bytes, int]:
     """Shared free-run byte rollout, used by BOTH the in-loop val_freerun probe
     (``_generate``) and the standalone eval (``generate_continuation``) so their
@@ -206,6 +238,8 @@ def free_run_rollout(
     gen_offset = init_offset  # nonzero when the rescue resumes mid-NAL (not a fresh frame)
     forced = list(forced_bits) if forced_bits else []
     forced_used = 0
+    prev_token = -1  # for stop_pad_run: length of the current identical-byte run
+    run_len = 0
     try:
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = raw(
@@ -224,12 +258,19 @@ def free_run_rollout(
                     high_bits = (high_bits << 1) | forced[forced_used + j]
                 next_logits = _forced_byte_mask(next_logits, high_bits, n_high)
                 forced_used += n_high
-            if temperature <= 0:
-                token = int(next_logits.argmax(dim=-1))
-            else:
-                probs = torch.softmax(next_logits.float() / temperature, dim=-1)
-                token = int(torch.multinomial(probs, 1))
+            token = _sample_token(next_logits, temperature, top_k, top_p)
             generated.append(token)
+
+            # "Gave-up" stop: with no learned EOS, the model falls into a repetitive
+            # padding attractor (e.g. rbsp_trailing) when it runs out of confident
+            # content. A long run of one byte = finished; trim the run and stop so it
+            # doesn't waste the budget on padding (which also inflates survival).
+            if stop_pad_run:
+                run_len = run_len + 1 if token == prev_token else 1
+                prev_token = token
+                if run_len >= stop_pad_run:
+                    del generated[-stop_pad_run:]
+                    break
 
             is_start = len(generated) >= 3 and tuple(generated[-3:]) == START_CODE
             token_offset = gen_offset

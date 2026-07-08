@@ -145,6 +145,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy.")
     parser.add_argument(
+        "--top-k", type=int, default=0,
+        help="Nucleus/top-k sampling: keep the k highest-prob bytes. AVC-LM uses 50 "
+        "(with --temperature 1.0). 0 = off. Greedy (temp 0) degenerates for these AR "
+        "byte-LMs; top-k+top-p is the AVC-LM-faithful setting.",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=0.0,
+        help="Top-p (nucleus) sampling: smallest byte set with cumulative prob >= p. "
+        "AVC-LM uses 0.9 (with --temperature 1.0). 0 = off.",
+    )
+    parser.add_argument(
+        "--stop-pad-run", type=int, default=0,
+        help="Gave-up stop: end free-run when the model emits this many identical bytes "
+        "in a row (the padding/rbsp_trailing attractor it falls into without a learned "
+        "EOS), trimming the run. 0 = off. Try 32.",
+    )
+    parser.add_argument(
         "--survival-only",
         action="store_true",
         help="Continuation mode: skip the ffmpeg GT-decode + frame-count gate and the "
@@ -941,6 +958,9 @@ def generate_continuation(
         cont_frames,
         max_gen,
         args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        stop_pad_run=args.stop_pad_run,
     )
 
 
