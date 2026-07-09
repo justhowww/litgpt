@@ -79,17 +79,16 @@ def rows(name):
             cont = r
     return tf, cont
 
-# Teacher-forced accuracy is identical across configs -- print it once.
+# Teacher-forced value metrics are identical across configs -- print once.
 tf0, _ = rows(names[0])
 if tf0:
-    print("\n[teacher-forced bit-accuracy | sampling-independent]")
-    sba = tf0.get("syntax_bit_acc", {})
-    for k in sorted(sba, key=lambda k: sba[k]["acc"]):
-        print(f"  {k:16s} bit_acc={sba[k]['acc']:.3f}  n_bits={sba[k]['n_bits']}")
-    for k in ("mb_type", "coded_block_pattern"):
-        v = tf0.get("element_bit_acc", {}).get(k)
-        if v:
-            print(f"  * {k:14s} bit_acc={v['acc']:.3f}  n_bits={v['n_bits']}")
+    print("\n[teacher-forced value metrics | sampling-independent]")
+    print("  argmax-decodes-to: CORRECT value (exact) | LEGAL value (would not desync)")
+    cor = tf0.get("element_correct", {})
+    leg = tf0.get("element_legal", {})
+    for k in sorted(cor, key=lambda k: cor[k]["acc"]):
+        legs = f"{leg[k]['acc']:.3f}" if k in leg else "  -  "
+        print(f"  {k:24s} correct={cor[k]['acc']:.3f}  legal={legs}  n={cor[k]['n']}")
 
 print("\n[free-run desync by sampling regime]")
 hdr = f"  {'config':12s} {'surv_med':>8s} {'surv_mean':>9s} {'top desync region':>22s}"

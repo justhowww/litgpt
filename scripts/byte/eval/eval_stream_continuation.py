@@ -576,8 +576,8 @@ def _syntax_buckets(
     Bytes not covered by any span -> "untagged" (GT is valid H.264, so ~0). A byte
     straddles bit-packed elements; it is assigned to the first span (stream order)
     that covers it -- a documented approximation adequate for a coarse *byte-level*
-    signal. For the honest per-field number see _bit_hits (scores only a span's own
-    bits, so short sub-byte fields aren't dragged down by co-packed neighbours).
+    signal. Now used only for the unigram histogram; the honest per-field accuracy is
+    _value_legal_hits (argmax-decodes-to-correct-value / -to-legal-value).
     """
     n = total_len - prefix_len
     cat = ["untagged"] * n
@@ -606,49 +606,136 @@ def _merge_counts(dst: dict[str, list[int]], src: dict[str, list[int]]) -> None:
         acc[1] += tot
 
 
-def _bit_hits(
+def _argmax_bit_reader(pred_list: list[int], prefix_len: int, byte_start: int, rbsp_bit0: int):
+    """A reader over the model's argmax RBSP bits, addressed by absolute RBSP bit index,
+    for a field whose RBSP starts at ``rbsp_bit0`` / raw byte ``byte_start``. Maps RBSP
+    bit -> raw byte (byte_start + (bit>>3 - rbsp_bit0>>3), valid when no emulation-
+    prevention byte lies in the field, as the caller ensures) -> argmax byte in
+    ``pred_list`` (indexed by raw_offset - prefix_len). Returns 0/1 or None past the end.
+    """
+    def bit(b: int):
+        raw_off = byte_start + ((b >> 3) - (rbsp_bit0 >> 3))
+        k = raw_off - prefix_len
+        if 0 <= k < len(pred_list):
+            return (pred_list[k] >> (7 - (b & 7))) & 1
+        return None
+    return bit
+
+
+def _decode_ue_bits(bit, start: int, max_zeros: int = 32):
+    """Decode an exp-Golomb ue(v) from the ``bit`` reader starting at RBSP bit ``start``.
+    Returns the value, or None if it ran off the end / overran ``max_zeros``."""
+    b, zeros = start, 0
+    while True:
+        v = bit(b)
+        b += 1
+        if v is None:
+            return None
+        if v == 1:
+            break
+        zeros += 1
+        if zeros > max_zeros:
+            return None
+    val = 1
+    for _ in range(zeros):
+        v = bit(b)
+        b += 1
+        if v is None:
+            return None
+        val = (val << 1) | v
+    return val - 1
+
+
+def _vlc_decodable(bit, start: int, cmap: dict, max_len: int = 32) -> bool:
+    """True iff the model's argmax bits from ``start`` match some codeword in the
+    prefix-free VLC ``cmap`` (i.e. the codeword is decodable = legal for that table)."""
+    s, b = "", start
+    for _ in range(max_len):
+        v = bit(b)
+        if v is None:
+            return False
+        s += "1" if v else "0"
+        b += 1
+        if s in cmap:
+            return True
+    return False
+
+
+def _value_legal_hits(
     spans: list,
     prefix_len: int,
     total_len: int,
     gt_list: list[int],
     pred_list: list[int],
-) -> tuple[dict[str, list[int]], dict[str, list[int]], int]:
-    """Bit-level top-1 accuracy per category/element: score ONLY each span's own
-    RBSP bits against the model's argmax byte, removing the byte-level co-packing
-    that sinks short sub-byte fields (mb_type, sub_mb_type, cbp).
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """The honest per-field metrics from the teacher-forced argmax:
 
-    A span's RBSP byte r (=bit>>3) maps to raw offset byte_start + (r - rb0) when the
-    field contains no emulation-prevention byte -- detectable as raw-byte count ==
-    rbsp-byte count. Spans with an interior 00-00-03 (counts differ) are skipped and
-    tallied (rare mid-field). gt_list/pred_list index by k = raw_offset - prefix_len.
+      correct[element] = fraction of that element's occurrences where the argmax bits
+          EXACTLY reproduce GT's codeword. For a prefix-free code this is identical to
+          "the argmax decodes to the CORRECT value" -- no byte co-packing (unlike a
+          per-byte match) and no per-bit partial credit (unlike bit accuracy).
+      legal[element]   = fraction where the argmax codeword decodes to a LEGAL value for
+          the field's constraint. Defined for mb_type (<=30 P / <=25 I), coded_block_
+          pattern (codeNum < 48), and coeff_token (matches the nC-selected VLC table);
+          1 - legal is the rate at which the model's own best guess would DESYNC there.
+
+    Spans with an interior emulation-prevention byte (raw-byte count != rbsp-byte count)
+    are skipped (the local RBSP<->raw mapping is unreliable). gt_list/pred_list index by
+    k = raw_offset - prefix_len.
     """
-    cat_bit: dict[str, list[int]] = {}
-    elem_bit: dict[str, list[int]] = {}
-    epb_skipped = 0
+    from litgpt.byte import h264_cavlc_tables as T
+
+    correct: dict[str, list[int]] = {}
+    legal: dict[str, list[int]] = {}
+    slice_type = None
     for span in spans:
+        if span.name == "slice_type":
+            slice_type = span.value
         b0, b1 = span.bit_start, span.bit_end
         if b1 <= b0:
             continue
         rb0 = b0 >> 3
         n_rbsp = ((b1 - 1) >> 3) - rb0 + 1
-        n_raw = span.byte_end - span.byte_start
-        if n_rbsp != n_raw:
-            epb_skipped += 1  # emulation-prevention inside the field; skip
-            continue
-        cb = cat_bit.setdefault(span.category.value, [0, 0])
-        eb = elem_bit.setdefault(_INDEX_RE.sub("", span.name), [0, 0])
+        if n_rbsp != (span.byte_end - span.byte_start):
+            continue  # emulation-prevention inside the field; local mapping unreliable
+
+        ename = _INDEX_RE.sub("", span.name)
+        all_match, any_in = True, False
         for b in range(b0, b1):
             raw_off = span.byte_start + ((b >> 3) - rb0)
             if not (prefix_len <= raw_off < total_len):
                 continue
+            any_in = True
             k = raw_off - prefix_len
-            shift = 7 - (b & 7)  # bitstream is MSB-first
-            hit = int(((gt_list[k] >> shift) & 1) == ((pred_list[k] >> shift) & 1))
-            cb[0] += hit
-            cb[1] += 1
-            eb[0] += hit
-            eb[1] += 1
-    return cat_bit, elem_bit, epb_skipped
+            shift = 7 - (b & 7)  # MSB-first
+            if ((gt_list[k] >> shift) & 1) != ((pred_list[k] >> shift) & 1):
+                all_match = False
+        if not any_in:
+            continue
+        c = correct.setdefault(ename, [0, 0])
+        c[0] += int(all_match)
+        c[1] += 1
+
+        bit = _argmax_bit_reader(pred_list, prefix_len, span.byte_start, b0)
+        is_legal = None
+        if span.name == "mb_type":
+            v = _decode_ue_bits(bit, b0)
+            if v is not None and slice_type is not None:
+                hi = 25 if (slice_type % 5 == 2) else 30  # I-slice caps at 25, else P (30)
+                is_legal = 0 <= v <= hi
+        elif span.name == "coded_block_pattern":
+            v = _decode_ue_bits(bit, b0)
+            if v is not None:
+                is_legal = 0 <= v < 48  # GOLOMB_TO_*_CBP have 48 entries
+        elif span.name.endswith(".coeff_token"):
+            nc = span.value.get("nC") if isinstance(span.value, dict) else None
+            if nc is not None:
+                is_legal = _vlc_decodable(bit, b0, T.code_map(T.coeff_token_label(nc)))
+        if is_legal is not None:
+            lg = legal.setdefault(ename, [0, 0])
+            lg[0] += int(is_legal)
+            lg[1] += 1
+    return correct, legal
 
 
 def _copy_oracle(spans: list) -> dict[str, list[int]]:
@@ -704,10 +791,13 @@ def evaluate_teacher_forced(
     byte. Readings:
       * ``tf_byte_acc`` / ``tf_ce_nats`` -- overall local bit-fidelity (and a
         cross-check that the forward is faithful: tf_ce tracks training val_loss_ar).
-      * ``syntax_acc`` / ``element_acc`` / flat ``acc_*`` -- the same top-1 accuracy
-        bucketed by H.264 syntax element, to localize where the model succeeds
-        (structural: start codes, NAL/slice headers, mb_type) vs fails (residual
-        coefficients, motion-vector deltas).
+      * ``element_correct`` / ``element_legal`` (+ headline ``correct_*`` / ``legal_*``)
+        -- per H.264 syntax element, whether the argmax codeword decodes to the CORRECT
+        value (exact codeword match) and to a LEGAL value (would not desync). These are
+        the honest per-field numbers: bit-accuracy overstates (per-bit partial credit on
+        near-deterministic fields), byte-accuracy understates (co-packed neighbours), and
+        neither answers "would the model's own best guess produce a valid value here" --
+        which ``legal_*`` does, and which predicts the free-run desync rate.
     """
     raw = model.module if hasattr(model, "module") else model  # * model
     raw.eval()
@@ -717,18 +807,16 @@ def evaluate_teacher_forced(
     byte_accs: list[float] = []
     ces: list[float] = []
     # Pooled (across-clip, byte-weighted) per-syntax accuracy: bucket -> [hits, total].
-    cat_acc: dict[str, list[int]] = {}
-    elem_acc: dict[str, list[int]] = {}
-    # Bit-level accuracy (score only each field's own bits) -> bucket -> [hits, bits].
-    cat_bit: dict[str, list[int]] = {}
-    elem_bit: dict[str, list[int]] = {}
+    # Honest per-field metrics: does the model's argmax codeword decode to the CORRECT
+    # value (exact codeword match), and to a LEGAL value (would not desync)?
+    elem_correct: dict[str, list[int]] = {}
+    elem_legal: dict[str, list[int]] = {}
     # Unigram/chance floor: GT byte histogram per bucket (accuracy of always guessing
     # the bucket's most common byte).
     cat_hist: dict[str, Counter] = {}
     elem_hist: dict[str, Counter] = {}
     # Temporal-copy oracle (GT-only): per-element previous-frame persistence.
     copy_acc: dict[str, list[int]] = {}
-    bit_epb_skipped = 0
     skipped = 0
     attempted = 0
 
@@ -803,25 +891,16 @@ def evaluate_teacher_forced(
         gt_list = cont_targets.tolist()
         pred_list = pred_ids.tolist()
 
-        # Byte-level accuracy (coarse; short sub-byte fields are co-packing-diluted)
-        # + unigram histogram per bucket.
-        hits = (pred_ids == cont_targets).tolist()
+        # Unigram histogram per bucket (chance floor).
         cat_of, elem_of = _syntax_buckets(spans, prefix_len, total_len)
-        for k, hit in enumerate(hits):
-            cat_acc.setdefault(cat_of[k], [0, 0])
-            cat_acc[cat_of[k]][0] += int(hit)
-            cat_acc[cat_of[k]][1] += 1
-            elem_acc.setdefault(elem_of[k], [0, 0])
-            elem_acc[elem_of[k]][0] += int(hit)
-            elem_acc[elem_of[k]][1] += 1
+        for k in range(len(gt_list)):
             cat_hist.setdefault(cat_of[k], Counter())[gt_list[k]] += 1
             elem_hist.setdefault(elem_of[k], Counter())[gt_list[k]] += 1
 
-        # Bit-level accuracy (honest per-field) + temporal-copy oracle.
-        cb, eb, epb = _bit_hits(spans, prefix_len, total_len, gt_list, pred_list)
-        _merge_counts(cat_bit, cb)
-        _merge_counts(elem_bit, eb)
-        bit_epb_skipped += epb
+        # Honest per-field metrics (correct-value / legal-value) + temporal-copy oracle.
+        cor, leg = _value_legal_hits(spans, prefix_len, total_len, gt_list, pred_list)
+        _merge_counts(elem_correct, cor)
+        _merge_counts(elem_legal, leg)
         _merge_counts(copy_acc, _copy_oracle(spans))
 
         details.append(
@@ -835,19 +914,6 @@ def evaluate_teacher_forced(
             }
         )
 
-    residual = [
-        cat_acc.get("residual_luma", [0, 0])[0]
-        + cat_acc.get("residual_chroma", [0, 0])[0],
-        cat_acc.get("residual_luma", [0, 0])[1]
-        + cat_acc.get("residual_chroma", [0, 0])[1],
-    ]
-    residual_bit = [
-        cat_bit.get("residual_luma", [0, 0])[0]
-        + cat_bit.get("residual_chroma", [0, 0])[0],
-        cat_bit.get("residual_luma", [0, 0])[1]
-        + cat_bit.get("residual_chroma", [0, 0])[1],
-    ]
-
     def _uni(counter: Counter) -> float | None:
         tot = sum(counter.values())
         return max(counter.values()) / tot if tot else None
@@ -859,25 +925,16 @@ def evaluate_teacher_forced(
         "num_skipped_too_long": skipped,
         "tf_byte_acc_mean": mean(byte_accs),
         "tf_ce_nats_mean": mean(ces),
-        # Flat, grep-friendly headline accuracies (structure vs content).
-        "acc_start_code": _acc(cat_acc.get("start_code", [0, 0])),
-        "acc_nal_header": _acc(cat_acc.get("nal_header", [0, 0])),
-        "acc_slice_header": _acc(cat_acc.get("slice_header", [0, 0])),
-        "acc_mb_header": _acc(cat_acc.get("mb_header", [0, 0])),
-        "acc_mb_pred": _acc(cat_acc.get("mb_pred", [0, 0])),
-        "acc_cbp": _acc(cat_acc.get("cbp", [0, 0])),
-        "acc_residual": _acc(residual),
-        # Bit-level accuracy: scores only each field's own RBSP bits, so short
-        # sub-byte fields (mb_type) aren't diluted by co-packed neighbours.
-        "bit_acc_start_code": _acc(cat_bit.get("start_code", [0, 0])),
-        "bit_acc_slice_header": _acc(cat_bit.get("slice_header", [0, 0])),
-        "bit_acc_mb_header": _acc(cat_bit.get("mb_header", [0, 0])),
-        "bit_acc_mb_pred": _acc(cat_bit.get("mb_pred", [0, 0])),
-        "bit_acc_residual": _acc(residual_bit),
-        "bit_acc_mb_type": _acc(elem_bit.get("mb_type", [0, 0])),
-        "bit_epb_skipped": bit_epb_skipped,  # fields skipped for interior 00-00-03
-        # Unigram/chance floor (byte-level): accuracy of always guessing the bucket's
-        # most common byte -- the floor the model's byte acc_* must beat.
+        # HONEST per-field headline: does the argmax codeword decode to the CORRECT value
+        # (exact codeword match) and to a LEGAL value (would not desync)? These replace
+        # bit-accuracy (per-bit, overstates) and byte-accuracy (co-packing, understates).
+        "correct_mb_type": _acc(elem_correct.get("mb_type", [0, 0])),
+        "legal_mb_type": _acc(elem_legal.get("mb_type", [0, 0])),
+        "correct_cbp": _acc(elem_correct.get("coded_block_pattern", [0, 0])),
+        "legal_cbp": _acc(elem_legal.get("coded_block_pattern", [0, 0])),
+        "correct_coeff_token": _acc(elem_correct.get("luma.coeff_token", [0, 0])),
+        "legal_coeff_token": _acc(elem_legal.get("luma.coeff_token", [0, 0])),
+        # Unigram/chance floor: accuracy of always guessing the bucket's most common byte.
         "unigram_mb_type": _uni(elem_hist.get("mb_type", Counter())),
         "unigram_mb_pred": _uni(cat_hist.get("mb_pred", Counter())),
         "unigram_residual": _uni(
@@ -886,22 +943,16 @@ def evaluate_teacher_forced(
         ),
         # Temporal-copy oracle (GT-only): does the field persist frame-to-frame?
         "copy_oracle_mb_type": _acc(copy_acc.get("mb_type", [0, 0])),
-        # Full breakdowns (nested; readable in JSONL).
-        "syntax_acc": {
-            c: {"acc": h / t, "n": t} for c, (h, t) in sorted(cat_acc.items()) if t
-        },
-        "element_acc": {
+        # Full per-element breakdowns.
+        "element_correct": {
             e: {"acc": h / t, "n": t}
-            for e, (h, t) in sorted(elem_acc.items())
-            if t >= 32
+            for e, (h, t) in sorted(elem_correct.items())
+            if t >= 16
         },
-        "syntax_bit_acc": {
-            c: {"acc": h / t, "n_bits": t} for c, (h, t) in sorted(cat_bit.items()) if t
-        },
-        "element_bit_acc": {
-            e: {"acc": h / t, "n_bits": t}
-            for e, (h, t) in sorted(elem_bit.items())
-            if t >= 64
+        "element_legal": {
+            e: {"acc": h / t, "n": t}
+            for e, (h, t) in sorted(elem_legal.items())
+            if t >= 16
         },
         "unigram_acc": {
             e: {"acc": _uni(c), "n": sum(c.values())}
