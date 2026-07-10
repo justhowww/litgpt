@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 0 -- tiny overfit sanity check on UMD Vulcan (single a5000). ~10 videos, ~10.6M
+# Phase 0 -- tiny overfit sanity check on UMD Vulcan (single a6000). ~10 videos, ~10.6M
 # model (6/384/6), NO encodings (AVC-LM-style), SPS/PPS in windows. Goal: memorize + GREEDY free-run
 # reproduce the training videos (L0->L3; L2 = byte-exact reproduction = pass/fail line).
 # STEPS is a high ceiling (1M); overfit converges far earlier and the run is resumable.
@@ -45,7 +45,7 @@ sbatch_args=(--parsable --export=ALL
     --output="${OUT_DIR}/logs/%x-%j.out" --error="${OUT_DIR}/logs/%x-%j.err")
 [[ -n "${EXCLUDE_NODES:-}" ]] && sbatch_args+=(--exclude="${EXCLUDE_NODES}")
 
-echo "[phase0-overfit/vulcan] ${MAX_ROWS} videos / ~10M (${N_LAYER}/${N_EMBD}/${N_HEAD}) / ${DEVICES}x a5000 / no_encoding=${NO_ENCODING} / steps=${STEPS}"
+echo "[phase0-overfit/vulcan] ${MAX_ROWS} videos / ~10M (${N_LAYER}/${N_EMBD}/${N_HEAD}) / ${DEVICES}x a6000 / no_encoding=${NO_ENCODING} / steps=${STEPS}"
 echo "  OUT_DIR=${OUT_DIR}"
 job_id=$(sbatch "${sbatch_args[@]}" "${SCRIPT_DIR}/train.sbatch")
 echo "Submitted phase0-overfit job ${job_id}"
