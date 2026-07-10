@@ -12,7 +12,7 @@ set -euo pipefail
 export SLURM_EXPORT_ENV=ALL
 
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
-source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
+source "${REPO_ROOT}/scripts/hpc/vulcan/env.sh"
 
 : "${MANIFEST:?Set MANIFEST to the scratch-resident corpus manifest.jsonl}"
 
@@ -29,6 +29,8 @@ STEPS=${STEPS:-100000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-8}
+DEVICES=${DEVICES:-1}
+NUM_NODES=${NUM_NODES:-1}
 WINDOW_MIN_FRAMES=${WINDOW_MIN_FRAMES:-2}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 WARMUP_STEPS=${WARMUP_STEPS:-2000}
@@ -54,7 +56,7 @@ if [[ ! -r "${MANIFEST}" ]]; then
 fi
 if [[ ! -r "${NAL_INDEX}" ]]; then
     echo "NAL index is not readable: ${NAL_INDEX}" >&2
-    echo "Build it with scripts/hpc/zaratan/submit_byte_nal_index.sh before training." >&2
+    echo "Build nal_index.sqlite (scripts/byte build_byte_nal_index) before training." >&2
     exit 1
 fi
 
@@ -77,6 +79,8 @@ cmd=(
     --warmup-steps "${WARMUP_STEPS}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --micro-batch-size "${MICRO_BATCH_SIZE}"
+    --devices "${DEVICES}"
+    --num-nodes "${NUM_NODES}"
     --learning-rate "${LEARNING_RATE}"
     --min-learning-rate "${MIN_LEARNING_RATE}"
     --val-fraction "${VAL_FRACTION}"

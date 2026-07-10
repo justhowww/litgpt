@@ -409,6 +409,14 @@ def fit(
     initial_iter = state["iter_num"]
     train_iterator = CycleIterator(train_dataloader)
 
+    # Batch config -- read this alongside the per-step "peak mem" to size micro_batch_size.
+    fabric.print(
+        f"batch config | micro_batch={train.micro_batch_size} "
+        f"grad_accum={train.gradient_accumulation_iters(devices, num_nodes)} "
+        f"global_batch={train.global_batch_size} block/seq={model.max_seq_length} "
+        f"devices={devices}x{num_nodes} -> watch 'peak mem' below vs the card size"
+    )
+
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
         fabric.device
     )
@@ -526,6 +534,15 @@ def fit(
                 supervised_tokens = (targets != -100).sum()
                 metrics["supervised_tokens"] = supervised_tokens
                 metrics["raw_tokens"] = model_inputs["idx"].numel()
+            # Peak GPU memory so far -- use it to size micro_batch_size. `reserved` is what
+            # actually counts against the card (e.g. 48 GB a6000); it stabilizes within a
+            # few steps, so the first log lines tell you the headroom. If reserved is well
+            # under the card size you can raise MICRO_BATCH_SIZE.
+            mem_reserved_gb = 0.0
+            if fabric.device.type == "cuda":
+                mem_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
+                metrics["gpu_mem_reserved_gb"] = mem_reserved_gb
+                metrics["gpu_mem_alloc_gb"] = torch.cuda.max_memory_allocated() / 1e9
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
@@ -534,6 +551,7 @@ def fit(
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
+                f" | peak mem: {mem_reserved_gb:.1f} GB"
                 f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"
             )
 
