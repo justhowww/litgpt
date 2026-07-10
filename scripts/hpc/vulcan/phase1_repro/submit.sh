@@ -26,7 +26,7 @@ export WARMUP_STEPS=${WARMUP_STEPS:-2000}
 # 64 keeps the effective batch of a 1-GPU run while training ~2x faster. To DOUBLE the
 # effective batch, set GLOBAL_BATCH_SIZE=128 (consider a higher LR / more warmup then).
 export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
-export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-2}  # per-GPU; raise once 'peak mem' shows headroom
+export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-4}  # per-GPU; raise once 'peak mem' shows headroom
 export VAL_FRACTION=${VAL_FRACTION:-0.01}
 export EVAL_INTERVAL=${EVAL_INTERVAL:-250}
 export SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
