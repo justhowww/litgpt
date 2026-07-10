@@ -170,6 +170,22 @@ def parse_args() -> argparse.Namespace:
         "Needed for the per-MB (slice-max-mbs=1) corpus where 'frames' are macroblocks, and "
         "handy without ffmpeg.",
     )
+    parser.add_argument(
+        "--train-split-file",
+        type=Path,
+        default=None,
+        help="Path to a train_split.json written by train.py. Restricts eval to the exact "
+        "videos that were TRAINED (drops any held-out videos), giving an unambiguous "
+        "training-set eval. Use the same --manifest/--max-manifest-rows as training.",
+    )
+    parser.add_argument(
+        "--exclude-param-sets",
+        action="store_true",
+        help="Feed the model a window that STARTS at the first VCL NAL (IDR), dropping the "
+        "leading SPS/PPS/SEI -- matching the training windows (which begin at the IDR). "
+        "Parsing/metrics still use the full stream (SPS/PPS kept only for the parser), so "
+        "correct/legal mb_type is measured with the model conditioned exactly as in training.",
+    )
     parser.add_argument("--viz-fps", type=int, default=6)
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
     parser.add_argument("--timeout-sec", type=int, default=60)
@@ -188,6 +204,21 @@ def main() -> None:
     rows = load_manifest_rows(
         args.manifest, max_rows=args.max_manifest_rows or None, report_progress=True
     )
+    if args.train_split_file is not None:
+        split = json.loads(Path(args.train_split_file).read_text(encoding="utf-8"))
+        train_videos = {str(Path(v)) for v in split.get("videos", [])}
+        before = len(rows)
+        rows = [r for r in rows if str(Path(r["h264_path"])) in train_videos]
+        print(
+            f"train-split filter: {len(rows)}/{before} rows kept "
+            f"({split.get('n_train_videos')} train videos from {args.train_split_file})",
+            flush=True,
+        )
+        if not rows:
+            raise SystemExit(
+                "No manifest rows matched the train split -- check --manifest / "
+                "--max-manifest-rows match the training run."
+            )
     index_path = args.nal_index_path or default_nal_index_path(args.manifest)
     nal_index = load_nal_index(
         index_path, args.manifest, rows
@@ -279,7 +310,10 @@ def _first_qualifying_window(
         if nals[k].nal_type != 5:
             continue
         start = k
-        while start - 1 >= 0 and nals[start - 1].nal_type in PARAMETER_SET_NAL_TYPES:
+        # Back up over the access unit's leading non-VCL NALs (SPS/PPS + any SEI/AUD
+        # between them and the IDR), stopping at the previous VCL slice -- matches
+        # _windows_for_video so the eval window start aligns with training.
+        while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
             start -= 1
         total = 0
         vcl = 0
@@ -326,9 +360,11 @@ def select_intra_clips(
         if idr is None:
             continue
         start = idr
-        while start - 1 >= 0 and nals[start - 1].nal_type in PARAMETER_SET_NAL_TYPES:
+        # Back up over leading non-VCL NALs (SPS/PPS + any SEI/AUD before the IDR),
+        # stopping at the previous VCL slice -- matches _windows_for_video.
+        while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
             start -= 1
-        if start == idr:
+        if not any(nals[i].nal_type in PARAMETER_SET_NAL_TYPES for i in range(start, idr)):
             continue  # no SPS/PPS before the IDR -> cannot decode the generated frame
         psp = sum(nals[i].end - nals[i].start for i in range(start, idr))
         idr_len = nals[idr].end - nals[idr].start
@@ -385,6 +421,14 @@ def evaluate_checkpoint(
         prefix_bytes = _concat_nals(data, nals, 0, clip.prefix_end_nal)
         gt_bytes = _concat_nals(data, nals, 0, clip.cont_end_nal)
         gt_cont_len = len(gt_bytes) - len(prefix_bytes)
+        # --exclude-param-sets: feed the model a prefix that starts at the first VCL NAL
+        # (IDR), matching training. Survival still parses with the FULL prefix (SPS/PPS
+        # kept only for the parser), so the desync location is unaffected.
+        vcl_start = (
+            _leading_param_bytes(nals, clip.prefix_end_nal)[0]
+            if args.exclude_param_sets else 0
+        )
+        fed_prefix = _concat_nals(data, nals, vcl_start, clip.prefix_end_nal)
 
         if not args.survival_only:
             gt_frames, _ = decode_h264(gt_bytes, args, strict=False)
@@ -400,7 +444,7 @@ def evaluate_checkpoint(
 
         max_gen = min(
             int(gt_cont_len * args.max_gen_multiple) + 512,
-            model_max_gen(model, prefix_bytes),
+            model_max_gen(model, fed_prefix),
         )
         if max_gen <= 0:
             # Prefix fills (or exceeds) the model context: there is no room to
@@ -418,13 +462,14 @@ def evaluate_checkpoint(
             continue
         gen_bytes, gen_frames_emitted = generate_continuation(
             model,
-            prefix_bytes,
+            fed_prefix,
             nals,
             clip.prefix_end_nal,
             device,
             args,
             clip.cont_frames,
             max_gen,
+            start_nal=vcl_start,
         )
         n, m = clip.prefix_frames, clip.cont_frames
 
@@ -661,6 +706,32 @@ def _vlc_decodable(bit, start: int, cmap: dict, max_len: int = 32) -> bool:
     return False
 
 
+def _leading_param_bytes(nals: list[NALUnit], end_nal: int) -> tuple[int, int]:
+    """(vcl_start, ps_len): index of the first VCL NAL in [0, end_nal) and the byte length
+    of the leading non-VCL NALs (SPS/PPS/SEI) before it. (0, 0) if it starts at a VCL NAL."""
+    vcl_start = next((i for i in range(end_nal) if nals[i].nal_type in VCL_NAL_TYPES), 0)
+    ps_len = sum(nals[i].end - nals[i].start for i in range(vcl_start))
+    return vcl_start, ps_len
+
+
+def _shift_spans(spans: list, ps_len: int) -> list:
+    """Map parsed spans from full-window Annex-B byte coords into fed-window coords (the
+    window with ps_len leading param-set bytes dropped): byte_start/byte_end move by
+    -ps_len; bit_start/bit_end are per-NAL RBSP offsets, unchanged. Param-set spans (now
+    before byte 0) are dropped. Used with --exclude-param-sets so the metric, computed in
+    fed coords, aligns with the model that was fed the param-set-free window."""
+    if ps_len == 0:
+        return spans
+    out = []
+    for s in spans:
+        if s.byte_start < ps_len:
+            continue
+        s.byte_start -= ps_len
+        s.byte_end -= ps_len
+        out.append(s)
+    return out
+
+
 def _value_legal_hits(
     spans: list,
     prefix_len: int,
@@ -830,22 +901,31 @@ def evaluate_teacher_forced(
         total_len = len(gt_bytes)
         if total_len - prefix_len <= 0:
             continue
-        # One BOS + all GT bytes must fit the context window.
-        if total_len + 1 > max_seq:
+        # --exclude-param-sets: feed a window starting at the first VCL NAL (IDR), like the
+        # training windows. The full window is still parsed below (SPS/PPS kept for the
+        # parser); spans are shifted into fed coords. ps_len = leading param-set bytes.
+        vcl_start, ps_len = (
+            _leading_param_bytes(nals, clip.cont_end_nal) if args.exclude_param_sets else (0, 0)
+        )
+        fed_bytes = gt_bytes[ps_len:]
+        fed_prefix_len = prefix_len - ps_len
+        fed_total_len = total_len - ps_len
+        # One BOS + all fed bytes must fit the context window.
+        if fed_total_len + 1 > max_seq:
             skipped += 1
             details.append(
                 {
                     "checkpoint": checkpoint_name,
                     "clip_index": clip_idx,
                     "status": "skipped_too_long",
-                    "window_bytes": total_len,
+                    "window_bytes": fed_total_len,
                 }
             )
             continue
         attempted += 1
         # * preparing for inputs and auxiliary inputs (region_ids, offset_ids)
         prompt_ids, region_ids, offset_ids = _prompt_tensors(
-            gt_bytes, nals, clip.cont_end_nal
+            fed_bytes, nals, clip.cont_end_nal, start_nal=vcl_start
         )
         prompt_ids = prompt_ids.to(device).unsqueeze(0)
         region_ids = region_ids.to(device).unsqueeze(0)
@@ -876,29 +956,30 @@ def evaluate_teacher_forced(
 
         # token = [BOS, gt_0, ..., gt_{L-1}]; logits[:, j] predicts token[j+1] = gt_j.
         # Continuation bytes are gt_j for j in [prefix_len, total_len-1].
-        gt_ids = bytes_to_ids(gt_bytes).to(device)
-        cont_logits = logits[0, prefix_len:total_len, :BYTE_VOCAB_SIZE].float()
-        cont_targets = gt_ids[prefix_len:total_len]
+        gt_ids = bytes_to_ids(fed_bytes).to(device)
+        cont_logits = logits[0, fed_prefix_len:fed_total_len, :BYTE_VOCAB_SIZE].float()
+        cont_targets = gt_ids[fed_prefix_len:fed_total_len]
         pred_ids = cont_logits.argmax(dim=-1)
         acc = float((pred_ids == cont_targets).float().mean())
         ce = float(torch.nn.functional.cross_entropy(cont_logits, cont_targets))
         byte_accs.append(acc)
         ces.append(ce)
 
-        # Parse the GT window ONCE; reuse the spans for byte-level buckets, bit-level
-        # accuracy, the unigram floor, and the temporal-copy oracle.
+        # Parse the FULL GT window once (SPS/PPS needed to resolve pps_id), then shift the
+        # spans into fed coords so they align with the (param-set-free) window the model saw.
         spans = HS.parse_stream(gt_bytes, parse_slice_data=True).all_spans()
+        spans = _shift_spans(spans, ps_len)
         gt_list = cont_targets.tolist()
         pred_list = pred_ids.tolist()
 
         # Unigram histogram per bucket (chance floor).
-        cat_of, elem_of = _syntax_buckets(spans, prefix_len, total_len)
+        cat_of, elem_of = _syntax_buckets(spans, fed_prefix_len, fed_total_len)
         for k in range(len(gt_list)):
             cat_hist.setdefault(cat_of[k], Counter())[gt_list[k]] += 1
             elem_hist.setdefault(elem_of[k], Counter())[gt_list[k]] += 1
 
         # Honest per-field metrics (correct-value / legal-value) + temporal-copy oracle.
-        cor, leg = _value_legal_hits(spans, prefix_len, total_len, gt_list, pred_list)
+        cor, leg = _value_legal_hits(spans, fed_prefix_len, fed_total_len, gt_list, pred_list)
         _merge_counts(elem_correct, cor)
         _merge_counts(elem_legal, leg)
         _merge_counts(copy_acc, _copy_oracle(spans))
@@ -986,15 +1067,17 @@ def generate_continuation(
     args: argparse.Namespace,
     cont_frames: int,
     max_gen: int,
+    start_nal: int = 0,
 ) -> tuple[bytes, int]:
     """Free-run byte generation, stopping after the model emits cont_frames complete
     frames (cont_frames + 1 start codes) or the byte budget. Offsets reset per NAL by
-    detecting start codes; region is REGION_TARGET for all generated bytes."""
+    detecting start codes; region is REGION_TARGET for all generated bytes. ``start_nal``
+    > 0 (--exclude-param-sets) means ``prefix_bytes`` = concat of nals[start_nal:end]."""
     raw = model.module if hasattr(model, "module") else model
     raw.eval()
 
     prompt_ids, prompt_region, prompt_offset = _prompt_tensors(
-        prefix_bytes, nals, prefix_end_nal
+        prefix_bytes, nals, prefix_end_nal, start_nal=start_nal
     )
     prompt_ids = prompt_ids.to(device).unsqueeze(0)
     prompt_region = prompt_region.to(device).unsqueeze(0)
@@ -1016,11 +1099,14 @@ def generate_continuation(
 
 
 def _prompt_tensors(
-    prefix_bytes: bytes, nals: list[NALUnit], prefix_end_nal: int
+    prompt_bytes: bytes, nals: list[NALUnit], end_nal: int, start_nal: int = 0
 ) -> tuple[Tensor, Tensor, Tensor]:
+    """Build (prompt_ids, region_ids, offset_ids) for ``prompt_bytes`` = concat of
+    nals[start_nal:end_nal]. ``start_nal`` > 0 drops leading NALs (e.g. SPS/PPS/SEI) to
+    match training windows that begin at the IDR -- offset_ids are per-NAL either way."""
     region_chunks: list[Tensor] = []
     offset_chunks: list[Tensor] = []
-    for nal in nals[:prefix_end_nal]:
+    for nal in nals[start_nal:end_nal]:
         length = nal.end - nal.start
         region = (
             REGION_META if nal.nal_type in PARAMETER_SET_NAL_TYPES else REGION_TARGET
@@ -1030,7 +1116,7 @@ def _prompt_tensors(
     raw_region = torch.cat(region_chunks)
     raw_offset = torch.cat(offset_chunks)
     bos = torch.tensor([SLICE_BOS_ID], dtype=torch.long)
-    prompt_ids = torch.cat((bos, bytes_to_ids(prefix_bytes)))
+    prompt_ids = torch.cat((bos, bytes_to_ids(prompt_bytes)))
     region_ids = torch.cat(
         (torch.tensor([REGION_TARGET], dtype=torch.long), raw_region)
     )

@@ -349,6 +349,9 @@ def main() -> None:
         config=data_config,
         max_manifest_rows=max_manifest_rows,
         nal_index_path=args.nal_index_path,
+        # Record the exact train split so a later training-set eval can target precisely
+        # what was trained (--train-split-file in eval_stream_continuation.py).
+        train_split_dump_path=args.out_dir / "train_split.json",
     )
     train = TrainArgs(
         save_interval=args.save_interval,

@@ -1000,12 +1000,15 @@ class ByteStreamWindowDataset(Dataset):
         idr_positions = [k for k, nal in enumerate(nals) if nal.nal_type == 5]
         used_until = 0  # next window must start at or after this NAL index
         for k in idr_positions:
-            # Back up to include the parameter sets immediately preceding the IDR
-            # so the window is self-contained and decodable from its first byte.
+            # Back up to include the access unit's leading non-VCL NALs (SPS/PPS, plus
+            # any SEI/AUD wedged between them and the IDR) so the window carries its
+            # parameter sets and is self-contained/decodable from its first byte. Stop at
+            # the previous VCL slice so we don't pull in an earlier frame. NOTE: an earlier
+            # version stepped back only over PARAMETER_SET_NAL_TYPES; when an SEI sat
+            # between the PPS and the IDR that stopped the backup at the SEI, so those
+            # windows silently omitted SPS/PPS (baselines up to and including xl-avclm).
             start = k
-            while (
-                start - 1 >= 0 and nals[start - 1].nal_type in PARAMETER_SET_NAL_TYPES
-            ):
+            while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
                 start -= 1
             if start < used_until:
                 continue  # this GOP is already inside a previously packed window
@@ -1119,6 +1122,10 @@ class ByteDataModule(DataModule):
     nal_index_path: Path | None = (
         None  # Defaults to manifest_dir/nal_index.sqlite when present.
     )
+    train_split_dump_path: Path | None = (
+        None  # If set, setup() writes the exact train split (videos + windows) here so a
+        # later training-set eval can target precisely what was trained.
+    )
 
     batch_size: int = field(default=1, init=False, repr=False)
     max_seq_length: int = field(
@@ -1220,6 +1227,44 @@ class ByteDataModule(DataModule):
             self.train_dataset, self.val_dataset = random_split(
                 dataset, [train_size, val_size], generator=generator
             )
+
+        if self.train_split_dump_path is not None:
+            self._dump_train_split()
+
+    def _dump_train_split(self) -> None:
+        """Write the EXACT train split -- train videos and (window mode) their
+        (h264_path, start_nal, end_nal) windows -- so a training-set eval can target
+        precisely what was trained, regardless of the (seeded) train/val split. Atomic
+        write; safe to call once per rank (identical content)."""
+        ds = self.train_dataset
+        if hasattr(ds, "indices") and hasattr(ds, "dataset"):  # torch Subset (window split)
+            base = ds.dataset
+            samples = [base.samples[i] for i in ds.indices]
+        else:
+            samples = list(getattr(ds, "samples", []))
+        windows = [
+            {"h264_path": str(s.h264_path), "start_nal": s.start_nal, "end_nal": s.end_nal}
+            for s in samples
+            if hasattr(s, "start_nal")
+        ]
+        videos = sorted({str(s.h264_path) for s in samples if hasattr(s, "h264_path")})
+        payload = {
+            "manifest": str(self.manifest_path),
+            "max_manifest_rows": self.max_manifest_rows,
+            "split_by_video": self.config.split_by_video,
+            "val_fraction": self.config.val_fraction,
+            "seed": self.config.seed,
+            "dataset_mode": self.config.dataset_mode,
+            "n_train_videos": len(videos),
+            "n_train_windows": len(windows),
+            "videos": videos,
+            "windows": windows,
+        }
+        path = Path(self.train_split_dump_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)  # atomic
 
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:

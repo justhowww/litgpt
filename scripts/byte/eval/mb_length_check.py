@@ -87,6 +87,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=1.0, help="0 = greedy.")
     p.add_argument("--top-k", type=int, default=0)
     p.add_argument("--top-p", type=float, default=0.0)
+    p.add_argument("--dump-dir", type=Path, default=None,
+                   help="write prefix+generated .h264 per clip here (feed to h264_visualize.py; "
+                        "--prefix-bytes = the printed prefix length)")
     return p.parse_args()
 
 
@@ -206,6 +209,13 @@ def evaluate_checkpoint(raw, clips, device, args, name) -> tuple[dict, list]:
         max_gen = model_max_gen(raw, prefix)
         gen, _ = free_run_rollout(raw, p_ids, r_ids, o_ids, device, args.cont_frames, max_gen,
                                   args.temperature, top_k=args.top_k, top_p=args.top_p)
+        if args.dump_dir is not None:
+            args.dump_dir.mkdir(parents=True, exist_ok=True)
+            fp = args.dump_dir / f"{name}_clip{idx:02d}.h264"
+            fp.write_bytes(prefix + gen)
+            if idx == 0:
+                print(f"  dumped prefix+generated -> {fp}  (visualize with "
+                      f"--prefix-bytes {len(prefix)})", flush=True)
         mbs = analyze_generated_mbs(prefix, gen)
         mbs_per_clip.append(len(mbs))
         for m in mbs:
