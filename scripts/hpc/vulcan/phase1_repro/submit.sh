@@ -18,6 +18,8 @@ export N_HEAD=${N_HEAD:-12}
 export DEVICES=${DEVICES:-2}                     # 2x a6000 FSDP; keep in sync with --gres
 # AVC-LM-faithful: NO additive region/offset-id encodings (--no-region-id --no-offset-id).
 export NO_ENCODING=${NO_ENCODING:-1}
+# 2 tasks x 4 CPU (ntasks-per-node=2); keep dataloader workers under the per-task CPUs.
+export NUM_WORKERS=${NUM_WORKERS:-3}
 
 export MAX_ROWS=${MAX_ROWS:-1000}               # 1000 videos
 export STEPS=${STEPS:-1000000}                  # real LR horizon (cosine anneals over this)

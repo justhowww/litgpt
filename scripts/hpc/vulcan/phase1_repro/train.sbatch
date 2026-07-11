@@ -12,9 +12,9 @@
 #SBATCH --time=72:00:00
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:rtxa6000:2
-#SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=4
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
