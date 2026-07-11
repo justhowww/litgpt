@@ -8,9 +8,9 @@
 #SBATCH --qos=vulcan-medium
 #SBATCH --account=vulcan-metzler
 #SBATCH --time=72:00:00
-#SBATCH --mem=64G
+#SBATCH --mem=48G
 #SBATCH --gres=gpu:rtxa6000:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -o logs/%x-%j.out

@@ -18,11 +18,13 @@ export N_HEAD=${N_HEAD:-6}
 export DEVICES=${DEVICES:-1}
 # AVC-LM-faithful: NO additive region/offset-id encodings (--no-region-id --no-offset-id).
 export NO_ENCODING=${NO_ENCODING:-1}
+# vulcan-ampere caps 4 CPU / 48 G per GPU -> the sbatch requests 4 CPU / 48 G for 1 GPU.
+export NUM_WORKERS=${NUM_WORKERS:-3}
 
 export MAX_ROWS=${MAX_ROWS:-10}                 # 10 videos
 export STEPS=${STEPS:-1000000}                  # ceiling; overfit converges early, resumable
-export WARMUP_STEPS=${WARMUP_STEPS:-50}
-export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-16}
+# WARMUP_STEPS defaults to 2% of STEPS (=20000 at STEPS=1M) in train.sh.
+export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-4}
 export VAL_FRACTION=${VAL_FRACTION:-0.02}
 export EVAL_INTERVAL=${EVAL_INTERVAL:-100}

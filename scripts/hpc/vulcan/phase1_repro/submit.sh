@@ -20,8 +20,8 @@ export DEVICES=${DEVICES:-2}                     # 2x a6000 FSDP; keep in sync w
 export NO_ENCODING=${NO_ENCODING:-1}
 
 export MAX_ROWS=${MAX_ROWS:-1000}               # 1000 videos
-export STEPS=${STEPS:-1000000}                  # ceiling; resumable
-export WARMUP_STEPS=${WARMUP_STEPS:-2000}
+export STEPS=${STEPS:-1000000}                  # real LR horizon (cosine anneals over this)
+# WARMUP_STEPS defaults to 2% of STEPS (=20000 at STEPS=1M) in train.sh.
 # global_batch_size is the TOTAL effective batch across both GPUs (FSDP data-parallel).
 # 64 keeps the effective batch of a 1-GPU run while training ~2x faster. To DOUBLE the
 # effective batch, set GLOBAL_BATCH_SIZE=128 (consider a higher LR / more warmup then).

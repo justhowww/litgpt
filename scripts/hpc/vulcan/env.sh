@@ -15,13 +15,8 @@ CONDA_ROOT=${CONDA_ROOT:-"${PROJECT_ROOT}/miniforge3"}   # <-- verify / override
 CONDA_ENV=${CONDA_ENV:-"litgpt"}                          # <-- verify / override
 CACHE_ROOT=${CACHE_ROOT:-"${PROJECT_ROOT}/cache"}
 
-if [[ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]]; then
-    echo "Conda init not found under CONDA_ROOT=${CONDA_ROOT}." >&2
-    echo "Set CONDA_ROOT/CONDA_ENV to your Vulcan conda install before submitting." >&2
-    exit 1
-fi
 
-source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV}"
 
 export HF_HOME=${HF_HOME:-"${CACHE_ROOT}/huggingface"}
