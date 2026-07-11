@@ -376,27 +376,14 @@ class ByteTrainingRuntime:
         """
         if self.free_run_config is None or not self.free_run_samples:
             return
-        metrics: dict[str, float] = {}
-        if fabric.world_size > 1:
-            # FSDP shards params across ranks, so a plain forward needs all ranks.
-            # Gather full params on every rank (a collective ALL must enter), then
-            # generate + log on rank 0 only. _fsdp_summon_full_params is
-            # deterministic across ranks, so all ranks take the same branch (no
-            # mixed enter/return -> no deadlock); it returns None -> skip (not hang)
-            # if the FSDP module can't be located.
-            summon = _fsdp_summon_full_params(model)
-            if summon is None:
-                if fabric.global_rank == 0:
-                    fabric.print(
-                        "Free-run validation: FSDP module not found for summon; "
-                        "skipping on multi-GPU."
-                    )
-                return
-            with summon:
-                if fabric.global_rank == 0:
-                    metrics = self._run_free_run_guarded(fabric, model)
-        else:
-            metrics = self._run_free_run_guarded(fabric, model)
+        # Under FSDP, EVERY model forward all-gathers the sharded params -- a collective that
+        # all ranks must enter together. So the free-run generation runs on EVERY rank in
+        # lockstep (only rank 0's metrics are logged below). Running it on rank 0 alone
+        # deadlocks: rank 0's per-forward unshard all-gather waits forever for the idle
+        # ranks (summon_full_params does NOT prevent forward's own unshard). Sampled
+        # generation would diverge across ranks (different #forwards -> mismatched
+        # collectives -> deadlock), so _run_free_run_guarded forces greedy on multi-GPU.
+        metrics = self._run_free_run_guarded(fabric, model)
 
         if fabric.global_rank == 0 and metrics:
             fabric.print(
@@ -412,9 +399,22 @@ class ByteTrainingRuntime:
     def _run_free_run_guarded(
         self, fabric: Fabric, model: nn.Module
     ) -> dict[str, float]:
+        config = self.free_run_config
+        if fabric.world_size > 1 and config.temperature != 0.0:
+            # Sampled generation would take a different number of AR steps on each rank,
+            # mismatching the per-forward FSDP all-gathers -> deadlock. Force greedy so all
+            # ranks generate identically and their collectives stay in lockstep.
+            from dataclasses import replace
+
+            config = replace(config, temperature=0.0)
+            if fabric.global_rank == 0:
+                fabric.print(
+                    "Free-run probe: forcing greedy (temp 0) under multi-GPU so the "
+                    "generation is identical across ranks."
+                )
         try:
             return run_free_run_eval(
-                model, self.free_run_samples, fabric.device, self.free_run_config
+                model, self.free_run_samples, fabric.device, config
             )
         except Exception as exc:  # a probe must never crash training
             fabric.print(
