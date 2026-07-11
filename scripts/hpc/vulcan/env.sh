@@ -11,9 +11,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=${REPO_ROOT:-"$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"}
 
 PROJECT_ROOT=${PROJECT_ROOT:-"/fs/nexus-projects/time-control-videogen"}
-CONDA_ROOT=${CONDA_ROOT:-"${PROJECT_ROOT}/miniforge3"}   # <-- verify / override
-CONDA_ENV=${CONDA_ENV:-"litgpt"}                          # <-- verify / override
-CACHE_ROOT=${CACHE_ROOT:-"${PROJECT_ROOT}/cache"}
+CONDA_ROOT=${CONDA_ROOT:-"/vulcanscratch/${USER}/miniconda3"}
+CONDA_ENV=${CONDA_ENV:-"litgpt"}
+CACHE_ROOT=${CACHE_ROOT:-"/vulcanscratch/${USER}/cache"}
 
 
 eval "$(conda shell.bash hook)"
