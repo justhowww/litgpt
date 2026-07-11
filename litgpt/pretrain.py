@@ -1,6 +1,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 import math
+import os
 import pprint
 import time
 import warnings
@@ -416,6 +417,27 @@ def fit(
         f"global_batch={train.global_batch_size} block/seq={model.max_seq_length} "
         f"devices={devices}x{num_nodes} -> watch 'peak mem' below vs the card size"
     )
+
+    # Per-rank distributed topology (printed from EVERY rank, not just rank 0) -- the first
+    # thing to check when a multi-GPU run hangs on a collective. Confirms each rank landed
+    # on a DISTINCT physical GPU (same uuid on two ranks => device-binding bug, not NCCL),
+    # the world size is right, and the NCCL transport env actually took effect.
+    if torch.cuda.is_available():
+        _dev = torch.cuda.current_device()
+        try:
+            _uuid = str(torch.cuda.get_device_properties(_dev).uuid)[:13]
+        except Exception:
+            _uuid = "n/a"
+        print(
+            f"[dist] rank={fabric.global_rank}/{fabric.world_size} "
+            f"local_rank={fabric.local_rank} node={getattr(fabric, 'node_rank', 0)} "
+            f"cuda:{_dev} uuid={_uuid} visible={os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')} "
+            f"| NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE', '')} "
+            f"NCCL_IB_DISABLE={os.environ.get('NCCL_IB_DISABLE', '')}",
+            flush=True,
+        )
+    fabric.barrier()  # surfaces a broken communicator HERE (with the topology above) rather
+    # than 30 min later inside validate()
 
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
         fabric.device
