@@ -264,6 +264,34 @@ class BitReader:
         return self.pos < stop
 
 
+def slice_first_mb(nal_bytes: bytes, *, max_value: int = 1 << 16) -> int | None:
+    """Read only the leading ``first_mb_in_slice`` ue(v) from a VCL NAL's raw bytes
+    (header byte + payload, no start code). This is the sole authority for "is this
+    NAL the start of a new frame" (``first_mb_in_slice == 0``) used both when
+    indexing ground-truth NALs and when counting frames during free-run generation --
+    do not reimplement this check elsewhere.
+
+    Returns None if the NAL is too short, its exp-Golomb prefix is malformed/
+    unterminated, or the decoded value is implausibly large. **None means "cannot
+    determine a frame boundary here" -- callers must treat it as a desync signal
+    and stop, not as "not a frame start."** Silently continuing past unparseable
+    bytes would let frame-counting drift arbitrarily out of sync with reality on
+    exactly the corrupted tail that free-run generation produces.
+    """
+    if len(nal_bytes) < 2:
+        return None
+    rbsp, _byte_map, _epb = unescape_rbsp(nal_bytes, 1, len(nal_bytes))
+    if not rbsp:
+        return None
+    try:
+        value = BitReader(rbsp).read_ue()
+    except BitReaderError:
+        return None
+    if not (0 <= value <= max_value):
+        return None
+    return value
+
+
 # ---------------------------------------------------------------------------
 # SPS / PPS
 # ---------------------------------------------------------------------------
