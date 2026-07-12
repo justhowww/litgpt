@@ -287,8 +287,9 @@ def select_continuation_clips(
     for row in candidate_rows:
         path = Path(row["h264_path"])
         nals = nal_index[str(path)]
+        data = path.read_bytes()
         clip = _first_qualifying_window(
-            path, nals, needed, args.max_window_bytes, args.prefix_frames
+            data, path, nals, needed, args.max_window_bytes, args.prefix_frames
         )
         if clip is not None:
             clips.append(clip)
@@ -298,13 +299,19 @@ def select_continuation_clips(
 
 
 def _first_qualifying_window(
+    data: bytes,
     path: Path,
     nals: list[NALUnit],
     needed_frames: int,
     max_bytes: int,
     prefix_frames: int,
 ) -> ContinuationClip | None:
-    """First IDR-anchored window holding >= needed_frames VCL frames within budget."""
+    """First IDR-anchored window holding >= needed_frames REAL frames -- not raw
+    VCL-NAL/MB-slice count -- within budget. Frame boundaries are ground truth
+    first_mb_in_slice == 0 (HS.slice_first_mb), the SAME primitive free_run_rollout
+    uses to decide when to stop generating; clip windowing and free-run stopping can
+    therefore never silently disagree on what a 'frame' is, even on a
+    slice-max-mbs=1 corpus where one VCL NAL is one macroblock, not one frame."""
     n = len(nals)
     for k in range(n):
         if nals[k].nal_type != 5:
@@ -316,22 +323,30 @@ def _first_qualifying_window(
         while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
             start -= 1
         total = 0
-        vcl = 0
+        frames = 0
         prefix_end = -1
         cont_end = -1
         end = start
         while end < n:
-            nal_len = nals[end].end - nals[end].start
+            nal = nals[end]
+            nal_len = nal.end - nal.start
             if total + nal_len > max_bytes:
                 break
             total += nal_len
-            if nals[end].nal_type in VCL_NAL_TYPES:
-                vcl += 1
-                if vcl == prefix_frames:
-                    prefix_end = end + 1
-                if vcl == needed_frames:
-                    cont_end = end + 1
+            if nal.nal_type in VCL_NAL_TYPES:
+                nal_bytes = data[nal.start + nal.start_code_len : nal.end]
+                first_mb = HS.slice_first_mb(nal_bytes)
+                if first_mb is None:
+                    # Unparseable slice header (corrupt/truncated) -- don't build a
+                    # window past it; try the next IDR candidate instead of guessing.
                     break
+                if first_mb == 0:
+                    frames += 1
+                    if frames == prefix_frames + 1 and prefix_end < 0:
+                        prefix_end = end  # exclude this (next-frame) NAL from prefix
+                    if frames == needed_frames + 1:
+                        cont_end = end  # exclude this (next-frame) NAL from cont
+                        break
             end += 1
         if cont_end > 0 and prefix_end > 0:
             return ContinuationClip(
