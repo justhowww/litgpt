@@ -142,6 +142,12 @@ def iter_nals(data: bytes) -> list[NALInfo]:
     nals: list[NALInfo] = []
     for k, (sc_start, sc_len) in enumerate(starts):
         payload_start = sc_start + sc_len
+        if payload_start >= n:
+            # Dangling start code at EOF with no header byte after it -- free-run
+            # generation can stop (budget exhausted) right after emitting a start
+            # code, before sampling even one byte of the next NAL. There is no NAL
+            # here to report; drop it rather than indexing past the end of `data`.
+            continue
         payload_end = starts[k + 1][0] if k + 1 < len(starts) else n
         header = data[payload_start]
         nals.append(
