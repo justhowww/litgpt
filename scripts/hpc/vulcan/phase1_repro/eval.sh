@@ -61,7 +61,7 @@ run() {  # split(train|val)  name  out_root  extra-sampling-args...
 # comparing sampling regimes here isolates how much of that gap is decoding-strategy
 # vs. genuine per-decision compounding). --------------------------------------
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
-run train greedy      "${TRAIN_OUT}" --temperature 0.0
+# run train greedy      "${TRAIN_OUT}" --temperature 0.0
 run train greedy      "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes
 # run train temp1       "${TRAIN_OUT}" --temperature 1.0
 # run train avclm_topk  "${TRAIN_OUT}" --temperature 1.0 --top-k 50 --top-p 0.9
