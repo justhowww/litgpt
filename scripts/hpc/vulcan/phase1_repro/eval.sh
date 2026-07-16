@@ -61,8 +61,17 @@ run() {  # split(train|val)  name  out_root  extra-sampling-args...
 # comparing sampling regimes here isolates how much of that gap is decoding-strategy
 # vs. genuine per-decision compounding). --------------------------------------
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
-# run train greedy      "${TRAIN_OUT}" --temperature 0.0
-run train greedy      "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes
+# greedy vs greedy_masked is the A/B that isolates constrained decoding: same
+# checkpoint, clips and seed, differing only in --mask-illegal-bytes. They must write
+# to DIFFERENT --out-dirs -- metrics.jsonl is opened append-only while config.json and
+# summary.csv are overwritten, so sharing a name silently mixes the two runs' rows and
+# destroys the record of which config produced them.
+run train greedy        "${TRAIN_OUT}" --temperature 0.0
+# --mask-debug keeps the permissive-fallback path visible: with v1's headers
+# unconstrained, an illegal mb_type/cbp flips the automaton to "unknown" and quietly
+# drops strict masking for the rest of that NAL. Without this you cannot tell "the mask
+# worked" from "the mask switched itself off".
+run train greedy_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --mask-debug
 # run train temp1       "${TRAIN_OUT}" --temperature 1.0
 # run train avclm_topk  "${TRAIN_OUT}" --temperature 1.0 --top-k 50 --top-p 0.9
 
@@ -70,39 +79,50 @@ run train greedy      "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes
 # VAL_OUT="${OUT_DIR}/eval_decode/val/${CKPT}"
 # run val greedy "${VAL_OUT}" --temperature 0.0
 
-# # --- Consolidate the train sweep -----------------------------------------------
-# echo
-# echo "===================== train sweep summary ====================="
-# python3 - "${TRAIN_OUT}" greedy temp1 avclm_topk <<'PY'
-# import json, sys
-# from pathlib import Path
+# --- Consolidate the train sweep -----------------------------------------------
+# Headline: full_cont for greedy vs greedy_masked. The mask's claim is that it turns
+# decodability from a probabilistic AND-chain into an invariant, so full_cont should
+# rise and the BitReaderError desyncs (running off the end of a mis-parsed field)
+# should collapse -- desync_reasons is printed to check that second half.
+echo
+echo "===================== train sweep summary ====================="
+python3 - "${TRAIN_OUT}" greedy greedy_masked <<'PY'
+import json, sys
+from pathlib import Path
 
-# root = sys.argv[1]
-# names = sys.argv[2:]
+root = sys.argv[1]
+names = sys.argv[2:]
 
-# def rows(name):
-#     p = Path(root) / name / "metrics.jsonl"
-#     if not p.exists():
-#         return None, None
-#     tf = cont = None
-#     for line in p.open():
-#         r = json.loads(line)
-#         if r.get("mode") == "teacher_forced":
-#             tf = r
-#         elif r.get("mode") == "continuation":
-#             cont = r
-#     return tf, cont
+def rows(name):
+    p = Path(root) / name / "metrics.jsonl"
+    if not p.exists():
+        return None, None
+    tf = cont = None
+    for line in p.open():
+        r = json.loads(line)
+        if r.get("mode") == "teacher_forced":
+            tf = r
+        elif r.get("mode") == "continuation":
+            cont = r
+    return tf, cont
 
-# print(f"{'sampling':<12} {'decode_rate':>11} {'full_cont':>10} {'survival_mean':>14} {'psnr':>8}  desync_top")
-# for name in names:
-#     tf, cont = rows(name)
-#     if cont is None:
-#         print(f"{name:<12} (missing metrics.jsonl)")
-#         continue
-#     print(
-#         f"{name:<12} {cont.get('decode_rate', 0):>11.3f} "
-#         f"{cont.get('full_continuation_rate', 0):>10.3f} "
-#         f"{cont.get('survival_bytes_mean', 0):>14.1f} "
-#         f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
-#     )
-# PY
+hdr = f"{'sampling':<14} {'decode_rate':>11} {'full_cont':>10} {'survival_mean':>14} {'psnr':>8}  desync_top"
+print(hdr)
+print("-" * len(hdr))
+for name in names:
+    tf, cont = rows(name)
+    if cont is None:
+        print(f"{name:<14} (missing metrics.jsonl)")
+        continue
+    print(
+        f"{name:<14} {cont.get('decode_rate', 0):>11.3f} "
+        f"{cont.get('full_continuation_rate', 0):>10.3f} "
+        f"{cont.get('survival_bytes_mean', 0):>14.1f} "
+        f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
+    )
+print()
+for name in names:
+    _, cont = rows(name)
+    if cont is not None:
+        print(f"{name:<14} desync_reasons: {cont.get('desync_reason_hist')}")
+PY

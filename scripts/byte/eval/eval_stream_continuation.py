@@ -64,6 +64,7 @@ from litgpt.byte.data import (  # noqa: E402
     load_nal_index,
 )
 from litgpt.byte import h264_syntax as HS  # noqa: E402
+from litgpt.byte import h264_mask as HM  # noqa: E402
 from litgpt.byte.free_run_eval import (
     _survival_and_validity,
     free_run_rollout,
@@ -169,6 +170,19 @@ def parse_args() -> argparse.Namespace:
         "h264_mask). Scoped to the slice-max-mbs=1 corpus.",
     )
     parser.add_argument(
+        "--mask-debug",
+        action="store_true",
+        help="Print low-volume h264_mask diagnostics: NAL open/close, automaton "
+        "initialization/completion, permissive fallbacks, and periodic mask summaries.",
+    )
+    parser.add_argument(
+        "--mask-debug-stages",
+        action="store_true",
+        help="Verbose automaton trace showing syntax-element transitions such as "
+        "mb_type, prediction, CBP, residual CAVLC fields, and RBSP trailing bits. "
+        "Implies --mask-debug and can produce substantial output.",
+    )
+    parser.add_argument(
         "--survival-only",
         action="store_true",
         help="Continuation mode: skip the ffmpeg GT-decode + frame-count gate and the "
@@ -201,6 +215,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    HM.configure_debug(args.mask_debug or args.mask_debug_stages, stages=args.mask_debug_stages)
     if args.prefix_frames < 1 or args.cont_frames < 1:
         raise SystemExit("--prefix-frames and --cont-frames must be positive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
