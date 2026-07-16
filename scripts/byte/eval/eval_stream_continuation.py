@@ -162,6 +162,13 @@ def parse_args() -> argparse.Namespace:
         "EOS), trimming the run. 0 = off. Try 32.",
     )
     parser.add_argument(
+        "--mask-illegal-bytes",
+        action="store_true",
+        help="Constrained decoding: before sampling each byte, mask the logits to the "
+        "bytes that keep the stream decodable (Annex-B escaping + CAVLC grammar, via "
+        "h264_mask). Scoped to the slice-max-mbs=1 corpus.",
+    )
+    parser.add_argument(
         "--survival-only",
         action="store_true",
         help="Continuation mode: skip the ffmpeg GT-decode + frame-count gate and the "
@@ -1112,6 +1119,8 @@ def generate_continuation(
         top_k=args.top_k,
         top_p=args.top_p,
         stop_pad_run=args.stop_pad_run,
+        constrain=args.mask_illegal_bytes,
+        prefix_bytes=prefix_bytes,
     )
 
 

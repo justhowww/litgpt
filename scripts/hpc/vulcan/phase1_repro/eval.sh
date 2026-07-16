@@ -62,46 +62,47 @@ run() {  # split(train|val)  name  out_root  extra-sampling-args...
 # vs. genuine per-decision compounding). --------------------------------------
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
 run train greedy      "${TRAIN_OUT}" --temperature 0.0
-run train temp1       "${TRAIN_OUT}" --temperature 1.0
-run train avclm_topk  "${TRAIN_OUT}" --temperature 1.0 --top-k 50 --top-p 0.9
+run train greedy      "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes
+# run train temp1       "${TRAIN_OUT}" --temperature 1.0
+# run train avclm_topk  "${TRAIN_OUT}" --temperature 1.0 --top-k 50 --top-p 0.9
 
-# --- (2) Within-video "val" sanity run (greedy only; see caveat above) --------
-VAL_OUT="${OUT_DIR}/eval_decode/val/${CKPT}"
-run val greedy "${VAL_OUT}" --temperature 0.0
+# # --- (2) Within-video "val" sanity run (greedy only; see caveat above) --------
+# VAL_OUT="${OUT_DIR}/eval_decode/val/${CKPT}"
+# run val greedy "${VAL_OUT}" --temperature 0.0
 
-# --- Consolidate the train sweep -----------------------------------------------
-echo
-echo "===================== train sweep summary ====================="
-python3 - "${TRAIN_OUT}" greedy temp1 avclm_topk <<'PY'
-import json, sys
-from pathlib import Path
+# # --- Consolidate the train sweep -----------------------------------------------
+# echo
+# echo "===================== train sweep summary ====================="
+# python3 - "${TRAIN_OUT}" greedy temp1 avclm_topk <<'PY'
+# import json, sys
+# from pathlib import Path
 
-root = sys.argv[1]
-names = sys.argv[2:]
+# root = sys.argv[1]
+# names = sys.argv[2:]
 
-def rows(name):
-    p = Path(root) / name / "metrics.jsonl"
-    if not p.exists():
-        return None, None
-    tf = cont = None
-    for line in p.open():
-        r = json.loads(line)
-        if r.get("mode") == "teacher_forced":
-            tf = r
-        elif r.get("mode") == "continuation":
-            cont = r
-    return tf, cont
+# def rows(name):
+#     p = Path(root) / name / "metrics.jsonl"
+#     if not p.exists():
+#         return None, None
+#     tf = cont = None
+#     for line in p.open():
+#         r = json.loads(line)
+#         if r.get("mode") == "teacher_forced":
+#             tf = r
+#         elif r.get("mode") == "continuation":
+#             cont = r
+#     return tf, cont
 
-print(f"{'sampling':<12} {'decode_rate':>11} {'full_cont':>10} {'survival_mean':>14} {'psnr':>8}  desync_top")
-for name in names:
-    tf, cont = rows(name)
-    if cont is None:
-        print(f"{name:<12} (missing metrics.jsonl)")
-        continue
-    print(
-        f"{name:<12} {cont.get('decode_rate', 0):>11.3f} "
-        f"{cont.get('full_continuation_rate', 0):>10.3f} "
-        f"{cont.get('survival_bytes_mean', 0):>14.1f} "
-        f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
-    )
-PY
+# print(f"{'sampling':<12} {'decode_rate':>11} {'full_cont':>10} {'survival_mean':>14} {'psnr':>8}  desync_top")
+# for name in names:
+#     tf, cont = rows(name)
+#     if cont is None:
+#         print(f"{name:<12} (missing metrics.jsonl)")
+#         continue
+#     print(
+#         f"{name:<12} {cont.get('decode_rate', 0):>11.3f} "
+#         f"{cont.get('full_continuation_rate', 0):>10.3f} "
+#         f"{cont.get('survival_bytes_mean', 0):>14.1f} "
+#         f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
+#     )
+# PY
