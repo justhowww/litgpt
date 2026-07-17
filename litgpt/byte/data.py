@@ -25,6 +25,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 
+from litgpt.byte import h264_syntax as HS
 from litgpt.data.base import DataModule
 from litgpt.tokenizer import Tokenizer
 
@@ -118,8 +119,10 @@ class ByteDataConfig:
         32768  # Used when LitGPT connect() does not provide max_seq_length.
     )
     # "slice" = ByteSliceDataset (one ref slice + one target slice). "window" =
-    # ByteStreamWindowDataset: the multi-frame contiguous-stream AR objective used
-    # for H0 (verifying the AVC-LM/JPEG-LM generation legacy). See 0616.md.
+    # ByteStreamWindowDataset: the multi-frame contiguous-stream window, run as the
+    # AR objective at p_fim=0 (H0, verifying the AVC-LM/JPEG-LM generation legacy)
+    # and as masked-span infill at p_fim>0. AR and FIM share the window and differ
+    # only in masking, so H0 is the p_fim=0 case of one pipeline. See 0616.md.
     dataset_mode: DatasetMode = "slice"
     window_min_frames: int = 2  # Minimum VCL NALs per stream window ("window" mode).
     # NB: counts VCL NALs, which == frames only for one-slice-per-frame corpora. Under
@@ -930,9 +933,46 @@ class ByteStreamWindowDataset(Dataset):
         region    = REGION_META for parameter sets, REGION_TARGET for VCL bytes
         offset    = arange within each NAL, reset to 0 at every NAL boundary
 
-    The masked-span FIM-over-windows mode (``p_fim > 0`` -- hole in the window's
-    last VCL frame, prior frames as causal context) is the planned parallel mode;
-    not implemented yet (see 0616.md design note).
+    FIM layout (``p_fim > 0`` -- masked-span infill over the same window):
+        A REAL frame f is chosen uniformly among the window's frames, the window is
+        TRUNCATED at f's end (causality: real-time repair has no future frames), and
+        a contiguous span is excised from f's interior:
+
+        context   = window[:frame_lo]          # SPS/PPS + clean prior frames
+        prefix    = window[frame_lo:split]     # f's received bytes before the hole
+        missing   = window[split:split+gap]    # the excised span -- the only target
+        orphan    = window[split+gap:frame_hi] # f's received bytes after the hole
+        input_ids = context, FIM_BEGIN, prefix, FIM_HOLE, orphan, FIM_END,
+                    missing_tail[:-1]
+        labels    = ignore everywhere except the trailing missing_tail
+
+    This mirrors ``ByteSliceDataset._build_fim_item`` (same markers, same
+    prefix/missing/orphan decomposition, same labels-on-the-span convention); the
+    differences are that the multi-frame window replaces the single reference slice
+    as context, and the hole is placed within a real frame rather than within a
+    single NAL. "Multi-frame" describes the CONTEXT, not the objective -- AR is the
+    multi-frame objective, FIM is a single-span objective over a multi-frame context
+    (0616.md).
+
+    The hole shape follows BSCV's corruption operator (Tian et al., `corrupt_Gen.py`;
+    see 04 - projects/.../corruption-vs-bscv.md, which designates it the training
+    generator): a contiguous interior byte EXCISION at a uniformly random offset, one
+    hole per damaged frame, with the frame chosen uniformly (BSCV's
+    ``random.sample(frameIndexes_in_GOP, corr_prob)``) rather than pinned to the last
+    frame -- pinning it would train every sample at maximal conditioning depth, while
+    deployment loses packets at arbitrary GOP depth.
+
+    CAVEAT -- this corpus cannot reproduce BSCV's artifact. BSCV excises 1024-2048 B
+    from inside ONE slice payload with the NAL header intact, which presumes
+    one-slice-per-frame. Under AVC-LM's ``slice-max-mbs=1`` a VCL NAL is a single
+    ~10-byte macroblock, so a hole of that size necessarily spans ~100+ whole NALs
+    and their start codes. The survivors still parse (``first_mb_in_slice`` simply
+    jumps) and the decoder conceals the gap, so the "present but desynced slice" BSCV
+    creates cannot occur -- per-MB slicing is an error-resilience mode, a desync
+    firewall every ~10 bytes. Window FIM here is therefore a valid infill objective
+    for measuring OBJECTIVE INTERFERENCE against the phase-1 AR baseline, but its
+    reconstruction numbers are NOT a bitstream-repair task result. That requires a
+    one-slice-per-frame corpus.
     """
 
     def __init__(
@@ -942,6 +982,11 @@ class ByteStreamWindowDataset(Dataset):
         *,
         min_frames: int = 2,
         p_fim: float = 0.0,
+        fim_format: FIMFormat = "psm",
+        use_eos: bool = False,
+        fim_min_gap: int = 64,
+        fim_max_gap: int = 1400,
+        frame_guard_bytes: int = 64,
         nal_index: dict[str, list[NALUnit]] | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
@@ -950,15 +995,23 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError("max_seq_length must be at least 4")
         if min_frames < 1:
             raise ValueError("min_frames must be positive")
-        if p_fim != 0.0:
-            raise NotImplementedError(
-                "ByteStreamWindowDataset FIM-over-windows mode is not implemented yet; "
-                "see the 0616.md design note. Use p_fim=0 for the AR/H0 objective."
-            )
+        if not 0.0 <= p_fim <= 1.0:
+            raise ValueError("p_fim must be in [0, 1]")
+        if fim_format not in FIM_FORMATS:
+            raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
+        if fim_min_gap < 1 or fim_max_gap < fim_min_gap:
+            raise ValueError("require 1 <= fim_min_gap <= fim_max_gap")
+        if frame_guard_bytes < 0:
+            raise ValueError("frame_guard_bytes must be non-negative")
         self.rows = rows
         self.max_seq_length = max_seq_length
         self.min_frames = min_frames
         self.p_fim = p_fim
+        self.fim_format = fim_format
+        self.use_eos = use_eos
+        self.fim_min_gap = fim_min_gap
+        self.fim_max_gap = fim_max_gap
+        self.frame_guard_bytes = frame_guard_bytes
         self.seed = seed
         self.ignore_index = ignore_index
         self.samples, self.nal_index = self._build_index(nal_index)
@@ -967,6 +1020,8 @@ class ByteStreamWindowDataset(Dataset):
                 "No usable stream windows found. Check max_seq_length, min_frames, "
                 "and that the corpus contains IDR-anchored GOPs."
             )
+        if self.p_fim > 0:
+            self._assert_fim_reachable()
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -1028,11 +1083,99 @@ class ByteStreamWindowDataset(Dataset):
             used_until = max(used_until, end)
         return windows
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        sample = self.samples[idx]
-        data = sample.h264_path.read_bytes()
-        nals = self.nal_index[str(sample.h264_path)]
+    def _frame_bounds(self, sample: WindowSample, data: bytes) -> list[tuple[int, int]]:
+        """(lo, hi) byte offsets, within the window, of each REAL frame.
 
+        A frame starts at a VCL NAL whose ``first_mb_in_slice == 0``. That check is
+        HS.slice_first_mb -- the same primitive free_run_rollout and the standalone
+        eval use to index frame boundaries, so the dataset can never disagree with
+        them about what a frame is on a slice-max-mbs=1 corpus (one VCL NAL == one
+        macroblock, so NAL boundaries are NOT frame boundaries). Do not reimplement.
+
+        A NAL whose first_mb_in_slice cannot be read is treated as "not a frame
+        start" rather than a desync: unlike free-run, these are ground-truth bytes,
+        so an unreadable value means our parse is too weak, and the cost is only a
+        missed hole candidate.
+        """
+        nals = self.nal_index[str(sample.h264_path)]
+        starts: list[int] = []
+        cursor = 0
+        for nal in nals[sample.start_nal : sample.end_nal]:
+            length = nal.end - nal.start
+            if nal.nal_type in VCL_NAL_TYPES:
+                payload = data[nal.start + nal.start_code_len : nal.end]
+                if HS.slice_first_mb(payload) == 0:
+                    starts.append(cursor)
+            cursor += length
+        if not starts:
+            return []
+        ends = starts[1:] + [cursor]
+        return list(zip(starts, ends))
+
+    def _fim_candidates(
+        self, sample: WindowSample, data: bytes
+    ) -> list[tuple[int, int]]:
+        """Frames that can host a hole, as (frame_lo, frame_hi).
+
+        Two filters. (1) The frame must hold ``frame_guard_bytes`` of untouchable
+        head plus ``fim_min_gap`` of hole plus a byte -- the guard keeps the frame's
+        first NAL (which carries the first_mb_in_slice == 0 that MAKES it a frame
+        boundary) and the window's leading SPS/PPS out of the hole. (2) The truncated
+        window plus marker/EOS overhead must fit max_seq_length: collate's
+        pad_and_truncate cuts from the RIGHT, which would silently amputate the
+        missing_tail and with it every supervised label in the sample.
+        """
+        overhead = self._fim_overhead()
+        candidates = []
+        for lo, hi in self._frame_bounds(sample, data):
+            if hi + overhead > self.max_seq_length:
+                continue
+            if hi - (lo + self.frame_guard_bytes) - 1 >= self.fim_min_gap:
+                candidates.append((lo, hi))
+        return candidates
+
+    def _fim_overhead(self) -> int:
+        """Net length added by the FIM reordering, over a window cut at frame_hi.
+
+        PSM inserts three markers (FIM_BEGIN, FIM_HOLE, FIM_END) but middle_in is
+        [FIM_END, missing_tail[:-1]], so the teacher-forcing shift gives one byte
+        back: net +2, not +3. Bridge inserts one marker and gives the same byte back:
+        net 0. Matches ByteSliceDataset's `format_overhead = 2 if psm else 0`.
+        """
+        markers = 2 if self.fim_format == "psm" else 0
+        return markers + (1 if self.use_eos else 0)
+
+    def _assert_fim_reachable(self) -> None:
+        """Fail loudly when p_fim > 0 but no window can host a hole.
+
+        Without this the dataset degrades silently: __getitem__ falls through to the
+        AR item, so the run trains pure AR while logging p_fim > 0 and reporting FIM
+        metrics for an objective it never saw. That is not hypothetical -- it is what
+        ByteSliceDataset does on this corpus, where a ~10-byte target NAL gives
+        max_fim_gap == 1 against fim_min_gap == 64, so `fim_eligible` is False for
+        every sample.
+        """
+        probe = self.samples[:: max(1, len(self.samples) // 32)][:32]
+        eligible = 0
+        for sample in probe:
+            data = sample.h264_path.read_bytes()
+            if self._fim_candidates(sample, data):
+                eligible += 1
+        if eligible == 0:
+            raise ValueError(
+                f"p_fim={self.p_fim} but none of {len(probe)} probed windows can host "
+                f"a hole (fim_min_gap={self.fim_min_gap}, "
+                f"frame_guard_bytes={self.frame_guard_bytes}, "
+                f"max_seq_length={self.max_seq_length}). Every sample would silently "
+                "fall back to AR. Lower fim_min_gap, lower frame_guard_bytes, or "
+                "check that the corpus has readable frame boundaries."
+            )
+
+    def _window_tensors(
+        self, sample: WindowSample, data: bytes
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """(bytes, region, offset) for the whole window, before AR/FIM shaping."""
+        nals = self.nal_index[str(sample.h264_path)]
         byte_chunks: list[Tensor] = []
         region_chunks: list[Tensor] = []
         offset_chunks: list[Tensor] = []
@@ -1046,11 +1189,33 @@ class ByteStreamWindowDataset(Dataset):
             )
             region_chunks.append(torch.full((length,), region, dtype=torch.long))
             offset_chunks.append(torch.arange(length, dtype=torch.long))
+        return (
+            torch.cat(byte_chunks),
+            torch.cat(region_chunks),
+            torch.cat(offset_chunks),
+        )
 
-        window = torch.cat(byte_chunks)
-        raw_region = torch.cat(region_chunks)
-        raw_offset = torch.cat(offset_chunks)
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        rng = random.Random(self.seed + idx)
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        window, raw_region, raw_offset = self._window_tensors(sample, data)
 
+        if self.p_fim > 0 and rng.random() < self.p_fim:
+            candidates = self._fim_candidates(sample, data)
+            if candidates:
+                return self._build_fim_item(
+                    sample, window, raw_region, raw_offset, candidates, rng
+                )
+        return self._build_ar_item(sample, window, raw_region, raw_offset)
+
+    def _build_ar_item(
+        self,
+        sample: WindowSample,
+        window: Tensor,
+        raw_region: Tensor,
+        raw_offset: Tensor,
+    ) -> dict[str, Any]:
         # Teacher forcing across the whole window. SLICE_BOS is reused as the
         # stream-start marker (this dataset never emits a slice-level BOS), so the
         # AR vocabulary is unchanged.
@@ -1061,6 +1226,106 @@ class ByteStreamWindowDataset(Dataset):
             (torch.tensor([REGION_TARGET], dtype=torch.long), raw_region[:-1])
         )
         offset_ids = torch.cat((torch.tensor([0], dtype=torch.long), raw_offset[:-1]))
+        return self._pack_item(input_ids, labels, region_ids, offset_ids, sample, "ar")
+
+    def _build_fim_item(
+        self,
+        sample: WindowSample,
+        window: Tensor,
+        raw_region: Tensor,
+        raw_offset: Tensor,
+        candidates: list[tuple[int, int]],
+        rng: random.Random,
+    ) -> dict[str, Any]:
+        frame_lo, frame_hi = rng.choice(candidates)
+        lo = frame_lo + self.frame_guard_bytes
+        gap = rng.randint(self.fim_min_gap, min(self.fim_max_gap, frame_hi - lo - 1))
+        split = rng.randint(lo, frame_hi - gap)
+
+        # Everything after the hole's frame is dropped: real-time repair never has
+        # future frames, so they must not reach the model as context (0616.md).
+        context = window[:frame_lo]
+        prefix = window[frame_lo:split]
+        missing = window[split : split + gap]
+        orphan = window[split + gap : frame_hi]
+        missing_tail = self._with_eos(missing)
+
+        if self.fim_format == "psm":
+            head = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
+            hole = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
+            middle_in = torch.cat(
+                (torch.tensor([FIM_END_ID], dtype=torch.long), missing_tail[:-1])
+            )
+            pieces = [context, head, prefix, hole, orphan, middle_in]
+            regions = [
+                raw_region[:frame_lo],
+                torch.full((1,), REGION_PREFIX, dtype=torch.long),
+                torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
+                torch.full((1,), REGION_ORPHAN, dtype=torch.long),
+                torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
+                torch.full((middle_in.numel(),), REGION_BRIDGE, dtype=torch.long),
+            ]
+        else:
+            middle_in = torch.cat(
+                (torch.tensor([SPAN_BOS_ID], dtype=torch.long), missing_tail[:-1])
+            )
+            pieces = [context, prefix, orphan, middle_in]
+            regions = [
+                raw_region[:frame_lo],
+                torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
+                torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
+                torch.full((middle_in.numel(),), REGION_BRIDGE, dtype=torch.long),
+            ]
+
+        input_ids = torch.cat(pieces)
+        region_ids = torch.cat(regions)
+        # Offsets are the window-AR convention (arange within each NAL, reset at NAL
+        # boundaries) for received bytes, and continue from the hole's window offset
+        # across the generated span. A multi-NAL hole has no single within-NAL
+        # position, so this is a placeholder that is only coherent while offset ids
+        # are DISABLED -- which is why scripts/byte/train.py rejects window FIM
+        # without --no-offset-id. Turning them back on needs a real design (260703
+        # found encodings help, so someone will want to).
+        offset_ids = torch.cat(
+            (
+                raw_offset[:frame_lo],
+                torch.zeros(1, dtype=torch.long),
+                raw_offset[frame_lo:split],
+                torch.zeros(1, dtype=torch.long),
+                raw_offset[split + gap : frame_hi],
+                torch.arange(middle_in.numel(), dtype=torch.long),
+            )
+        )
+        labels = torch.full_like(input_ids, self.ignore_index)
+        labels[-missing_tail.numel() :] = missing_tail
+        return self._pack_item(
+            input_ids,
+            labels,
+            region_ids,
+            offset_ids,
+            sample,
+            "fim",
+            fim_gap=gap,
+            fim_split=split,
+            frame_lo=frame_lo,
+            frame_hi=frame_hi,
+        )
+
+    def _with_eos(self, content: Tensor) -> Tensor:
+        if not self.use_eos:
+            return content
+        return torch.cat((content, torch.tensor([SEQ_EOS_ID], dtype=torch.long)))
+
+    def _pack_item(
+        self,
+        input_ids: Tensor,
+        labels: Tensor,
+        region_ids: Tensor,
+        offset_ids: Tensor,
+        sample: WindowSample,
+        task: TaskName,
+        **fim_meta: int,
+    ) -> dict[str, Any]:
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -1071,12 +1336,13 @@ class ByteStreamWindowDataset(Dataset):
                 "raw_plus_prompt_template": int(input_ids.numel()),
             },
             "sample_meta": {
-                "task": "ar",
-                "fim_format": "stream",
+                "task": task,
+                "fim_format": self.fim_format if task == "fim" else "stream",
                 "h264_path": str(sample.h264_path),
                 "start_nal": sample.start_nal,
                 "end_nal": sample.end_nal,
                 "num_frames": sample.num_frames,
+                **fim_meta,
             },
         }
 
@@ -1174,6 +1440,11 @@ class ByteDataModule(DataModule):
                     max_seq_length=self.max_seq_length,
                     min_frames=self.config.window_min_frames,
                     p_fim=self.config.p_fim,
+                    fim_format=self.config.fim_format,
+                    use_eos=self.config.use_eos,
+                    fim_min_gap=self.config.fim_min_gap,
+                    fim_max_gap=self.config.fim_max_gap,
+                    frame_guard_bytes=self.config.slice_header_guard_bytes,
                     nal_index=nal_index,
                     seed=self.config.seed,
                 )

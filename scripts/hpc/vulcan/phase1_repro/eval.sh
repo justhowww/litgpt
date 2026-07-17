@@ -35,6 +35,7 @@ COMMON_TRAIN=(
     --max-manifest-rows 1000
     --num-clips 20
     --seed 42
+    --no-eval-intra
     --prefix-frames 4 --cont-frames 2
     --max-window-bytes 16384
 )
@@ -45,6 +46,7 @@ COMMON_VAL=(
     --max-manifest-rows 1000
     --num-clips 20
     --seed 1337
+    --no-eval-intra
     --prefix-frames 4 --cont-frames 2
     --max-window-bytes 16384
 )

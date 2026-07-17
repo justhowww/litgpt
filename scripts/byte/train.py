@@ -140,8 +140,11 @@ def parse_args() -> argparse.Namespace:
         choices=DATASET_MODES,
         default="slice",
         help="'slice' = ByteSliceDataset (ref+target slice). 'window' = "
-        "ByteStreamWindowDataset, the multi-frame contiguous-stream AR objective "
-        "(H0). In window mode p_fim must be 0 and slice-only flags are ignored.",
+        "ByteStreamWindowDataset, the multi-frame contiguous-stream window: AR (H0) "
+        "at --p-fim 0, masked-span infill at --p-fim > 0. Window FIM reuses "
+        "--fim-format/--fim-min-gap/--fim-max-gap/--use-eos and reads "
+        "--slice-header-guard-bytes as a per-frame head guard; the remaining "
+        "slice-only flags are ignored.",
     )
     parser.add_argument(
         "--window-min-frames",
@@ -307,6 +310,28 @@ def main() -> None:
     # same checkpoint; the eval path emits both as separate metric prefixes.
     if args.mrt_interval > 0 and args.p_fim <= 0:
         raise ValueError("MRT requires a non-zero --p-fim")
+    # Window FIM's hole spans many NALs (on a slice-max-mbs=1 corpus a 64-1400 byte
+    # hole covers ~100+ of them), so the window-AR offset convention -- arange within
+    # each NAL, reset at every boundary -- has no coherent value across the generated
+    # span. The dataset emits a placeholder that is only meaningful with offset ids
+    # off; refuse the combination rather than train on quietly wrong positions.
+    if args.dataset_mode == "window" and args.p_fim > 0 and not args.no_offset_id:
+        raise ValueError(
+            "window FIM requires --no-offset-id: a multi-NAL hole has no single "
+            "within-NAL offset. Phase 1 already runs --no-region-id --no-offset-id "
+            "(AVC-LM-faithful), so a phase-1-comparable FIM run wants both."
+        )
+    # The reconstruction probe is slice-only: it reads sample.target_index (a
+    # SliceSample field WindowSample does not have) and derives the replacement span
+    # from slice-mode offset ids, which window FIM does not carry. Fail at startup
+    # rather than AttributeError hours into a run.
+    if args.dataset_mode == "window" and args.reconstruction_eval_interval > 0:
+        raise ValueError(
+            "--reconstruction-eval-interval is not supported in window mode "
+            "(litgpt/byte/reconstruction.py assumes a single target NAL per sample). "
+            "Use --free-run-eval-interval for the AR probe; window-FIM reconstruction "
+            "needs the probe ported first."
+        )
     # A100 Tensor Cores accelerate float32 matmuls used outside bf16 AMP regions.
     torch.set_float32_matmul_precision("high")
 
