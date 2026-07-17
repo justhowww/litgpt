@@ -62,10 +62,11 @@ SPLIT_BY_VIDEO=${SPLIT_BY_VIDEO:-0}
 # run trains both modes over the same windows. P_FIM=0 reproduces phase 1 exactly.
 P_FIM=${P_FIM:-0.5}
 FIM_FORMAT=${FIM_FORMAT:-psm}
-# Oracle-length generation by default (USE_EOS=1 to train a terminator instead).
-# NB: use_eos lifts the vocab (vocab_size_for_fim_format), so it is not free to
-# toggle against an existing checkpoint.
-USE_EOS=${USE_EOS:-0}
+# On by default: train a terminator (SEQ_EOS after f_middle) rather than relying on
+# an oracle-supplied span length, which is a training-time convenience a real
+# deployment wouldn't have. Lifts the vocab (vocab_size_for_fim_format); phase 1
+# already uses a different fim_format/vocab, so there is no warm-start path to break.
+USE_EOS=${USE_EOS:-1}
 # Hole size, in bytes. BSCV excises 1024-2048 B; 64-1400 keeps the operator's shape
 # while staying inside one frame of this corpus (~1.8 KB at 256x144/QP37 per-MB).
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}

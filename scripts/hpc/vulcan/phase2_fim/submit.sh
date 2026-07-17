@@ -1,8 +1,12 @@
 #!/bin/bash
 # Phase 2 -- AR + masked-span FIM on UMD Vulcan (2x a6000, FSDP). Same corpus, arch,
-# split, batch and LR horizon as phase 1 (submit.sh there); the ONLY difference is
-# P_FIM > 0. That is deliberate: phase 2's question is whether adding the FIM
-# objective damages AR, and any second change would confound the comparison.
+# split, batch and LR horizon as phase 1 (submit.sh there); the objective is the
+# deliberate change (P_FIM > 0, FIM_FORMAT=psm, USE_EOS=1) -- everything that shapes
+# what the AR arm sees and how it's optimized is held fixed so phase 2's AR numbers
+# stay comparable to phase 1's. Note phase 1 uses --fim-format bridge (p_fim=0
+# either way, so it's inert there) and USE_EOS=0, so the two runs' vocabularies
+# already differ regardless of USE_EOS; there was never a warm-start path between
+# them, so this costs nothing.
 #
 # Read it against phase 1 at the same step count:
 #   signal 1  val_loss_ar + the training-set free-run eval  -- did AR regress?
@@ -54,7 +58,14 @@ export FREE_RUN_CONT_FRAMES=${FREE_RUN_CONT_FRAMES:-2}
 # and you want to find the interference threshold rather than just observe it.
 export P_FIM=${P_FIM:-0.5}
 export FIM_FORMAT=${FIM_FORMAT:-psm}
-export USE_EOS=${USE_EOS:-0}                     # oracle length; USE_EOS=1 changes the vocab
+# On: the model is trained to emit SEQ_EOS after f_middle, rather than relying on an
+# oracle-supplied span length. That oracle is a training-time convenience (we know
+# the excised length because we synthesized it) that a real deployment wouldn't have,
+# so a checkpoint that can only generate with oracle length can't do actual FIM
+# generation later without retraining. The cost is one vocab row (262->263) and one
+# extra supervised label per FIM sample -- negligible against needing this the moment
+# generation quality (not just CE) is asked of this objective.
+export USE_EOS=${USE_EOS:-1}
 export FIM_MIN_GAP=${FIM_MIN_GAP:-64}
 export FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 export SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
