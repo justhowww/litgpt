@@ -19,6 +19,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Literal
 
 import torch
@@ -987,6 +988,7 @@ class ByteStreamWindowDataset(Dataset):
         fim_min_gap: int = 64,
         fim_max_gap: int = 1400,
         frame_guard_bytes: int = 64,
+        resample_fim: bool = False,
         nal_index: dict[str, list[NALUnit]] | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
@@ -1012,6 +1014,12 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_min_gap = fim_min_gap
         self.fim_max_gap = fim_max_gap
         self.frame_guard_bytes = frame_guard_bytes
+        self.resample_fim = resample_fim
+        # Indices pinned to a deterministic hole even when resample_fim is on. With a
+        # window-level (within-video) split, train and val are random_split Subsets of
+        # ONE dataset instance, so the val indices have to be named here -- there is no
+        # second instance to configure. setup() fills this in.
+        self.fixed_indices: frozenset[int] = frozenset()
         self.seed = seed
         self.ignore_index = ignore_index
         self.samples, self.nal_index = self._build_index(nal_index)
@@ -1156,12 +1164,21 @@ class ByteStreamWindowDataset(Dataset):
         every sample.
         """
         probe = self.samples[:: max(1, len(self.samples) // 32)][:32]
-        eligible = 0
+        windows_ok = 0
+        frames_total = 0
+        frames_ok = 0
+        hole_fracs: list[float] = []
         for sample in probe:
             data = sample.h264_path.read_bytes()
-            if self._fim_candidates(sample, data):
-                eligible += 1
-        if eligible == 0:
+            bounds = self._frame_bounds(sample, data)
+            candidates = self._fim_candidates(sample, data)
+            frames_total += len(bounds)
+            frames_ok += len(candidates)
+            windows_ok += bool(candidates)
+            for lo, hi in candidates:
+                usable = hi - (lo + self.frame_guard_bytes) - 1
+                hole_fracs.append(min(self.fim_max_gap, usable) / max(hi - lo, 1))
+        if windows_ok == 0:
             raise ValueError(
                 f"p_fim={self.p_fim} but none of {len(probe)} probed windows can host "
                 f"a hole (fim_min_gap={self.fim_min_gap}, "
@@ -1169,6 +1186,29 @@ class ByteStreamWindowDataset(Dataset):
                 f"max_seq_length={self.max_seq_length}). Every sample would silently "
                 "fall back to AR. Lower fim_min_gap, lower frame_guard_bytes, or "
                 "check that the corpus has readable frame boundaries."
+            )
+        # A hole is placed in an ELIGIBLE frame, so an aggressive fim_min_gap does not
+        # fail loudly -- it quietly narrows the hole to the corpus's largest frames
+        # (the IDR and the fattest P-frames) and trains repair on those alone. Report
+        # the eligible-frame fraction and the share of a frame the hole can reach so
+        # that bias is visible at startup rather than inferred from results later.
+        frac = frames_ok / max(frames_total, 1)
+        mean_hole = sum(hole_fracs) / max(len(hole_fracs), 1)
+        print(
+            f"[window-fim] hole-eligible frames: {frames_ok}/{frames_total} "
+            f"({frac:.0%}) over {len(probe)} probed windows | max hole covers "
+            f"~{mean_hole:.0%} of its frame | gap=[{self.fim_min_gap},"
+            f"{self.fim_max_gap}] guard={self.frame_guard_bytes}",
+            flush=True,
+        )
+        if frac < 0.5:
+            print(
+                f"[window-fim] WARNING: {1 - frac:.0%} of frames are too small to host "
+                f"fim_min_gap={self.fim_min_gap} (a frame needs > "
+                f"{self.frame_guard_bytes + self.fim_min_gap + 1} bytes). Holes will "
+                "concentrate in the largest frames, which biases what the FIM arm ever "
+                "practises on.",
+                flush=True,
             )
 
     def _window_tensors(
@@ -1195,8 +1235,38 @@ class ByteStreamWindowDataset(Dataset):
             torch.cat(offset_chunks),
         )
 
+    def pin_fixed_indices(self, indices: Iterable[int]) -> None:
+        """Pin these sample indices to a deterministic AR/FIM draw and hole (the val
+        split), so val_loss_fim is measured on the same spans at every eval and is
+        comparable across steps."""
+        self.fixed_indices = frozenset(int(i) for i in indices)
+
+    def _rng_for(self, idx: int) -> random.Random:
+        """Per-sample RNG.
+
+        Seeded by index (the default, and what ByteSliceDataset does) the hole is
+        frozen for the whole run: `rng.random() < p_fim` returns the same answer for
+        index idx every epoch, so p_fim stops being a per-visit coin flip and becomes
+        a fixed PARTITION of windows -- half of them AR forever, half FIM forever with
+        one hole each. Slice mode tolerates that because it has one sample per target
+        NAL (thousands per video); a window dataset has ~one sample per video (one IDR
+        per clip => one window), so the same pattern would (a) halve the AR arm
+        relative to the phase-1 baseline it is supposed to be compared against, which
+        confounds the interference measurement this run exists to make, and (b) turn
+        FIM into a few hundred fixed (context, hole, answer) triples repeated ~1e5
+        times, which a model that already memorises this corpus to tf_byte_acc 0.9998
+        will simply look up.
+
+        So training resamples per access: every window is AR on ~half its visits and
+        gets a fresh hole on the others. The corpus split stays seeded (and is dumped
+        to train_split.json), so what is lost is only the exact hole sequence.
+        """
+        if not self.resample_fim or idx in self.fixed_indices:
+            return random.Random(self.seed + idx)
+        return random.Random()  # fresh OS entropy per access, per worker
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        rng = random.Random(self.seed + idx)
+        rng = self._rng_for(idx)
         sample = self.samples[idx]
         data = sample.h264_path.read_bytes()
         window, raw_region, raw_offset = self._window_tensors(sample, data)
@@ -1486,6 +1556,9 @@ class ByteDataModule(DataModule):
             val_rows = [r for r in rows if r["h264_path"] in val_video_ids]
             self.train_dataset = _build_dataset(train_rows)
             self.val_dataset = _build_dataset(val_rows)
+            # Separate instances here, so train resamples and val simply does not.
+            if isinstance(self.train_dataset, ByteStreamWindowDataset):
+                self.train_dataset.resample_fim = self.config.p_fim > 0
         else:
             dataset = _build_dataset(rows)
             val_size = max(1, int(len(dataset) * self.config.val_fraction))
@@ -1498,6 +1571,11 @@ class ByteDataModule(DataModule):
             self.train_dataset, self.val_dataset = random_split(
                 dataset, [train_size, val_size], generator=generator
             )
+            # One shared instance: turn resampling on, then pin the val indices back to
+            # deterministic holes so val_loss_fim is the same spans at every eval.
+            if isinstance(dataset, ByteStreamWindowDataset) and self.config.p_fim > 0:
+                dataset.resample_fim = True
+                dataset.pin_fixed_indices(self.val_dataset.indices)
 
         if self.train_split_dump_path is not None:
             self._dump_train_split()

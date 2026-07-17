@@ -205,6 +205,37 @@ def test_unreachable_fim_raises_instead_of_silently_training_ar(tmp_path):
         _dataset(tmp_path, fim_min_gap=4096, fim_max_gap=8192)
 
 
+def test_index_seeded_rng_freezes_the_hole(tmp_path):
+    # The default (and what ByteSliceDataset does): the hole is fixed for the run.
+    ds, _ = _dataset(tmp_path)
+    draws = {(_meta(ds[0]).get("fim_split"), _meta(ds[0]).get("fim_gap")) for _ in range(12)}
+    assert len(draws) == 1
+
+
+def test_resample_fim_draws_a_fresh_hole_per_access(tmp_path):
+    # Training wants augmentation: same window, different hole each visit. Without
+    # this the AR arm is a fixed HALF of the windows (p_fim stops being a per-visit
+    # coin flip), which halves the AR data vs the phase-1 baseline and confounds the
+    # interference comparison phase 2 exists to make.
+    ds, _ = _dataset(tmp_path, p_fim=1.0, resample_fim=True)
+    draws = {(_meta(ds[0])["fim_split"], _meta(ds[0])["fim_gap"]) for _ in range(24)}
+    assert len(draws) > 1
+
+
+def test_resampling_flips_the_ar_fim_draw_across_visits(tmp_path):
+    ds, _ = _dataset(tmp_path, p_fim=0.5, resample_fim=True)
+    tasks = {_meta(ds[0])["task"] for _ in range(40)}
+    assert tasks == {"ar", "fim"}, f"p_fim=0.5 never varied per visit: {tasks}"
+
+
+def test_pinned_indices_stay_deterministic_under_resampling(tmp_path):
+    # val must not resample, or val_loss_fim moves under you between evals.
+    ds, _ = _dataset(tmp_path, p_fim=1.0, resample_fim=True)
+    ds.pin_fixed_indices([0])
+    draws = {(_meta(ds[0])["fim_split"], _meta(ds[0])["fim_gap"]) for _ in range(24)}
+    assert len(draws) == 1
+
+
 def test_hole_spans_many_nals_on_a_per_mb_corpus(tmp_path):
     # Documents the (b)-corpus caveat concretely: a corruption-sized hole cannot be
     # sub-NAL here, so BSCV's "excise inside one slice payload, NAL header intact"
