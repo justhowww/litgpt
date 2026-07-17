@@ -139,6 +139,9 @@ RUN_BEFORE = _build_rows(_RUN_LEN, _RUN_BITS)
 # ---------------------------------------------------------------------------
 
 _CODE_MAPS: dict[str, dict[str, object]] = {}
+# label -> every proper prefix of every codeword in that table. Lets decode_vlc reject
+# an illegal prefix the moment no codeword can still extend it, in O(1) per bit.
+_PREFIX_SETS: dict[str, set[str]] = {}
 
 
 def _invert(table: dict, label: str) -> dict[str, object]:
@@ -162,6 +165,7 @@ def _register(label: str, table: dict) -> dict[str, object]:
     code_map = _invert(table, label)
     _assert_prefix_free(list(code_map.keys()), label)
     _CODE_MAPS[label] = code_map
+    _PREFIX_SETS[label] = {c[:i] for c in code_map for i in range(1, len(c))}
     return code_map
 
 
@@ -169,13 +173,37 @@ def code_map(label: str) -> dict[str, object]:
     return _CODE_MAPS[label]
 
 
+def prefix_set(label: str) -> set[str]:
+    """Every proper prefix of every codeword in ``label``'s table."""
+    return _PREFIX_SETS[label]
+
+
 def decode_vlc(read_bit, cmap: dict[str, object], label: str = "", max_len: int = 32):
-    """Read bits until a code in ``cmap`` matches; return (value, num_bits)."""
+    """Read bits until a code in ``cmap`` matches; return (value, num_bits).
+
+    Raises ValueError as soon as the accumulated bits are neither a codeword nor a
+    proper prefix of one -- i.e. the moment the input is provably illegal for this
+    nC/TotalCoeff-selected table. Without that check the loop keeps consuming bits and,
+    on a short NAL (one macroblock is ~80 bits), ``read_bit`` runs off the RBSP first --
+    so a genuinely ILLEGAL codeword gets reported as BitReaderError ("the NAL ended too
+    early") instead of ValueError ("these bits are not a codeword"). The two are
+    different failure mechanisms and the exception histogram must not conflate them:
+
+      ValueError      -- the prefix is illegal for the selected table.
+      BitReaderError  -- the prefix was still extendable; the NAL ended first.
+
+    Valid streams are unaffected: their accumulated bits are always a prefix of the true
+    codeword, so the check never fires. Mirrors h264_automaton._feed's ``vlc`` branch,
+    keeping the recursive parser and the bit-stepped automaton in agreement.
+    """
+    prefixes = _PREFIX_SETS.get(label)
     bits = ""
     for _ in range(max_len):
         bits += "1" if read_bit() else "0"
         if bits in cmap:
             return cmap[bits], len(bits)
+        if prefixes is not None and bits not in prefixes:
+            raise ValueError(f"no VLC prefix match ({label}) for {bits!r}")
     raise ValueError(f"no VLC match ({label}) for {bits!r}")
 
 

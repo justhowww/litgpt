@@ -52,8 +52,19 @@ COMMON_VAL=(
 run() {  # split(train|val)  name  out_root  extra-sampling-args...
     local split="$1" name="$2" out_root="$3"; shift 3
     local -n common_ref="COMMON_${split^^}"
+    local dir="${out_root}/${name}"
+    # Start from a clean dir. metrics.jsonl is opened APPEND-only while config.json and
+    # summary.csv are overwritten, so re-running into a populated dir interleaves two
+    # runs' rows and destroys the only record of which config produced them -- the
+    # summary below then silently reports the last rows against the wrong config. (The
+    # previous greedy/ shipped exactly this: two continuation rows, full_cont 0.05 and
+    # 0.75, indistinguishable without the intra PSNR as a tie-break.)
+    if [[ -d "${dir}" ]]; then
+        echo "[clean] removing previous ${dir}"
+        rm -rf "${dir}"
+    fi
     echo "===================== [${split}/${name}] ====================="
-    python "${EVAL}" "${common_ref[@]}" --out-dir "${out_root}/${name}" "$@"
+    python "${EVAL}" "${common_ref[@]}" --out-dir "${dir}" "$@"
 }
 
 # --- (1) Training-set sampling sweep: this phase's focus (see 260712 - phase 1
@@ -126,3 +137,22 @@ for name in names:
     if cont is not None:
         print(f"{name:<14} desync_reasons: {cont.get('desync_reason_hist')}")
 PY
+
+# --- Per-NAL termination diagnostics -------------------------------------------
+# desync_reason=BitReaderError only says the parser wanted more bits than the NAL held;
+# it does not say WHY the NAL ended. This replays the persisted streams (no GPU, no
+# model) and answers the decisive question: at each emitted boundary, was the automaton
+# already in `done`? stage != done => the model learned how many macroblock NALs to
+# emit but not when one is syntactically complete. stop_reason (recorded by
+# free_run_rollout, whose six exits share one return) separately rules max_gen in/out.
+#
+# Runs AFTER the summary and cannot abort it: under `set -e` a non-zero exit here (e.g.
+# results predating stream persistence) would otherwise kill the script before the
+# headline A/B ever printed. A diagnostic must never suppress the result it explains.
+NAL_TERM=scripts/byte/eval/nal_termination.py
+for name in greedy greedy_masked; do
+    echo
+    echo "===================== [nal-termination/${name}] ====================="
+    python "${NAL_TERM}" "${TRAIN_OUT}/${name}" --slice-max-mbs 1 \
+        || echo "[warn] nal_termination failed for ${name} (summary above is unaffected)"
+done

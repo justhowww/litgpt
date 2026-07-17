@@ -497,6 +497,7 @@ def evaluate_checkpoint(
                 }
             )
             continue
+        rollout_trace: dict[str, Any] = {}
         gen_bytes, gen_frames_emitted = generate_continuation(
             model,
             fed_prefix,
@@ -507,8 +508,25 @@ def evaluate_checkpoint(
             clip.cont_frames,
             max_gen,
             start_nal=vcl_start,
+            trace=rollout_trace,
         )
         n, m = clip.prefix_frames, clip.cont_frames
+
+        # Persist both streams for offline analysis (scripts/byte/eval/nal_termination.py).
+        stream_gen_path = _write_stream(
+            args.out_dir, checkpoint_name, clip_idx, "gen", prefix_bytes + gen_bytes
+        )
+        stream_gt_path = _write_stream(args.out_dir, checkpoint_name, clip_idx, "gt", gt_bytes)
+        # stop_reason names which of free_run_rollout's six exits fired; it cannot be
+        # recovered from the bytes (a clean frame-target stop, a pad-run stop, a mask
+        # box-in and a first_mb desync all re-parse identically).
+        stream_fields = {
+            "stream_gen_path": stream_gen_path,
+            "stream_gt_path": stream_gt_path,
+            "n_prefix_bytes": len(prefix_bytes),
+            "max_gen": max_gen,
+            "stop_reason": rollout_trace.get("stop_reason"),
+        }
 
         # Byte-level survival + desync (parse-only, no ffmpeg) -- runs in BOTH modes.
         sr = _survival_and_validity(prefix_bytes, gen_bytes, m)
@@ -538,6 +556,8 @@ def evaluate_checkpoint(
                     "desync_reason": sr.desync_reason or "none",
                     "gen_bytes": len(gen_bytes),
                     "gt_cont_bytes": gt_cont_len,
+                    "first_desync": sr.first_desync,
+                    **stream_fields,
                 }
             )
             continue
@@ -588,6 +608,8 @@ def evaluate_checkpoint(
                 "gt_cont_bytes": gt_cont_len,
                 "cont_psnr_mean": mean(clip_psnr),
                 "cont_ssim_mean": mean(clip_ssim),
+                "first_desync": sr.first_desync,
+                **stream_fields,
             }
         )
         if clip_idx < args.num_visualizations:
@@ -642,6 +664,11 @@ def evaluate_checkpoint(
 
 
 _INDEX_RE = re.compile(r"\[\d+\]")
+
+# Residual block kind -> max_coeff. Selects the total_zeros VLC family (4 == chroma DC,
+# which uses the _cdc_ tables) and marks when total_zeros is absent (TotalCoeff == max).
+# Mirrors the _residual_block call sites in h264_syntax._parse_residual.
+_MAX_COEFF = {"luma_dc": 16, "luma_ac": 15, "luma": 16, "chroma_dc": 4, "chroma_ac": 15}
 
 
 def _acc(counts: list[int]) -> float | None:
@@ -728,18 +755,32 @@ def _decode_ue_bits(bit, start: int, max_zeros: int = 32):
     return val - 1
 
 
-def _vlc_decodable(bit, start: int, cmap: dict, max_len: int = 32) -> bool:
-    """True iff the model's argmax bits from ``start`` match some codeword in the
-    prefix-free VLC ``cmap`` (i.e. the codeword is decodable = legal for that table)."""
+def _vlc_legal(bit, start: int, label: str, max_len: int = 32) -> bool | None:
+    """Is the model's argmax codeword at ``start`` legal for VLC table ``label``?
+
+    True  -- the bits decode to a codeword.
+    False -- provably illegal: no codeword can extend the accumulated prefix.
+    None  -- INCONCLUSIVE: the eval window ended mid-codeword. Returning False here
+             (as this used to) counts a truncated-but-still-extendable prefix as an
+             illegal one, which is the same conflation decode_vlc had. Callers skip
+             None, so such spans contribute to neither legal nor illegal counts.
+
+    Mirrors h264_cavlc_tables.decode_vlc and h264_automaton._feed's ``vlc`` branch.
+    """
+    from litgpt.byte import h264_cavlc_tables as T  # lazy: keep import-light
+
+    cmap, prefixes = T.code_map(label), T.prefix_set(label)
     s, b = "", start
     for _ in range(max_len):
         v = bit(b)
         if v is None:
-            return False
+            return None
         s += "1" if v else "0"
         b += 1
         if s in cmap:
             return True
+        if s not in prefixes:
+            return False
     return False
 
 
@@ -775,7 +816,7 @@ def _value_legal_hits(
     total_len: int,
     gt_list: list[int],
     pred_list: list[int],
-) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+) -> tuple[dict[str, list[int]], dict[str, list[int]], dict[str, list[int]]]:
     """The honest per-field metrics from the teacher-forced argmax:
 
       correct[element] = fraction of that element's occurrences where the argmax bits
@@ -783,9 +824,22 @@ def _value_legal_hits(
           "the argmax decodes to the CORRECT value" -- no byte co-packing (unlike a
           per-byte match) and no per-bit partial credit (unlike bit accuracy).
       legal[element]   = fraction where the argmax codeword decodes to a LEGAL value for
-          the field's constraint. Defined for mb_type (<=30 P / <=25 I), coded_block_
-          pattern (codeNum < 48), and coeff_token (matches the nC-selected VLC table);
-          1 - legal is the rate at which the model's own best guess would DESYNC there.
+          the field's constraint; 1 - legal is the rate at which the model's own best
+          guess would DESYNC there.
+      illegal_when_wrong[element] = [n_illegal, n_wrong] over the same spans, i.e.
+          P(illegal | wrong). This is the quantity that gates free-run, and it is NOT
+          derivable from tf_byte_acc: survival is exp(-n * e_byte * P(illegal|wrong)),
+          so a model whose errors stay LEGAL free-runs at any length regardless of its
+          accuracy, while one that errs illegally dies exponentially in n. Conditioning
+          is exact because {illegal} is a subset of {wrong} (GT's own codeword is legal).
+
+    Legality is defined per field against the constraint the parser would enforce:
+      mb_type (<=30 P / <=25 I), coded_block_pattern (codeNum < 48), coeff_token
+      (nC-selected VLC table), mvd_l0.x/.y (se(v) decodes), total_zeros (TotalCoeff-
+      selected table, _cdc_ family when max_coeff == 4), run_before (min(zerosLeft, 7)
+      table). Context (nC, TotalCoeff, zerosLeft) is taken from GT spans -- this is a
+      teacher-forced probe, so the question is "given the true state, is the model's own
+      best guess legal here".
 
     Spans with an interior emulation-prevention byte (raw-byte count != rbsp-byte count)
     are skipped (the local RBSP<->raw mapping is unreliable). gt_list/pred_list index by
@@ -795,7 +849,13 @@ def _value_legal_hits(
 
     correct: dict[str, list[int]] = {}
     legal: dict[str, list[int]] = {}
+    illegal_when_wrong: dict[str, list[int]] = {}
     slice_type = None
+    # GT residual-block context, carried across spans in stream order (coeff_token ->
+    # total_zeros -> run_before[i] within one block).
+    blk_tc: int | None = None
+    blk_max: int | None = None
+    zeros_left: int | None = None
     for span in spans:
         if span.name == "slice_type":
             slice_type = span.value
@@ -825,6 +885,7 @@ def _value_legal_hits(
         c[1] += 1
 
         bit = _argmax_bit_reader(pred_list, prefix_len, span.byte_start, b0)
+        base = ename.split(".")[0]
         is_legal = None
         if span.name == "mb_type":
             v = _decode_ue_bits(bit, b0)
@@ -835,15 +896,51 @@ def _value_legal_hits(
             v = _decode_ue_bits(bit, b0)
             if v is not None:
                 is_legal = 0 <= v < 48  # GOLOMB_TO_*_CBP have 48 entries
-        elif span.name.endswith(".coeff_token"):
+        elif ename.endswith(".coeff_token"):
             nc = span.value.get("nC") if isinstance(span.value, dict) else None
             if nc is not None:
-                is_legal = _vlc_decodable(bit, b0, T.code_map(T.coeff_token_label(nc)))
+                is_legal = _vlc_legal(bit, b0, T.coeff_token_label(nc))
+        elif ename in ("mvd_l0.x", "mvd_l0.y"):
+            # se(v) is unbounded; the only illegality the parser can hit is an
+            # exp-Golomb prefix that never terminates (read_ue caps leading zeros).
+            is_legal = _decode_ue_bits(bit, b0) is not None
+        elif ename.endswith(".total_zeros"):
+            if blk_tc is not None and blk_max is not None and 0 < blk_tc < blk_max:
+                label = (
+                    f"total_zeros_cdc_{blk_tc}"
+                    if blk_max == 4
+                    else f"total_zeros_4x4_{blk_tc}"
+                )
+                is_legal = _vlc_legal(bit, b0, label)
+        elif ename.endswith(".run_before"):
+            if zeros_left is not None and zeros_left > 0:
+                is_legal = _vlc_legal(bit, b0, f"run_before_{min(zeros_left, 7)}")
         if is_legal is not None:
             lg = legal.setdefault(ename, [0, 0])
             lg[0] += int(is_legal)
             lg[1] += 1
-    return correct, legal
+            if not all_match:  # {illegal} subset {wrong} -> condition on wrong
+                iw = illegal_when_wrong.setdefault(ename, [0, 0])
+                iw[0] += int(not is_legal)
+                iw[1] += 1
+
+        # Advance GT block context AFTER the check above (the check reads the state the
+        # parser would be in when it reaches this field).
+        if ename.endswith(".coeff_token"):
+            blk_tc = span.value.get("total_coeff") if isinstance(span.value, dict) else None
+            blk_max = _MAX_COEFF.get(base)
+            # total_zeros is only coded when TotalCoeff < max_coeff; otherwise zerosLeft
+            # is 0 and no run_before follows.
+            zeros_left = 0 if (blk_tc is not None and blk_tc == blk_max) else None
+        elif ename.endswith(".total_zeros") and isinstance(span.value, int):
+            zeros_left = span.value
+        elif (
+            ename.endswith(".run_before")
+            and isinstance(span.value, int)
+            and zeros_left is not None
+        ):
+            zeros_left -= span.value
+    return correct, legal, illegal_when_wrong
 
 
 def _copy_oracle(spans: list) -> dict[str, list[int]]:
@@ -919,6 +1016,7 @@ def evaluate_teacher_forced(
     # value (exact codeword match), and to a LEGAL value (would not desync)?
     elem_correct: dict[str, list[int]] = {}
     elem_legal: dict[str, list[int]] = {}
+    elem_illegal_wrong: dict[str, list[int]] = {}
     # Unigram/chance floor: GT byte histogram per bucket (accuracy of always guessing
     # the bucket's most common byte).
     cat_hist: dict[str, Counter] = {}
@@ -1016,9 +1114,12 @@ def evaluate_teacher_forced(
             elem_hist.setdefault(elem_of[k], Counter())[gt_list[k]] += 1
 
         # Honest per-field metrics (correct-value / legal-value) + temporal-copy oracle.
-        cor, leg = _value_legal_hits(spans, fed_prefix_len, fed_total_len, gt_list, pred_list)
+        cor, leg, ilw = _value_legal_hits(
+            spans, fed_prefix_len, fed_total_len, gt_list, pred_list
+        )
         _merge_counts(elem_correct, cor)
         _merge_counts(elem_legal, leg)
+        _merge_counts(elem_illegal_wrong, ilw)
         _merge_counts(copy_acc, _copy_oracle(spans))
 
         details.append(
@@ -1052,6 +1153,13 @@ def evaluate_teacher_forced(
         "legal_cbp": _acc(elem_legal.get("coded_block_pattern", [0, 0])),
         "correct_coeff_token": _acc(elem_correct.get("luma.coeff_token", [0, 0])),
         "legal_coeff_token": _acc(elem_legal.get("luma.coeff_token", [0, 0])),
+        # P(illegal | wrong) -- the free-run gate. Headline is luma.coeff_token (the
+        # nC-context-dependent table, and the measured desync epicentre). Read it with
+        # its n_wrong: at TF acc ~0.9998 the error count is tiny and the ratio is noisy.
+        "p_illegal_given_err_coeff_token": _acc(
+            elem_illegal_wrong.get("luma.coeff_token", [0, 0])
+        ),
+        "n_wrong_coeff_token": elem_illegal_wrong.get("luma.coeff_token", [0, 0])[1],
         # Unigram/chance floor: accuracy of always guessing the bucket's most common byte.
         "unigram_mb_type": _uni(elem_hist.get("mb_type", Counter())),
         "unigram_mb_pred": _uni(cat_hist.get("mb_pred", Counter())),
@@ -1071,6 +1179,15 @@ def evaluate_teacher_forced(
             e: {"acc": h / t, "n": t}
             for e, (h, t) in sorted(elem_legal.items())
             if t >= 16
+        },
+        # P(illegal | wrong) per element. Deliberately NOT filtered by a minimum count:
+        # the denominator is the ERROR count, which is ~1e-3 of the occurrence count, so
+        # any n-threshold would empty this dict. Raw n_illegal/n_wrong are emitted so the
+        # (large) uncertainty is visible rather than hidden behind a ratio.
+        "element_illegal_when_wrong": {
+            e: {"p": h / t, "n_illegal": h, "n_wrong": t}
+            for e, (h, t) in sorted(elem_illegal_wrong.items())
+            if t > 0
         },
         "unigram_acc": {
             e: {"acc": _uni(c), "n": sum(c.values())}
@@ -1105,6 +1222,7 @@ def generate_continuation(
     cont_frames: int,
     max_gen: int,
     start_nal: int = 0,
+    trace: dict | None = None,
 ) -> tuple[bytes, int]:
     """Free-run byte generation, stopping after cont_frames complete real frames
     (detected via first_mb_in_slice == 0 on each closed VCL NAL -- see
@@ -1136,6 +1254,7 @@ def generate_continuation(
         stop_pad_run=args.stop_pad_run,
         constrain=args.mask_illegal_bytes,
         prefix_bytes=prefix_bytes,
+        trace=trace,
     )
 
 
@@ -1348,6 +1467,23 @@ def save_continuation_videos(
             + "\n",
             encoding="utf-8",
         )
+
+
+def _write_stream(out_dir: Path, checkpoint_name: str, clip_idx: int, kind: str, data: bytes) -> str:
+    """Persist one Annex-B byte stream and return its path.
+
+    Both streams are written with the SAME full prefix that ``_survival_and_validity``
+    parses, so ``gen`` and ``gt`` are byte-aligned over the prefix and their NALs can be
+    paired by index. Without this the generated bytes are unrecoverable -- the .mp4s are
+    mpeg4 re-encodes of DECODED frames, not the bitstream -- and every post-hoc question
+    (termination cause, codeword-length mismatch, parser-state mismatch) needs a fresh
+    GPU run. A few KB per clip buys offline re-analysis of all of them.
+    """
+    stream_dir = out_dir / "streams" / checkpoint_name
+    stream_dir.mkdir(parents=True, exist_ok=True)
+    path = stream_dir / f"clip_{clip_idx:04d}_continuation_{kind}.h264"
+    path.write_bytes(data)
+    return str(path)
 
 
 def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
