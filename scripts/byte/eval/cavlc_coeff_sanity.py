@@ -97,7 +97,10 @@ def random_block_bits(rng: random.Random, nc: int, max_coeff: int) -> tuple[list
             if max_coeff == 4
             else f"total_zeros_4x4_{total_coeff}"
         )
-        tz_values = sorted(set(T.code_map(tz_label).values()))
+        tz_values = sorted(
+            v for v in set(T.code_map(tz_label).values())
+            if v <= max_coeff - total_coeff
+        )
         total_zeros = rng.choice(tz_values)
         bits.extend(_code_for(tz_label, total_zeros))
 
