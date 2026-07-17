@@ -92,6 +92,28 @@ def test_no_parser_automaton_contradiction_on_ground_truth():
         )
 
 
+def test_first_desync_at_start_code_maps_to_nal():
+    """BitReaderError at EOF falls back to start_code_start, before payload_start."""
+    for name in _FIXTURE_FILES:
+        path = _FIXTURES / name
+        if not path.exists():
+            continue
+        data = path.read_bytes()
+        parsed = NT.HS.parse_stream(data, parse_slice_data=True)
+        vcl = next(p for p in parsed.nals if p.nal.nal_type in NT.HS.VCL_NAL_TYPES)
+        cut = data[: max(vcl.nal.payload_start + 2, vcl.nal.payload_end - 3)]
+        cut_parsed = NT.HS.parse_stream(cut, parse_slice_data=True)
+        cut_vcl = next(p for p in cut_parsed.nals if p.nal.nal_type in NT.HS.VCL_NAL_TYPES)
+        res = NT.analyze_stream(
+            cut, data, 0, slice_max_mbs=_FIXTURE_MAX_MBS,
+            first_desync=cut_vcl.nal.start_code_start,
+        )
+        marked = [n for n in res["nals"] if n.get("is_first_desync_nal")]
+        assert len(marked) == 1
+        assert marked[0]["byte_start"] == cut_vcl.nal.payload_start
+        break
+
+
 if __name__ == "__main__":  # stdlib runner
     for _n in _FIXTURE_FILES:
         if not (_FIXTURES / _n).exists():
@@ -102,4 +124,5 @@ if __name__ == "__main__":  # stdlib runner
     test_ground_truth_has_no_premature_boundaries()
     test_ground_truth_pairs_and_matches_itself()
     test_no_parser_automaton_contradiction_on_ground_truth()
+    test_first_desync_at_start_code_maps_to_nal()
     print("all passed")

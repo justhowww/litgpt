@@ -143,7 +143,10 @@ def prepare_free_run_samples(
         if not ok or prefix_bytes_len <= 0 or cont_bytes_len <= 0:
             continue
 
-        item = base[idx]
+        # ar_item, not base[idx]: this probe is AR-only and needs labels to be the
+        # window's raw bytes. Under p_fim > 0 base[idx] may return a FIM item whose
+        # labels are IGNORE_INDEX outside the span, which is not a byte string.
+        item = base.ar_item(idx)
         window_bytes = bytes(item["labels"].tolist())
         prefix_bytes = window_bytes[:prefix_bytes_len]
         # Confirm the prefix actually parses clean before trusting the metric.

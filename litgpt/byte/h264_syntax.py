@@ -116,6 +116,10 @@ class NALParse:
     # Bits of RBSP consumed when parsing stopped (for invariant A).
     consumed_bits: int | None = None
     rbsp_bits_total: int | None = None
+    # Exact parser operation active when an exception escaped. Completed spans alone
+    # cannot provide this for BitReaderError because the failing span is never appended.
+    failure_element: str | None = None
+    failure_context: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +213,21 @@ class BitReader:
         self.rbsp = rbsp
         self.nbits = len(rbsp) * 8
         self.pos = 0
+        self.active_element: str | None = None
+        self.active_context: dict | None = None
+
+    def begin(self, element: str, **context) -> None:
+        """Name the syntax read currently allowed to fail.
+
+        The marker is cleared only after a successful read. If read_bit reaches EOF,
+        parse_nal can therefore report the operation that requested the missing bit.
+        """
+        self.active_element = element
+        self.active_context = context or None
+
+    def end(self) -> None:
+        self.active_element = None
+        self.active_context = None
 
     def read_bit(self) -> int:
         if self.pos >= self.nbits:
@@ -629,19 +648,25 @@ class _Recorder:
 
     def u(self, name, reader: BitReader, n: int, cat: Category, mb_addr=None) -> int:
         b0 = reader.pos
+        reader.begin(name, category=cat.value, mb_addr=mb_addr, width=n)
         v = reader.read_bits(n)
+        reader.end()
         self._span(name, cat, b0, reader.pos, v, mb_addr)
         return v
 
     def ue(self, name, reader: BitReader, cat: Category, mb_addr=None) -> int:
         b0 = reader.pos
+        reader.begin(name, category=cat.value, mb_addr=mb_addr, coding="ue")
         v = reader.read_ue()
+        reader.end()
         self._span(name, cat, b0, reader.pos, v, mb_addr)
         return v
 
     def se(self, name, reader: BitReader, cat: Category, mb_addr=None) -> int:
         b0 = reader.pos
+        reader.begin(name, category=cat.value, mb_addr=mb_addr, coding="se")
         v = reader.read_se()
+        reader.end()
         self._span(name, cat, b0, reader.pos, v, mb_addr)
         return v
 
@@ -649,7 +674,9 @@ class _Recorder:
         self, name, reader: BitReader, x_max: int, cat: Category, mb_addr=None
     ) -> int:
         b0 = reader.pos
+        reader.begin(name, category=cat.value, mb_addr=mb_addr, coding="te", x_max=x_max)
         v = reader.read_te(x_max)
+        reader.end()
         self._span(name, cat, b0, reader.pos, v, mb_addr)
         return v
 
@@ -786,6 +813,8 @@ def parse_nal(
         result.status = ParseStatus.DESYNC
         result.reason = str(exc)
         result.reason_kind = type(exc).__name__
+        result.failure_element = reader.active_element
+        result.failure_context = reader.active_context
         result.desync_bit = reader.pos
         if reader.pos < reader.nbits and byte_map:
             result.desync_byte = byte_map[min(reader.pos, reader.nbits - 1) >> 3]
@@ -808,9 +837,11 @@ def _parse_slice(
 ) -> None:
     # Peek pps_id to resolve sps/pps (re-read cleanly inside parse_slice_header).
     save = reader.pos
+    reader.begin("slice_header.peek_pps_id", category=Category.SLICE_HEADER.value)
     _ = reader.read_ue()  # first_mb
     _ = reader.read_ue()  # slice_type
     pps_id = reader.read_ue()
+    reader.end()
     reader.pos = save
     pps = pps_map.get(pps_id)
     if pps is None:
@@ -931,6 +962,10 @@ def _residual_block(
     """Parse one CAVLC residual block; record sub-element spans; return TotalCoeff."""
     label = T.coeff_token_label(nc)
     b0 = reader.pos
+    reader.begin(
+        f"{name}.coeff_token", category=cat.value, mb_addr=mb_addr,
+        nC=nc, vlc_table=label, max_coeff=max_coeff,
+    )
     try:
         (total_coeff, trailing_ones), _ = T.decode_vlc(
             reader.read_bit, T.code_map(label), label
@@ -942,6 +977,7 @@ def _residual_block(
         record.raw(f"{name}.coeff_token", cat, b0, reader.pos,
                    {"nC": nc, "failed": True}, mb_addr)
         raise
+    reader.end()
     record.raw(
         f"{name}.coeff_token",
         cat,
@@ -954,7 +990,12 @@ def _residual_block(
         return 0
     if trailing_ones > 0:
         s0 = reader.pos
+        reader.begin(
+            f"{name}.trailing_ones_sign_flag", category=cat.value, mb_addr=mb_addr,
+            total_coeff=total_coeff, trailing_ones=trailing_ones,
+        )
         reader.read_bits(trailing_ones)
+        reader.end()
         record.raw(
             f"{name}.trailing_ones_sign_flag",
             cat,
@@ -967,6 +1008,12 @@ def _residual_block(
     for i in range(total_coeff - trailing_ones):
         ls = reader.pos
         level_prefix = 0
+        reader.begin(
+            f"{name}.level[{i}].prefix", category=cat.value, mb_addr=mb_addr,
+            level_index=i, levels_expected=total_coeff - trailing_ones,
+            total_coeff=total_coeff, trailing_ones=trailing_ones,
+            suffix_length=suffix_length,
+        )
         while reader.read_bit() == 0:
             level_prefix += 1
             if level_prefix > 60:
@@ -977,7 +1024,18 @@ def _residual_block(
             suffix_size = level_prefix - 3
         else:
             suffix_size = suffix_length
-        level_suffix = reader.read_bits(suffix_size) if suffix_size > 0 else 0
+        reader.end()
+        if suffix_size > 0:
+            reader.begin(
+                f"{name}.level[{i}].suffix", category=cat.value, mb_addr=mb_addr,
+                level_index=i, levels_expected=total_coeff - trailing_ones,
+                total_coeff=total_coeff, trailing_ones=trailing_ones,
+                level_prefix=level_prefix, suffix_size=suffix_size,
+            )
+            level_suffix = reader.read_bits(suffix_size)
+            reader.end()
+        else:
+            level_suffix = 0
         level_code = (min(15, level_prefix) << suffix_length) + level_suffix
         if level_prefix >= 15 and suffix_length == 0:
             level_code += 15
@@ -999,7 +1057,12 @@ def _residual_block(
             if max_coeff == 4
             else f"total_zeros_4x4_{total_coeff}"
         )
+        reader.begin(
+            f"{name}.total_zeros", category=cat.value, mb_addr=mb_addr,
+            total_coeff=total_coeff, max_coeff=max_coeff, vlc_table=tz_label,
+        )
         total_zeros, _ = T.decode_vlc(reader.read_bit, T.code_map(tz_label), tz_label)
+        reader.end()
         record.raw(f"{name}.total_zeros", cat, tz0, reader.pos, total_zeros, mb_addr)
     zeros_left = total_zeros
     for i in range(total_coeff - 1):
@@ -1007,7 +1070,13 @@ def _residual_block(
             break
         rb0 = reader.pos
         rb_label = f"run_before_{min(zeros_left, 7)}"
+        reader.begin(
+            f"{name}.run_before[{i}]", category=cat.value, mb_addr=mb_addr,
+            run_index=i, total_coeff=total_coeff, zeros_left=zeros_left,
+            vlc_table=rb_label,
+        )
         run, _ = T.decode_vlc(reader.read_bit, T.code_map(rb_label), rb_label)
+        reader.end()
         record.raw(f"{name}.run_before[{i}]", cat, rb0, reader.pos, run, mb_addr)
         zeros_left -= run
     return total_coeff

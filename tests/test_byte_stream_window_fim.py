@@ -236,6 +236,36 @@ def test_pinned_indices_stay_deterministic_under_resampling(tmp_path):
     assert len(draws) == 1
 
 
+def test_ar_item_returns_raw_window_bytes_under_p_fim(tmp_path):
+    # Regression: prepare_free_run_samples does bytes(item["labels"].tolist()), which
+    # died with "bytes must be in range(0, 256)" the moment p_fim > 0 handed it a FIM
+    # item (labels are IGNORE_INDEX outside the span). The free-run probe is AR-only,
+    # so it must read the AR view regardless of p_fim.
+    ds, data = _dataset(tmp_path, p_fim=1.0)
+    assert _meta(ds[0])["task"] == "fim"  # __getitem__ gives FIM ...
+    item = ds.ar_item(0)  # ... ar_item still gives AR
+    assert _meta(item)["task"] == "ar"
+    assert (item["labels"] >= 0).all() and (item["labels"] < 256).all()
+    assert bytes(item["labels"].tolist()) == data
+
+
+def test_free_run_probe_survives_p_fim(tmp_path, monkeypatch):
+    # The end-to-end shape of the vulcan crash: p_fim > 0 AND a free-run probe.
+    import types
+
+    from litgpt.byte import free_run_eval as FR
+
+    class _OK:
+        status = FR.HS.ParseStatus.OK
+
+    # Neutralise the "prefix parses clean" gate; synthetic payloads are not real CAVLC.
+    monkeypatch.setattr(FR.HS, "parse_stream", lambda *a, **k: types.SimpleNamespace(nals=[_OK()]))
+    ds, _ = _dataset(tmp_path, p_fim=1.0)
+    cfg = FR.FreeRunEvalConfig(interval=1, num_clips=4, prefix_frames=1, cont_frames=1)
+    samples = FR.prepare_free_run_samples(ds, cfg)  # must not raise
+    assert len(samples) == 1
+
+
 def test_hole_spans_many_nals_on_a_per_mb_corpus(tmp_path):
     # Documents the (b)-corpus caveat concretely: a corruption-sized hole cannot be
     # sub-NAL here, so BSCV's "excise inside one slice payload, NAL header intact"

@@ -1265,6 +1265,25 @@ class ByteStreamWindowDataset(Dataset):
             return random.Random(self.seed + idx)
         return random.Random()  # fresh OS entropy per access, per worker
 
+    def ar_item(self, idx: int) -> dict[str, Any]:
+        """The AR view of a window, whatever p_fim is.
+
+        For a caller that needs ``labels`` to BE the window's bytes. Under p_fim > 0
+        ``__getitem__`` may hand back a FIM item, whose labels are IGNORE_INDEX
+        everywhere outside the span and therefore not a byte string. The free-run
+        probe is such a caller: it is an AR probe, and reading it through
+        ``__getitem__`` made it fail with "bytes must be in range(0, 256)" as soon as
+        FIM was switched on.
+
+        Going through this method rather than skipping FIM samples also keeps the
+        probe's clip pool independent of p_fim, so phase 2's free-run numbers are
+        measured over the same windows as phase 1's and stay comparable.
+        """
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        window, raw_region, raw_offset = self._window_tensors(sample, data)
+        return self._build_ar_item(sample, window, raw_region, raw_offset)
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rng = self._rng_for(idx)
         sample = self.samples[idx]

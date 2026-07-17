@@ -190,6 +190,11 @@ def analyze_stream(
             "gen_len": gen_len,
             "parse_status": p.status.value,
             "parse_reason_kind": p.reason_kind,
+            "parse_reason": p.reason,
+            "failure_element": p.failure_element,
+            "failure_context": p.failure_context,
+            "consumed_bits": p.consumed_bits,
+            "rbsp_bits_total": p.rbsp_bits_total,
         }
         if snap:
             rec.update(
@@ -212,7 +217,11 @@ def analyze_stream(
             rec["total_coeff_gen"] = gen_tc
             rec["total_coeff_gt"] = gt_tc
             rec["total_coeff_match"] = gen_tc == gt_tc
-        if first_desync is not None and nal.payload_start <= first_desync < nal.payload_end:
+        # BitReaderError occurs at EOF, so parse_nal has no in-range desync_byte and
+        # _survival_and_validity falls back to the NAL's *start-code* offset. Include
+        # that prefix here; comparing only against payload_start silently misses the
+        # exact NAL this diagnostic exists to inspect.
+        if first_desync is not None and nal.start_code_start <= first_desync < nal.payload_end:
             rec["is_first_desync_nal"] = True
             desync_nal_index = j
         records.append(rec)
@@ -272,6 +281,7 @@ def main() -> None:
     deltas: list[int] = []
     tc_mismatch = 0
     tc_compared = 0
+    first_desync_reports: list[dict[str, Any]] = []
     for r in rows:
         gen = Path(r["stream_gen_path"]).read_bytes()
         gt = Path(r["stream_gt_path"]).read_bytes()
@@ -288,6 +298,24 @@ def main() -> None:
             if "total_coeff_match" in n:
                 tc_compared += 1
                 tc_mismatch += int(not n["total_coeff_match"])
+            if n.get("is_first_desync_nal"):
+                first_desync_reports.append({
+                    "clip_index": r["clip_index"],
+                    "desync_reason": r.get("desync_reason"),
+                    "gen_nal_index": n["gen_nal_index"],
+                    "classification": n["classification"],
+                    "parse_reason_kind": n["parse_reason_kind"],
+                    "parse_reason": n["parse_reason"],
+                    "failure_element": n["failure_element"],
+                    "failure_context": n["failure_context"],
+                    "consumed_bits": n["consumed_bits"],
+                    "rbsp_bits_total": n["rbsp_bits_total"],
+                    "automaton_stage": n.get("stage"),
+                    "automaton_element": n.get("ae_tag"),
+                    "automaton_total_coeff": n.get("rb_total_coeff"),
+                    "automaton_level_index": n.get("rb_i"),
+                    "automaton_zeros_left": n.get("rb_zeros_left"),
+                })
         clip_records.append({
             "clip_index": r["clip_index"],
             "stop_reason": r.get("stop_reason"),
@@ -312,6 +340,7 @@ def main() -> None:
         "parser_automaton_contradictions": sum(
             len(c["parser_automaton_contradictions"]) for c in clip_records
         ),
+        "first_desync_reports": first_desync_reports,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -322,6 +351,22 @@ def main() -> None:
     print(f"delta_bytes != 0 : {summary['delta_bytes_nonzero']}/{summary['delta_bytes_n']}")
     print(f"TotalCoeff wrong : {summary['total_coeff_mismatch']}/{summary['total_coeff_compared']}")
     print(f"parser/automaton contradictions: {summary['parser_automaton_contradictions']}")
+    print("first desync NALs:")
+    if not first_desync_reports:
+        print("  (none mapped)")
+    for r in first_desync_reports:
+        remaining = (
+            r["rbsp_bits_total"] - r["consumed_bits"]
+            if r["rbsp_bits_total"] is not None and r["consumed_bits"] is not None
+            else None
+        )
+        print(
+            f"  clip={r['clip_index']} nal={r['gen_nal_index']} "
+            f"boundary={r['classification']} reason={r['parse_reason_kind']} "
+            f"failure={r['failure_element']} context={r['failure_context']} "
+            f"bits={r['consumed_bits']}/{r['rbsp_bits_total']} remaining={remaining} "
+            f"auto={r['automaton_stage']}:{r['automaton_element']}"
+        )
     print(f"-> {out_dir}/nal_termination_clips.jsonl")
 
 
