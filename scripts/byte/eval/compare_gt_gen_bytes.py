@@ -238,6 +238,28 @@ def _overlap_list(title: str, syntax: list[dict[str, Any]], off: int) -> str:
     return f"<h3>{html.escape(title)}</h3><ul>{items}</ul>"
 
 
+def _span_details_list(label: str, spans: list[str]) -> str:
+    if not spans:
+        return f"<div class='muted'>{html.escape(label)}: no covering spans</div>"
+    items = "".join(f"<li>{html.escape(str(x))}</li>" for x in spans)
+    return f"<div class='span-side'><b>{html.escape(label)}</b><ul>{items}</ul></div>"
+
+
+def _byte_span_details(off: int, gt_s: dict[str, Any], gen_s: dict[str, Any]) -> str:
+    gt_spans = gt_s.get("all") or []
+    gen_spans = gen_s.get("all") or []
+    n = len(gt_spans) + len(gen_spans)
+    label = f"{n} span" if n == 1 else f"{n} spans"
+    return (
+        "<details class='byte-spans'>"
+        f"<summary>{label}</summary>"
+        f"<div class='span-title'>byte {off}</div>"
+        f"{_span_details_list('GT', gt_spans)}"
+        f"{_span_details_list('GEN', gen_spans)}"
+        "</details>"
+    )
+
+
 def _first_diff_panel(
     gt: bytes,
     gen: bytes,
@@ -480,11 +502,12 @@ def _byte_rows(gt: bytes, gen: bytes, gt_syntax: list[dict[str, Any]], gen_synta
             f"<td>{'same' if cls == 'same' else cls}<br><span class='bits'>{_bit_cells(gtb, geb)}</span></td>"
             f"<td>{_syntax_cell(gs)}</td><td>{html.escape(str(gs['value']))}</td>"
             f"<td>{_syntax_cell(es)}</td><td>{html.escape(str(es['value']))}</td>"
+            f"<td>{_byte_span_details(off, gs, es)}</td>"
             "</tr>"
         )
     if n > shown:
         rows.append(
-            f"<tr><td colspan='9'>Byte table truncated: {shown}/{n}. Raise --max-bytes.</td></tr>"
+            f"<tr><td colspan='10'>Byte table truncated: {shown}/{n}. Raise --max-bytes.</td></tr>"
         )
     return "".join(rows)
 
@@ -522,7 +545,7 @@ def render(gt: bytes, gen: bytes, title: str, prefix_len: int | None, max_bytes:
     body.append(
         "<h2>Byte comparison</h2>"
         "<table><tr><th>off</th><th>region</th><th>GT</th><th>GEN</th><th>match</th>"
-        "<th>GT syntax</th><th>GT value</th><th>GEN syntax</th><th>GEN value</th></tr>"
+        "<th>GT syntax</th><th>GT value</th><th>GEN syntax</th><th>GEN value</th><th>spans</th></tr>"
     )
     body.append(_byte_rows(gt, gen, gt_syntax, gen_syntax, prefix_len, max_bytes))
     body.append("</table>")
@@ -545,6 +568,12 @@ _HEAD = """<!doctype html><html><head><meta charset='utf-8'><title>__TITLE__</ti
  tr.extra{background:#20203a}
  tr.prefix{opacity:.72}
  .syntax{display:inline-block;color:white;border-radius:3px;padding:1px 5px;white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+ .byte-spans summary{cursor:pointer;color:#bfdbfe;white-space:nowrap}
+ .byte-spans[open] summary{margin-bottom:4px}
+ .span-title{color:#cbd5e1;margin:2px 0 4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .span-side{margin:5px 0}
+ .span-side ul{margin:3px 0 0 16px;padding:0;min-width:420px}
+ .span-side li{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;margin:2px 0}
  .bits{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
  .bitrow{margin-top:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
  .bit{display:inline-block;border-radius:3px;padding:2px 4px;margin-right:3px;border:1px solid #3b4154}
