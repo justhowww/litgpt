@@ -107,7 +107,7 @@ def _assign_syntax(spans: list, n_bytes: int) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for off, overlaps in enumerate(by_byte):
         if not overlaps:
-            out.append({"name": "?", "category": "unknown", "value": None, "mb_addr": None})
+            out.append({"name": "?", "category": "unknown", "value": None, "mb_addr": None, "all": []})
             continue
         primary = min(overlaps, key=lambda s: (s.byte_end - s.byte_start, s.byte_start))
         out.append(
@@ -116,6 +116,7 @@ def _assign_syntax(spans: list, n_bytes: int) -> list[dict[str, Any]]:
                 "category": _cat(primary),
                 "value": _jsonable(primary.value),
                 "mb_addr": primary.mb_addr,
+                "all": [_span_summary(s) for s in overlaps],
             }
         )
     return out
@@ -134,10 +135,78 @@ def _val(value: Any) -> str:
 def _syntax_cell(s: dict[str, Any]) -> str:
     color = CAT_COLORS.get(s["category"], CAT_COLORS["unknown"])
     mb = "" if s.get("mb_addr") is None else f" mb={s['mb_addr']}"
-    tip = html.escape(f"{s['name']} {s['value']}{mb}")
+    overlaps = s.get("all") or []
+    overlap_txt = "\n".join(overlaps[:12])
+    tip = html.escape(f"primary: {s['name']} {s['value']}{mb}" + (f"\n\nall overlaps:\n{overlap_txt}" if overlap_txt else ""))
     return (
         f"<span class='syntax' style='background:{color}' title='{tip}'>"
         f"{html.escape(s['name'])}</span>"
+    )
+
+
+def _span_summary(span) -> str:
+    mb = "" if span.mb_addr is None else f" mb={span.mb_addr}"
+    return (
+        f"{span.name} value={_jsonable(span.value)} bytes={span.byte_start}:{span.byte_end} "
+        f"rbsp_bits={span.bit_start}:{span.bit_end}{mb}"
+    )
+
+
+def _bits(b: int | None) -> str:
+    return "--------" if b is None else f"{b:08b}"
+
+
+def _first_diff_bit(gt_b: int | None, gen_b: int | None) -> int | None:
+    if gt_b is None or gen_b is None or gt_b == gen_b:
+        return None
+    for bit in range(8):
+        mask = 1 << (7 - bit)
+        if (gt_b & mask) != (gen_b & mask):
+            return bit
+    return None
+
+
+def _bit_cells(gt_b: int | None, gen_b: int | None) -> str:
+    gt_bits = _bits(gt_b)
+    gen_bits = _bits(gen_b)
+    first = _first_diff_bit(gt_b, gen_b)
+    cells = []
+    for i, (gb, eb) in enumerate(zip(gt_bits, gen_bits, strict=True)):
+        cls = "bit samebit" if gb == eb else "bit diffbit"
+        if first == i:
+            cls += " firstbit"
+        cells.append(f"<span class='{cls}' title='bit {i} msb-first: GT={gb} GEN={eb}'>{gb}/{eb}</span>")
+    return "".join(cells)
+
+
+def _overlap_list(title: str, syntax: list[dict[str, Any]], off: int) -> str:
+    if off >= len(syntax):
+        return f"<h3>{html.escape(title)}</h3><div class='muted'>byte outside stream</div>"
+    overlaps = syntax[off].get("all") or []
+    if not overlaps:
+        return f"<h3>{html.escape(title)}</h3><div class='muted'>no syntax span covers this byte</div>"
+    items = "".join(f"<li>{html.escape(str(x))}</li>" for x in overlaps)
+    return f"<h3>{html.escape(title)}</h3><ul>{items}</ul>"
+
+
+def _first_diff_panel(gt: bytes, gen: bytes, gt_syntax: list[dict[str, Any]], gen_syntax: list[dict[str, Any]], first_diff: int | None) -> str:
+    if first_diff is None:
+        return "<h2>First differing byte</h2><div class='summary'>No byte difference.</div>"
+    gt_b = gt[first_diff] if first_diff < len(gt) else None
+    gen_b = gen[first_diff] if first_diff < len(gen) else None
+    first_bit = _first_diff_bit(gt_b, gen_b)
+    bit_txt = "n/a" if first_bit is None else f"{first_bit} (MSB-first within byte)"
+    return (
+        "<h2>First differing byte</h2>"
+        "<div class='summary'>"
+        f"<b>offset {first_diff}</b> | GT=0x{_hx(gt_b)} ({_bits(gt_b)}) | "
+        f"GEN=0x{_hx(gen_b)} ({_bits(gen_b)}) | first differing bit={bit_txt}<br>"
+        f"<div class='bitrow'>{_bit_cells(gt_b, gen_b)}</div>"
+        "<div class='twocol'>"
+        f"<div>{_overlap_list('GT spans overlapping byte', gt_syntax, first_diff)}</div>"
+        f"<div>{_overlap_list('GEN spans overlapping byte', gen_syntax, first_diff)}</div>"
+        "</div>"
+        "</div>"
     )
 
 
@@ -255,12 +324,13 @@ def _byte_rows(gt: bytes, gen: bytes, gt_syntax: list[dict[str, Any]], gen_synta
         else:
             cls = "diff"
         region = "prefix" if prefix_len is not None and off < prefix_len else "generated"
-        gs = gt_syntax[off] if off < len(gt_syntax) else {"name": "?", "category": "unknown", "value": None, "mb_addr": None}
-        es = gen_syntax[off] if off < len(gen_syntax) else {"name": "?", "category": "unknown", "value": None, "mb_addr": None}
+        gs = gt_syntax[off] if off < len(gt_syntax) else {"name": "?", "category": "unknown", "value": None, "mb_addr": None, "all": []}
+        es = gen_syntax[off] if off < len(gen_syntax) else {"name": "?", "category": "unknown", "value": None, "mb_addr": None, "all": []}
+        bit_cls = " bitdiff" if cls == "diff" else ""
         rows.append(
-            f"<tr class='{cls} {region}'>"
+            f"<tr class='{cls} {region}{bit_cls}'>"
             f"<td>{off}</td><td>{region}</td><td>{_hx(gtb)}</td><td>{_hx(geb)}</td>"
-            f"<td>{'same' if cls == 'same' else cls}</td>"
+            f"<td>{'same' if cls == 'same' else cls}<br><span class='bits'>{_bit_cells(gtb, geb)}</span></td>"
             f"<td>{_syntax_cell(gs)}</td><td>{html.escape(str(gs['value']))}</td>"
             f"<td>{_syntax_cell(es)}</td><td>{html.escape(str(es['value']))}</td>"
             "</tr>"
@@ -298,6 +368,7 @@ def render(gt: bytes, gen: bytes, title: str, prefix_len: int | None, max_bytes:
         f"GEN NALs={len(gen_parsed.nals)} first_bad={html.escape(str(gen_desync.failure_element if gen_desync else 'none'))}"
         "</div>"
     )
+    body.append(_first_diff_panel(gt, gen, gt_syntax, gen_syntax, first_diff))
     body.append(
         "<h2>Byte comparison</h2>"
         "<table><tr><th>off</th><th>region</th><th>GT</th><th>GEN</th><th>match</th>"
@@ -324,6 +395,17 @@ _HEAD = """<!doctype html><html><head><meta charset='utf-8'><title>__TITLE__</ti
  tr.extra{background:#20203a}
  tr.prefix{opacity:.72}
  .syntax{display:inline-block;color:white;border-radius:3px;padding:1px 5px;white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+ .bits{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
+ .bitrow{margin-top:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .bit{display:inline-block;border-radius:3px;padding:2px 4px;margin-right:3px;border:1px solid #3b4154}
+ .samebit{background:#12251b;color:#bbf7d0}
+ .diffbit{background:#3b1d1d;color:#fecaca}
+ .firstbit{outline:2px solid #facc15}
+ .twocol{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin-top:10px}
+ .twocol h3{font-size:13px;margin:6px 0;color:#cbd5e1}
+ .twocol ul{margin:4px 0 0 18px;padding:0}
+ .twocol li{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;margin:2px 0}
+ .muted{color:#94a3b8}
  details{margin:8px 0;border:1px solid #2c3040;border-radius:6px;overflow:hidden}
  summary{cursor:pointer;background:#222532;padding:8px 10px}
  .desync{background:#3a1c1c;color:#fecaca;border-left:3px solid #ef4444;padding:7px 10px}
