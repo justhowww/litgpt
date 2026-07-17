@@ -179,6 +179,55 @@ def _bit_cells(gt_b: int | None, gen_b: int | None) -> str:
     return "".join(cells)
 
 
+def _span_raw_bit_range(span) -> tuple[int, int]:
+    """Approximate span ownership in Annex-B raw-bit coordinates.
+
+    h264_syntax records bit_start/bit_end in RBSP bit coordinates and byte_start/byte_end
+    in Annex-B coordinates. For normal syntax elements without an interior
+    emulation-prevention byte, the bit offset within byte_start is bit_start & 7. This is
+    the same convention used by h264_visualize.py to show field bits.
+    """
+    start = span.byte_start * 8 + (span.bit_start & 7)
+    return start, start + max(0, span.bit_end - span.bit_start)
+
+
+def _bit_owner(spans: list, off: int, bit: int):
+    raw_bit = off * 8 + bit
+    owners = []
+    for span in spans:
+        b0, b1 = _span_raw_bit_range(span)
+        if b0 <= raw_bit < b1:
+            owners.append(span)
+    if not owners:
+        return None
+    return min(owners, key=lambda s: (s.byte_end - s.byte_start, s.bit_end - s.bit_start, s.byte_start))
+
+
+def _owner_label(span) -> str:
+    if span is None:
+        return "?"
+    mb = "" if span.mb_addr is None else f" mb={span.mb_addr}"
+    return f"{span.name}={_jsonable(span.value)}{mb}"
+
+
+def _bit_owner_table(gt_spans: list, gen_spans: list, off: int, gt_b: int | None, gen_b: int | None) -> str:
+    rows = ["<table class='bitowners'><tr><th>bit</th><th>GT bit</th><th>GEN bit</th><th>GT owner</th><th>GEN owner</th></tr>"]
+    gt_bits = _bits(gt_b)
+    gen_bits = _bits(gen_b)
+    first = _first_diff_bit(gt_b, gen_b)
+    for bit, (gb, eb) in enumerate(zip(gt_bits, gen_bits, strict=True)):
+        gt_owner = _bit_owner(gt_spans, off, bit)
+        gen_owner = _bit_owner(gen_spans, off, bit)
+        cls = " class='firstowner'" if bit == first else ""
+        rows.append(
+            f"<tr{cls}><td>{bit}</td><td>{gb}</td><td>{eb}</td>"
+            f"<td>{html.escape(_owner_label(gt_owner))}</td>"
+            f"<td>{html.escape(_owner_label(gen_owner))}</td></tr>"
+        )
+    rows.append("</table>")
+    return "".join(rows)
+
+
 def _overlap_list(title: str, syntax: list[dict[str, Any]], off: int) -> str:
     if off >= len(syntax):
         return f"<h3>{html.escape(title)}</h3><div class='muted'>byte outside stream</div>"
@@ -189,7 +238,15 @@ def _overlap_list(title: str, syntax: list[dict[str, Any]], off: int) -> str:
     return f"<h3>{html.escape(title)}</h3><ul>{items}</ul>"
 
 
-def _first_diff_panel(gt: bytes, gen: bytes, gt_syntax: list[dict[str, Any]], gen_syntax: list[dict[str, Any]], first_diff: int | None) -> str:
+def _first_diff_panel(
+    gt: bytes,
+    gen: bytes,
+    gt_syntax: list[dict[str, Any]],
+    gen_syntax: list[dict[str, Any]],
+    gt_spans: list,
+    gen_spans: list,
+    first_diff: int | None,
+) -> str:
     if first_diff is None:
         return "<h2>First differing byte</h2><div class='summary'>No byte difference.</div>"
     gt_b = gt[first_diff] if first_diff < len(gt) else None
@@ -202,6 +259,8 @@ def _first_diff_panel(gt: bytes, gen: bytes, gt_syntax: list[dict[str, Any]], ge
         f"<b>offset {first_diff}</b> | GT=0x{_hx(gt_b)} ({_bits(gt_b)}) | "
         f"GEN=0x{_hx(gen_b)} ({_bits(gen_b)}) | first differing bit={bit_txt}<br>"
         f"<div class='bitrow'>{_bit_cells(gt_b, gen_b)}</div>"
+        "<h3>Bit ownership inside this byte</h3>"
+        f"{_bit_owner_table(gt_spans, gen_spans, first_diff, gt_b, gen_b)}"
         "<div class='twocol'>"
         f"<div>{_overlap_list('GT spans overlapping byte', gt_syntax, first_diff)}</div>"
         f"<div>{_overlap_list('GEN spans overlapping byte', gen_syntax, first_diff)}</div>"
@@ -345,8 +404,10 @@ def _byte_rows(gt: bytes, gen: bytes, gt_syntax: list[dict[str, Any]], gen_synta
 def render(gt: bytes, gen: bytes, title: str, prefix_len: int | None, max_bytes: int, max_nals: int) -> str:
     gt_parsed = _parse(gt)
     gen_parsed = _parse(gen)
-    gt_syntax = _assign_syntax(gt_parsed.all_spans(), len(gt))
-    gen_syntax = _assign_syntax(gen_parsed.all_spans(), len(gen))
+    gt_spans = gt_parsed.all_spans()
+    gen_spans = gen_parsed.all_spans()
+    gt_syntax = _assign_syntax(gt_spans, len(gt))
+    gen_syntax = _assign_syntax(gen_spans, len(gen))
     first_diff = _first_diff(gt, gen)
     inferred_prefix = _common_prefix_len(gt, gen)
     same = sum(1 for i in range(min(len(gt), len(gen))) if gt[i] == gen[i])
@@ -368,7 +429,7 @@ def render(gt: bytes, gen: bytes, title: str, prefix_len: int | None, max_bytes:
         f"GEN NALs={len(gen_parsed.nals)} first_bad={html.escape(str(gen_desync.failure_element if gen_desync else 'none'))}"
         "</div>"
     )
-    body.append(_first_diff_panel(gt, gen, gt_syntax, gen_syntax, first_diff))
+    body.append(_first_diff_panel(gt, gen, gt_syntax, gen_syntax, gt_spans, gen_spans, first_diff))
     body.append(
         "<h2>Byte comparison</h2>"
         "<table><tr><th>off</th><th>region</th><th>GT</th><th>GEN</th><th>match</th>"
@@ -405,6 +466,9 @@ _HEAD = """<!doctype html><html><head><meta charset='utf-8'><title>__TITLE__</ti
  .twocol h3{font-size:13px;margin:6px 0;color:#cbd5e1}
  .twocol ul{margin:4px 0 0 18px;padding:0}
  .twocol li{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;margin:2px 0}
+ .bitowners{margin-top:6px}
+ .bitowners td,.bitowners th{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+ .bitowners tr.firstowner{background:#3a300f}
  .muted{color:#94a3b8}
  details{margin:8px 0;border:1px solid #2c3040;border-radius:6px;overflow:hidden}
  summary{cursor:pointer;background:#222532;padding:8px 10px}
