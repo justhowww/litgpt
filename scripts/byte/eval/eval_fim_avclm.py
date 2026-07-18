@@ -74,6 +74,10 @@ class WindowFimSample:
     prompt_ids: Tensor
     prompt_region_ids: Tensor
     prompt_offset_ids: Tensor
+    teacher_input_ids: Tensor
+    teacher_region_ids: Tensor
+    teacher_offset_ids: Tensor
+    teacher_labels: Tensor
     target_bytes: bytes
     window_bytes: bytes
 
@@ -284,6 +288,10 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                 prompt_ids=item["input_ids"][:prompt_end].clone(),
                 prompt_region_ids=item["region_ids"][:prompt_end].clone(),
                 prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
+                teacher_input_ids=item["input_ids"].clone(),
+                teacher_region_ids=item["region_ids"].clone(),
+                teacher_offset_ids=item["offset_ids"].clone(),
+                teacher_labels=item["labels"].clone(),
                 target_bytes=bytes(target_ids),
                 window_bytes=window_bytes,
             )
@@ -418,6 +426,59 @@ def generate_span(
     return GenerationResult(bytes(generated), eos_stopped, stop_reason, len(generated))
 
 
+@torch.inference_mode()
+def teacher_forced_span_metrics(
+    model: nn.Module,
+    sample: WindowFimSample,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    """Teacher-forced accuracy on the exact same FIM target span used for generation."""
+    raw = _unwrap_model(model)
+    raw.eval()
+    if sample.teacher_input_ids.numel() > raw.max_seq_length:
+        return None
+    idx = sample.teacher_input_ids.to(device).unsqueeze(0)
+    labels = sample.teacher_labels.to(device).unsqueeze(0)
+    region_ids = sample.teacher_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.teacher_offset_ids.to(device).unsqueeze(0)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=device.type == "cuda",
+    ):
+        logits = raw(idx, region_ids=region_ids, offset_ids=offset_ids)
+    supervised = labels != IGNORE_INDEX
+    supervised_labels = labels[supervised]
+    if supervised_labels.numel() == 0:
+        return None
+    pred = logits.argmax(dim=-1)[supervised]
+    byte_mask = supervised_labels < BYTE_VOCAB_SIZE
+    eos_mask = supervised_labels == SEQ_EOS_ID
+    byte_total = int(byte_mask.sum())
+    eos_total = int(eos_mask.sum())
+    byte_correct = int((pred[byte_mask] == supervised_labels[byte_mask]).sum()) if byte_total else 0
+    eos_correct = int((pred[eos_mask] == SEQ_EOS_ID).sum()) if eos_total else 0
+    exact_span = bool(byte_total == sample.target_length and byte_correct == byte_total)
+    exact_tail = bool(int((pred == supervised_labels).sum()) == int(supervised_labels.numel()))
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+        ignore_index=IGNORE_INDEX,
+    )
+    return {
+        "tf_loss": float(loss),
+        "tf_target_tokens": int(supervised_labels.numel()),
+        "tf_byte_total": byte_total,
+        "tf_byte_correct": byte_correct,
+        "tf_byte_acc": byte_correct / max(byte_total, 1),
+        "tf_eos_total": eos_total,
+        "tf_eos_correct": eos_correct,
+        "tf_eos_acc": eos_correct / max(eos_total, 1) if eos_total else None,
+        "tf_exact_span_bytes": exact_span,
+        "tf_exact_tail_with_eos": exact_tail,
+    }
+
+
 def byte_accuracy(a: bytes, b: bytes) -> float:
     if not a and not b:
         return 1.0
@@ -484,7 +545,7 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
     n = len(details)
     if n == 0:
         return {}
-    return {
+    out = {
         "n": n,
         "exact_match_rate": mean(1.0 if r["exact_match"] else 0.0 for r in details),
         "byte_acc_mean": mean(r["byte_acc"] for r in details),
@@ -498,6 +559,24 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
             else None
         ),
     }
+    tf_rows = [r for r in details if "tf_byte_acc" in r]
+    if tf_rows:
+        out.update(
+            {
+                "tf_byte_acc_mean": mean(r["tf_byte_acc"] for r in tf_rows),
+                "tf_exact_span_rate": mean(
+                    1.0 if r["tf_exact_span_bytes"] else 0.0 for r in tf_rows
+                ),
+                "tf_exact_tail_with_eos_rate": mean(
+                    1.0 if r["tf_exact_tail_with_eos"] else 0.0 for r in tf_rows
+                ),
+                "tf_eos_acc_mean": mean(
+                    r["tf_eos_acc"] for r in tf_rows if r.get("tf_eos_acc") is not None
+                ),
+                "tf_loss_mean": mean(r["tf_loss"] for r in tf_rows),
+            }
+        )
+    return out
 
 
 def main() -> None:
@@ -543,6 +622,7 @@ def main() -> None:
             print(f"[{ckpt_name}] FIM AVC-LM stop_mode={stop_mode}", flush=True)
             rows: list[dict[str, Any]] = []
             for sample_id, sample in enumerate(samples):
+                tf_metrics = teacher_forced_span_metrics(model, sample, device)
                 result = generate_span(
                     model,
                     sample,
@@ -593,6 +673,8 @@ def main() -> None:
                     "gt_parse": gt_parse,
                     "model_parse": model_parse,
                 }
+                if tf_metrics is not None:
+                    row.update(tf_metrics)
                 if args.save_streams:
                     stem = f"sample_{sample_id:04d}_{stop_mode}"
                     gt_path = stream_dir / f"{stem}_gt.h264"
