@@ -1,6 +1,6 @@
 # Offline Sampling Sweep
 
-Runs `scripts/byte/eval/eval_checkpoints.py` over a fixed checkpoint list and
+Runs `scripts/byte/eval/helpers/checkpoint_eval_helpers.py` over a fixed checkpoint list and
 several sampling settings. This is an offline diagnostic, not a training job.
 
 The sweep is intentionally one-dimensional:

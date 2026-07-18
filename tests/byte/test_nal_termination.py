@@ -26,7 +26,7 @@ _FIXTURE_MAX_MBS = 99
 
 def _load_analyzer():
     spec = importlib.util.spec_from_file_location(
-        "nal_termination", _EVAL_DIR / "nal_termination.py"
+        "nal_termination", _EVAL_DIR / "analyze_nal_termination.py"
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules["nal_termination"] = module

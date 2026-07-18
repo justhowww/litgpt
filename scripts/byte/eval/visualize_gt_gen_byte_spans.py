@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Render a paired GT-vs-generated H.264 byte comparison as self-contained HTML.
 
-This is an offline analyzer for streams persisted by eval_stream_continuation.py:
+This is an offline analyzer for streams persisted by eval_ar_continuation.py:
 
-    python scripts/byte/eval/compare_gt_gen_bytes.py RESULTS_DIR --clip 0
+    python scripts/byte/eval/visualize_gt_gen_byte_spans.py RESULTS_DIR --clip 0
 
 or explicit files:
 
-    python scripts/byte/eval/compare_gt_gen_bytes.py --gt clip_gt.h264 --gen clip_gen.h264 --out cmp.html
+    python scripts/byte/eval/visualize_gt_gen_byte_spans.py --gt clip_gt.h264 --gen clip_gen.h264 --out cmp.html
 
 The report shows:
   * byte-by-byte GT vs generated values, marked same/different/missing/extra;

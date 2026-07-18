@@ -43,7 +43,7 @@ Output lands in `${RUN_DIR}/continuation_eval` by default.
 Raw command (no Slurm):
 
 ```bash
-python scripts/byte/eval/eval_stream_continuation.py \
+python scripts/byte/eval/eval_ar_continuation.py \
     /home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data/manifest.jsonl \
     --checkpoint-dirs RUN/step-XXXXXXXX [...] \
     --out-dir RUN/continuation_eval \

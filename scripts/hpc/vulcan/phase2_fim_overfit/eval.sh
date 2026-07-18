@@ -17,7 +17,7 @@ if [[ -z "${CKPT}" ]]; then
 fi
 echo "[phase2-overfit eval] checkpoint=${CKPT}"
 
-EVAL=scripts/byte/eval/eval_stream_continuation.py
+EVAL=scripts/byte/eval/eval_ar_continuation.py
 COMMON_TRAIN=(
     "${DATA}/manifest.jsonl"
     --nal-index-path "${DATA}/nal_index.sqlite"

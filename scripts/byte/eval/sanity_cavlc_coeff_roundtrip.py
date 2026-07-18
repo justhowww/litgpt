@@ -3,7 +3,7 @@
 
 This deliberately does NOT splice variable-length fields into a real generated NAL:
 doing so shifts every following bit and would conflate coefficient consistency with NAL
-rewriting. Instead, for each coeff_token BitReaderError reported by nal_termination.py,
+rewriting. Instead, for each coeff_token BitReaderError reported by analyze_nal_termination.py,
 generate complete random residual blocks under the same nC-selected table and max_coeff,
 then decode them with the recursive parser's _residual_block.
 
@@ -155,7 +155,7 @@ def _failure_reports(results_dir: Path) -> list[dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("results_dir", type=Path, help="nal_termination.py results directory")
+    ap.add_argument("results_dir", type=Path, help="analyze_nal_termination.py results directory")
     ap.add_argument("--trials", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=20260717)
     args = ap.parse_args()

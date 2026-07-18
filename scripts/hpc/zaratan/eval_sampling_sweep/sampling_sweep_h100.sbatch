@@ -86,7 +86,7 @@ run_setting() {
     fi
     echo "[run] ${name}: strategies=${strategies} temperature=${temperature} top_k=${top_k} top_p=${top_p} beam_width=${beam_width}"
     cmd=(
-        python scripts/byte/eval/eval_checkpoints.py
+        python scripts/byte/eval/helpers/checkpoint_eval_helpers.py
         "${MANIFEST}"
         --nal-index-path "${NAL_INDEX}"
         --checkpoint-dirs "${checkpoint_dirs[@]}"

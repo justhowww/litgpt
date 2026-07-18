@@ -5,7 +5,7 @@
 # multi-frame stream windows (parameter sets + IDR + P-frames), next-byte loss
 # across the whole window, window-level (within-video) split. AR only (p_fim=0);
 # the slice/FIM reconstruction probe is disabled -- continuation quality is
-# measured post-hoc by scripts/byte/eval/eval_stream_continuation.py. See 0616.md.
+# measured post-hoc by scripts/byte/eval/eval_ar_continuation.py. See 0616.md.
 
 set -euo pipefail
 export SLURM_EXPORT_ENV=ALL

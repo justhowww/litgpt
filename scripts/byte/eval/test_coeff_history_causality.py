@@ -30,10 +30,10 @@ if str(_ROOT) not in sys.path:
 from litgpt.byte import h264_syntax as HS  # noqa: E402
 from litgpt.byte.data import VCL_NAL_TYPES  # noqa: E402
 from litgpt.byte.free_run_eval import _survival_and_validity, free_run_rollout  # noqa: E402
-from scripts.byte.eval.cavlc_coeff_sanity import random_block_bits  # noqa: E402
-from scripts.byte.eval.eval_checkpoints import load_model  # noqa: E402
-from scripts.byte.eval.eval_stream_continuation import model_max_gen  # noqa: E402
-from scripts.byte.eval.rescue_test import _init_offset, _prompt_from_stream  # noqa: E402
+from scripts.byte.eval.sanity_cavlc_coeff_roundtrip import random_block_bits  # noqa: E402
+from scripts.byte.eval.helpers.checkpoint_eval_helpers import load_model  # noqa: E402
+from scripts.byte.eval.eval_ar_continuation import model_max_gen  # noqa: E402
+from scripts.byte.eval.helpers.free_run_rescue_helpers import _init_offset, _prompt_from_stream  # noqa: E402
 
 
 def _bits(data: bytes) -> list[int]:

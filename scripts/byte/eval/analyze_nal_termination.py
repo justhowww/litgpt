@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Why did each generated NAL end? Offline replay analyzer.
 
-Auxiliary to eval_stream_continuation.py (same role as mb_length_check.py). A free-run
+Auxiliary to eval_ar_continuation.py (same role as mb_length_check.py). A free-run
 failure reports ``desync_reason = BitReaderError``, which only says *the parser wanted
 more syntax bits than the NAL contained* -- not why the NAL ended there. The candidates:
 
@@ -272,7 +272,7 @@ def main() -> None:
     if not rows:
         sys.exit(
             "No rows with stream_gen_path. These results predate stream persistence; "
-            "re-run eval_stream_continuation.py to produce streams/."
+            "re-run eval_ar_continuation.py to produce streams/."
         )
 
     clip_records: list[dict[str, Any]] = []

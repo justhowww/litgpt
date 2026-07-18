@@ -1,6 +1,6 @@
 """Per-macroblock residual length-consistency check for free-run generation.
 
-Auxiliary to eval_stream_continuation.py. Under slice-max-mbs=1 each VCL NAL is one
+Auxiliary to eval_ar_continuation.py. Under slice-max-mbs=1 each VCL NAL is one
 macroblock ending byte-aligned at the next start code, which makes MB validity a LOCAL,
 checkable property. For every MB the model generates we walk the CAVLC cascade
 
@@ -59,8 +59,8 @@ from litgpt.byte.data import (  # noqa: E402
 )
 from litgpt.byte import h264_syntax as HS  # noqa: E402
 from litgpt.byte.free_run_eval import _desync_info, free_run_rollout  # noqa: E402
-from scripts.byte.eval.eval_checkpoints import load_model  # noqa: E402
-from scripts.byte.eval.eval_stream_continuation import (  # noqa: E402
+from scripts.byte.eval.helpers.checkpoint_eval_helpers import load_model  # noqa: E402
+from scripts.byte.eval.eval_ar_continuation import (  # noqa: E402
     model_max_gen,
     select_continuation_clips,
 )

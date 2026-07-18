@@ -4,7 +4,7 @@
 # Post-hoc probe for the Stage 0 run: give the model the first N frames of a
 # stream window, free-run generate the next M frames, strict-decode, and compare
 # against the ground-truth continuation (plus an intra IDR-from-scratch mode).
-# See scripts/byte/eval/eval_stream_continuation.py and 0616.md (H0).
+# See scripts/byte/eval/eval_ar_continuation.py and 0616.md (H0).
 
 #SBATCH --job-name=byte-stage0-cont-eval
 #SBATCH --account=metzler-prj-cmsc
@@ -36,7 +36,7 @@ OUT_DIR=${OUT_DIR:-"${RUN_DIR}/continuation_eval"}
 # named checkpoint does not exist yet.
 CHECKPOINT_STEPS=${CHECKPOINT_STEPS:-"2000 4000 6000"}
 
-# Continuation probe geometry (see eval_stream_continuation.py defaults).
+# Continuation probe geometry (see eval_ar_continuation.py defaults).
 NUM_CLIPS=${NUM_CLIPS:-20}
 NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
 PREFIX_FRAMES=${PREFIX_FRAMES:-8}
@@ -88,7 +88,7 @@ if [[ "${EVAL_INTRA}" == "0" ]]; then
     intra_flag="--no-eval-intra"
 fi
 
-srun python scripts/byte/eval/eval_stream_continuation.py \
+srun python scripts/byte/eval/eval_ar_continuation.py \
     "${MANIFEST}" \
     --nal-index-path "${NAL_INDEX}" \
     --checkpoint-dirs "${checkpoint_dirs[@]}" \

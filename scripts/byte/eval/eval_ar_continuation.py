@@ -25,7 +25,7 @@ Note this score is conditional on decode success -- it only sees frames that
 decoded, so the validity rate above is what accounts for outright failures.
 
 Usage:
-    python scripts/byte/eval/eval_stream_continuation.py MANIFEST \
+    python scripts/byte/eval/eval_ar_continuation.py MANIFEST \
         --checkpoint-dirs RUN/step-XXXX [...] --out-dir OUT \
         --prefix-frames 8 --cont-frames 4 --num-clips 20
 """
@@ -70,7 +70,7 @@ from litgpt.byte.free_run_eval import (
     free_run_rollout,
 )  # noqa: E402
 from litgpt.byte.reconstruction import image_psnr, image_ssim, parse_ppm  # noqa: E402
-from scripts.byte.eval.eval_checkpoints import (
+from scripts.byte.eval.helpers.checkpoint_eval_helpers import (
     jsonable,
     load_model,
     save_png,
@@ -512,7 +512,7 @@ def evaluate_checkpoint(
         )
         n, m = clip.prefix_frames, clip.cont_frames
 
-        # Persist both streams for offline analysis (scripts/byte/eval/nal_termination.py).
+        # Persist both streams for offline analysis (scripts/byte/eval/analyze_nal_termination.py).
         stream_gen_path = _write_stream(
             args.out_dir, checkpoint_name, clip_idx, "gen", prefix_bytes + gen_bytes
         )

@@ -377,7 +377,7 @@ def main() -> None:
         load_manifest_rows,
         load_nal_index,
     )
-    from scripts.byte.eval.eval_checkpoints import jsonable, load_model
+    from scripts.byte.eval.helpers.checkpoint_eval_helpers import jsonable, load_model
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
@@ -526,7 +526,7 @@ def _freerun_diff(model, item, dataset, device, args) -> dict[str, Any]:
 
 def _generate(model, prefix_bytes, nals, prefix_end_nal, device, args) -> bytes:
     """Thin wrapper around the continuation generator used by the stream eval."""
-    from scripts.byte.eval.eval_stream_continuation import generate_continuation, model_max_gen
+    from scripts.byte.eval.eval_ar_continuation import generate_continuation, model_max_gen
 
     max_gen = model_max_gen(model, prefix_bytes)
     gen, _ = generate_continuation(model, prefix_bytes, nals, prefix_end_nal, device,

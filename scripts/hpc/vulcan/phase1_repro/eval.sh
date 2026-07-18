@@ -10,7 +10,7 @@
 # a real "did we train on these videos" restriction but NOT a leakage-free held-out
 # set. The val run below just omits --train-split-file and uses a different --seed
 # so it's unlikely (not guaranteed) to hit the exact trained windows. A rigorous
-# held-out-window eval would need eval_stream_continuation.py to consume
+# held-out-window eval would need eval_ar_continuation.py to consume
 # train_split.json's "windows" list directly (not yet wired up) -- until then, treat
 # "val" here as indicative, not a leakage-free number.
 set -euo pipefail
@@ -26,7 +26,7 @@ if [[ -z "${CKPT}" ]]; then
 fi
 echo "[phase1 eval] checkpoint=${CKPT}"
 
-EVAL=scripts/byte/eval/eval_stream_continuation.py
+EVAL=scripts/byte/eval/eval_ar_continuation.py
 COMMON_TRAIN=(
     "${DATA}/manifest.jsonl"
     --nal-index-path "${DATA}/nal_index.sqlite"
@@ -151,7 +151,7 @@ PY
 # Runs AFTER the summary and cannot abort it: under `set -e` a non-zero exit here (e.g.
 # results predating stream persistence) would otherwise kill the script before the
 # headline A/B ever printed. A diagnostic must never suppress the result it explains.
-NAL_TERM=scripts/byte/eval/nal_termination.py
+NAL_TERM=scripts/byte/eval/analyze_nal_termination.py
 for name in greedy greedy_masked; do
     echo
     echo "===================== [nal-termination/${name}] ====================="

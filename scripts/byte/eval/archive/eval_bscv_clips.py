@@ -53,7 +53,7 @@ from litgpt.byte.reconstruction import (
     image_ssim,
     parse_ppm,
 )
-from scripts.byte.eval.eval_checkpoints import generate_bytes, jsonable, load_model, save_png
+from scripts.byte.eval.helpers.checkpoint_eval_helpers import generate_bytes, jsonable, load_model, save_png
 
 
 @dataclass(frozen=True)

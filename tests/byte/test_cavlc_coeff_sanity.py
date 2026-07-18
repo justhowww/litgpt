@@ -1,4 +1,4 @@
-"""Randomized round-trip tests for scripts/byte/eval/cavlc_coeff_sanity.py."""
+"""Randomized round-trip tests for scripts/byte/eval/sanity_cavlc_coeff_roundtrip.py."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "byte" / "eval" / "cavlc_coeff_sanity.py"
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "byte" / "eval" / "sanity_cavlc_coeff_roundtrip.py"
 spec = importlib.util.spec_from_file_location("cavlc_coeff_sanity", _SCRIPT)
 CS = importlib.util.module_from_spec(spec)
 sys.modules["cavlc_coeff_sanity"] = CS

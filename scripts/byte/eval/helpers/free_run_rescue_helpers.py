@@ -18,7 +18,7 @@ Outputs (clear, per-experiment -- see plan): rescue_clips.jsonl (one sectioned r
 per clip) + summary.json (grouped by experiment, headline metric first).
 
 Usage:
-    python scripts/byte/eval/rescue_test.py MANIFEST --nal-index-path NAL.sqlite \
+    python scripts/byte/eval/helpers/free_run_rescue_helpers.py MANIFEST --nal-index-path NAL.sqlite \
         --checkpoint-dirs RUN/step-XXXX [...] --out-dir OUT \
         --prefix-frames 8 --cont-frames 4 --num-clips 20 --temperature 1.0
 """
@@ -55,8 +55,8 @@ from litgpt.byte.data import (  # noqa: E402
 from litgpt.byte import h264_syntax as HS  # noqa: E402
 from litgpt.byte import h264_encode as HE  # noqa: E402
 from litgpt.byte.free_run_eval import _survival_and_validity, free_run_rollout  # noqa: E402
-from scripts.byte.eval.eval_checkpoints import load_model  # noqa: E402
-from scripts.byte.eval.eval_stream_continuation import (  # noqa: E402
+from scripts.byte.eval.helpers.checkpoint_eval_helpers import load_model  # noqa: E402
+from scripts.byte.eval.eval_ar_continuation import (  # noqa: E402
     model_max_gen,
     select_continuation_clips,
 )

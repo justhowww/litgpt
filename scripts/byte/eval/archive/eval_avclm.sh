@@ -7,7 +7,7 @@
 #   temp1        temperature 1.0                       (raw, samples the tail)
 #   avclm_topk   temperature 1.0 top-k 50 top-p 0.9    (AVC-LM / JPEG-LM protocol)
 #
-# Reuses eval_stream_continuation.py. --survival-only bypasses the ffmpeg frame gate,
+# Reuses eval_ar_continuation.py. --survival-only bypasses the ffmpeg frame gate,
 # which is invalid here: under slice-max-mbs=1 a VCL NAL is one macroblock, not a frame,
 # so decode-based frame counting is meaningless. TF accuracy is sampling-independent, so
 # it is identical across the three runs (kept in each for a self-contained record).
@@ -27,7 +27,7 @@ OUT_ROOT="${2:-$(dirname "$CKPT")/eval/avclm_sweep_$(basename "$CKPT")}"
 MANIFEST="$AVCLM_DATA/manifest.jsonl"
 NAL_INDEX="$AVCLM_DATA/nal_index.sqlite"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EVAL="$SCRIPT_DIR/eval_stream_continuation.py"
+EVAL="/../eval_ar_continuation.py"
 
 # Match training exactly (stage0_ar_multiframe_xl/train.sh): dataset-mode=window,
 # BLOCK_SIZE=16384 -> --max-window-bytes 16384 (= the model's trained context / KV-cache

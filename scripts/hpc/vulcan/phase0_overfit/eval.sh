@@ -1,7 +1,7 @@
 DATA=/fs/nexus-projects/time-control-videogen/OpenVid-1M_Data/data-avclm
 OUT_DIR=${DATA}/runs/byte-phase0-overfit-10v-10m
 
-python scripts/byte/eval/eval_stream_continuation.py \
+python scripts/byte/eval/eval_ar_continuation.py \
     "${DATA}/manifest.jsonl" \
     --nal-index-path "${DATA}/nal_index.sqlite" \
     --checkpoint-dirs "${OUT_DIR}/step-00006500" \

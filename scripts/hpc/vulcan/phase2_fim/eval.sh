@@ -27,7 +27,7 @@ if [[ -z "${CKPT}" ]]; then
 fi
 echo "[phase2 eval] checkpoint=${CKPT}"
 
-EVAL=scripts/byte/eval/eval_stream_continuation.py
+EVAL=scripts/byte/eval/eval_ar_continuation.py
 COMMON_TRAIN=(
     "${DATA}/manifest.jsonl"
     --nal-index-path "${DATA}/nal_index.sqlite"
@@ -113,7 +113,7 @@ PY
 # Per-NAL termination diagnostics. Runs AFTER the summary and cannot abort it: under
 # `set -e` a non-zero exit here would otherwise kill the script before the headline
 # ever printed. A diagnostic must never suppress the result it explains.
-NAL_TERM=scripts/byte/eval/nal_termination.py
+NAL_TERM=scripts/byte/eval/analyze_nal_termination.py
 for name in greedy greedy_masked; do
     echo
     echo "===================== [nal-termination/${name}] ====================="
