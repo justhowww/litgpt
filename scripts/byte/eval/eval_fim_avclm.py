@@ -476,6 +476,60 @@ def teacher_forced_span_metrics(
         "tf_eos_acc": eos_correct / max(eos_total, 1) if eos_total else None,
         "tf_exact_span_bytes": exact_span,
         "tf_exact_tail_with_eos": exact_tail,
+        "tf_argmax_ids": [int(x) for x in pred.detach().cpu().tolist()],
+    }
+
+
+def first_mismatch_diagnostic(
+    generated: bytes,
+    target: bytes,
+    tf_metrics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compare the first free-generation mismatch to the TF argmax.
+
+    At the first mismatch position k, generated[:k] still equals target[:k], so
+    free generation and teacher forcing should be conditioning on the same byte
+    prefix. If TF predicts the GT byte at k but free generation emits something
+    else, the generation path is not equivalent to the teacher-forced path.
+    """
+    limit = min(len(generated), len(target))
+    mismatch_pos: int | None = None
+    for i in range(limit):
+        if generated[i] != target[i]:
+            mismatch_pos = i
+            break
+    if mismatch_pos is None and len(generated) != len(target):
+        mismatch_pos = limit
+    if mismatch_pos is None:
+        return {
+            "first_mismatch_pos": None,
+            "first_mismatch_kind": "none",
+            "tf_correct_at_first_mismatch": None,
+            "free_matches_tf_argmax_at_first_mismatch": None,
+        }
+
+    if mismatch_pos >= len(generated):
+        kind = "generated_too_short"
+    elif mismatch_pos >= len(target):
+        kind = "generated_too_long"
+    else:
+        kind = "byte_mismatch"
+    gt_byte = target[mismatch_pos] if mismatch_pos < len(target) else None
+    gen_byte = generated[mismatch_pos] if mismatch_pos < len(generated) else None
+    tf_argmax_ids = list(tf_metrics.get("tf_argmax_ids", [])) if tf_metrics else []
+    tf_argmax = tf_argmax_ids[mismatch_pos] if mismatch_pos < len(tf_argmax_ids) else None
+    return {
+        "first_mismatch_pos": mismatch_pos,
+        "first_mismatch_kind": kind,
+        "first_mismatch_gt_byte": gt_byte,
+        "first_mismatch_gen_byte": gen_byte,
+        "first_mismatch_tf_argmax": tf_argmax,
+        "tf_correct_at_first_mismatch": (
+            bool(tf_argmax == gt_byte) if gt_byte is not None and tf_argmax is not None else None
+        ),
+        "free_matches_tf_argmax_at_first_mismatch": (
+            bool(tf_argmax == gen_byte) if gen_byte is not None and tf_argmax is not None else None
+        ),
     }
 
 
@@ -561,6 +615,9 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
     }
     tf_rows = [r for r in details if "tf_byte_acc" in r]
     if tf_rows:
+        first_mismatch_rows = [
+            r for r in tf_rows if r.get("tf_correct_at_first_mismatch") is not None
+        ]
         out.update(
             {
                 "tf_byte_acc_mean": mean(r["tf_byte_acc"] for r in tf_rows),
@@ -576,6 +633,22 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
                 "tf_loss_mean": mean(r["tf_loss"] for r in tf_rows),
             }
         )
+        if first_mismatch_rows:
+            out.update(
+                {
+                    "first_mismatch_tf_correct_rate": mean(
+                        1.0 if r["tf_correct_at_first_mismatch"] else 0.0
+                        for r in first_mismatch_rows
+                    ),
+                    "first_mismatch_free_matches_tf_rate": mean(
+                        1.0 if r["free_matches_tf_argmax_at_first_mismatch"] else 0.0
+                        for r in first_mismatch_rows
+                    ),
+                    "first_mismatch_pos_mean": mean(
+                        r["first_mismatch_pos"] for r in first_mismatch_rows
+                    ),
+                }
+            )
     return out
 
 
@@ -673,6 +746,7 @@ def main() -> None:
                     "gt_parse": gt_parse,
                     "model_parse": model_parse,
                 }
+                row.update(first_mismatch_diagnostic(result.data, sample.target_bytes, tf_metrics))
                 if tf_metrics is not None:
                     row.update(tf_metrics)
                 if args.save_streams:
