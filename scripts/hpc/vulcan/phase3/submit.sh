@@ -76,8 +76,13 @@ export REPO_ROOT MANIFEST OUT_DIR STAGED_CORPUS
 sbatch_args=(--parsable --export=ALL
     --output="${OUT_DIR}/logs/%x-%j.out" --error="${OUT_DIR}/logs/%x-%j.err")
 [[ -n "${EXCLUDE_NODES:-}" ]] && sbatch_args+=(--exclude="${EXCLUDE_NODES}")
+# AFTER_JOBID chains this submission behind a prior one (see resubmit.sh) -- afterany,
+# not afterok, since the prior job will most likely end by hitting vulcan-high's
+# 1-12:00:00 wall-time cap rather than exiting 0, and afterok would never fire on that.
+[[ -n "${AFTER_JOBID:-}" ]] && sbatch_args+=(--dependency=afterany:"${AFTER_JOBID}")
 
 echo "[phase3/vulcan] ${MAX_ROWS} videos / ~341M (${N_LAYER}/${N_EMBD}/${N_HEAD}) / ${DEVICES}x a6000 / p_fim=${P_FIM} / steps=${STEPS}"
 echo "  OUT_DIR=${OUT_DIR}"
+[[ -n "${AFTER_JOBID:-}" ]] && echo "  chained after job ${AFTER_JOBID} (afterany)"
 job_id=$(sbatch "${sbatch_args[@]}" "${SCRIPT_DIR}/train.sbatch")
 echo "Submitted phase3 job ${job_id}"
