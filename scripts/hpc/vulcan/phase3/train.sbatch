@@ -13,7 +13,7 @@
 # `sacctmgr show qos` before the first real submission and correct if wrong.
 
 #SBATCH --job-name=byte-phase3
-#SBATCH --partition=vulcan-high
+#SBATCH --partition=vulcan-ampere
 #SBATCH --qos=vulcan-high
 #SBATCH --account=vulcan-metzler
 #SBATCH --time=1-12:00:00
