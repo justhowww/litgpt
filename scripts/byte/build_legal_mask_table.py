@@ -1,60 +1,119 @@
-"""Build a deduplicated legal-next-byte mask table for a GT H.264 byte corpus.
+"""Build a table of legal-next-byte masks for a ground-truth H.264 byte corpus.
 
-Offline preprocessing: for each GT H.264 (Annex-B) file, walk it once with the
-same constrained-decoding automaton already used for inference-time masked
-generation (litgpt.byte.h264_mask -- MaskState / get_valid_byte_mask / advance,
-the exact machinery that takes free-run full_continuation_rate from 0.750
-unconstrained to 1.000 masked, see 260716 - Eval with syntax validation mask.md),
-computing the legal-next-byte mask at every byte position BEFORE that byte is
-consumed. Masks are deduplicated into a global mask_id -> 256-bit legal-set table
-(most positions repeat a handful of masks -- permissive header/non-residual
-positions are all identical [True]*256, and residual-coding positions repeat
-structurally across the corpus), and each file's byte stream is stored as a
-compact array of mask_ids.
+WHAT THIS COMPUTES
 
-Output is a single SQLite file (schema mirrors build_nal_index.py's style):
-  metadata(key TEXT PRIMARY KEY, value TEXT)
-  mask_table(mask_id INTEGER PRIMARY KEY, mask_bits BLOB UNIQUE)   -- 32-byte packed bool[256]
-  files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, size INTEGER, mtime_ns INTEGER, num_bytes INTEGER)
-  file_masks(file_id INTEGER PRIMARY KEY, mask_ids BLOB)           -- uint32[num_bytes], little-endian
-                                                                    -- (enforced explicitly, see write_file_result)
+For each ground-truth H.264 file, this script reads through the file once, byte
+by byte, and at every position asks: "given everything that came before this
+point, which of the 256 possible byte values could come next without breaking
+the H.264 bitstream syntax?" The answer at each position is a list of 256
+true/false flags, one per possible byte value. This reuses the exact same
+checker that is already used at generation time to keep sampled output valid
+(litgpt.byte.h264_mask), so nothing new is being taught to the checker here --
+this script only runs it once, offline, walking the real data instead of
+generated data, and saves the results.
 
-Alignment for consumers: mask_ids[i] is the legal-byte set for data[i] GIVEN THE
-TRUE PREFIX data[:i] (i.e. "before that byte is consumed", per iter_legal_masks
-below) -- it already lines up index-for-index with THIS PROJECT's actual label
-convention (litgpt/byte/data.py's ByteStreamWindowDataset: labels[t] == window[t],
-input_ids[t] == window[t-1] via a separate BOS-prepended tensor, NOT an
-overlapping slice of one array). For a training window starting at file offset
-`window_start`, the correct slice is
-`mask_ids[window_start : window_start + window_len]` matched directly against
-that window's `labels` tensor, index for index -- NOT shifted by one relative to
-`window_start`. Do not re-derive this against a generic "targets = data[start+1:]"
-convention; it does not apply to this codebase's actual tensor layout.
+Most positions in a file share the same answer as many other positions -- for
+example, every position inside a file header allows all 256 byte values,
+because the checker does not attempt to constrain headers (see "What this mask
+does and does not guarantee" below). Because of this repetition, each distinct
+256-flag answer is stored once in a shared table, and each file is stored as a
+short list of pointers into that shared table, one pointer per byte in the
+file. This keeps the output small.
 
-Known limitations (not resolved by this script -- read before wiring into a loss):
-  - AR order only. FIM training rearranges the presented byte order (prefix,
-    hole marker, suffix, ..., middle), so a mask computed against TRUE file order
-    is only valid for AR-ordered positions. Do not apply these masks to FIM
-    sequence positions without separately re-deriving what's legal in the
-    FIM-rearranged frame of reference.
-  - Windowing/context visibility. This script computes masks using automaton
-    state accumulated from byte 0 of each FILE. A later TRAINING window may
-    start mid-file; the automaton state the mask depends on is only inferable
-    from the model's own visible input if everything that state depends on
-    (active SPS/PPS, any carried CAVLC neighbor context) is itself visible
-    within the window. This project's per-MB corpus (slice_max_mbs=1) is
-    described elsewhere (phase2_fim/train.sh) as "a desync firewall every ~10
-    bytes", which suggests little state should actually carry past a NAL/slice
-    boundary -- but that has NOT been verified here. Before trusting this table
-    as a training target, verify it: recompute masks starting fresh from a
-    window's own bytes at several real window-start points and diff against
-    this whole-file table.
-  - Exactness is bounded by litgpt.byte.h264_mask/h264_automaton's own
-    correctness, which this script does not re-verify -- treat the output as
-    "automaton-admissible next-byte mask", upgraded in confidence only by a
-    full corpus run completing without tripping the assertion in
-    iter_legal_masks below (a completed run is evidence the automaton agrees
-    with itself on real content, not just synthetic test fixtures).
+WHAT THIS MASK DOES AND DOES NOT GUARANTEE
+
+Read this before using the output as a training signal, not after.
+
+A byte marked false is guaranteed to break the bitstream if used at that
+position. That guarantee is meant to be exact: the checker replays the actual
+H.264 bit-level decoding rules for that byte, so a false there should mean a
+genuinely broken bitstream, not a guess.
+
+A byte marked true is NOT guaranteed to be safe. It only means the checker did
+not find a reason to reject it. There are two different reasons a true can
+still be hiding a byte that is actually wrong:
+
+  1. On purpose, for large parts of the file. The checker currently only
+     applies its strict rules to the residual/coefficient-coding portion of
+     each macroblock -- the part of the syntax that is hardest to get right
+     and, not coincidentally, the part earlier evaluation on this project
+     (phase 1's train/val results) already identified as where the model's
+     accuracy gap actually lives. Everywhere else -- macroblock headers,
+     motion vectors, quantization steps, and any slice type the checker does
+     not support -- it currently answers "everything is allowed" without
+     really checking. This is a known, deliberate simplification of the
+     checker itself, not a bug in this script.
+
+  2. By accident, if the checker has a bug, even inside the part it is
+     supposed to check strictly. This script tests for one specific kind of
+     bug: for every single byte actually present in the real file, it checks
+     that the checker marks that real byte as allowed at its own position. If
+     the checker ever says the real, true byte was not allowed, something is
+     wrong with the checker, and this script stops immediately with an error
+     rather than silently saving a table that contradicts the very data it was
+     built from. This is a useful, cheap check, but it only ever tests the one
+     byte that actually appears in the real file at each position -- it says
+     nothing about whether the other 255 possible byte values at that same
+     position are being judged correctly. A checker could pass this test at
+     every single position in the entire corpus and still be wrong about some
+     of those other byte values.
+
+So: a false is trustworthy. A true is a "no objection," not a certificate of
+correctness. If this table is later used to shape a training loss (for
+example, penalizing the model for putting probability on bytes marked false),
+that loss can be trusted to push the model away from bytes that are definitely
+wrong. It cannot be trusted to guarantee that whatever probability is left
+over is sitting only on bytes that are definitely right -- some of it may be
+sitting on bytes nobody has actually verified.
+
+TWO FURTHER LIMITS, SPECIFIC TO HOW THIS TABLE WOULD BE USED IN TRAINING
+
+  - This table is only meaningful in the file's original byte order. Some
+    training setups (fill-in-the-middle, where the model sees a prefix and a
+    suffix and has to guess what belongs in between) present bytes to the
+    model in a different order than they appear in the file. This table
+    should not be applied to that rearranged order without separately working
+    out what "legal" even means once the byte order has changed.
+
+  - This table is built by reading each file from its very first byte. A
+    training example, however, is usually a short window cut out of the
+    middle of a longer recording, and the model only ever sees the bytes
+    inside that window -- it has no memory of anything before the window
+    started. If knowing whether a byte is legal at some position genuinely
+    requires information from before the window (for instance, which set of
+    encoding parameters is active), then the model is being asked to predict
+    something it cannot actually know from what it was shown, and using this
+    table as a training target there could do more harm than good. There is
+    a reason to think this may not be a large problem for this particular
+    corpus -- elsewhere in this project, the way this footage was encoded (one
+    macroblock per independently-decodable slice) is described as resetting
+    cleanly every few bytes, which would mean very little needs to be
+    remembered from outside the window -- but that has not actually been
+    checked yet, and it should be checked directly (for example, by rebuilding
+    the mask starting fresh from a window's own bytes and comparing it against
+    this whole-file table) before this table is trusted as a training target.
+
+OUTPUT FORMAT
+
+A single SQLite file (same style as build_nal_index.py):
+  metadata(key, value)              -- bookkeeping about which manifest this came from
+  mask_table(mask_id, mask_bits)    -- one row per distinct 256-flag answer, packed into 32 bytes
+  files(id, path, size, mtime_ns, num_bytes)  -- one row per source file
+  file_masks(file_id, mask_ids)     -- one row per file: a list of pointers into mask_table,
+                                        one pointer per byte in the file, stored as 32-bit
+                                        numbers in a fixed (little-endian) byte order
+
+How to line this table up with a training example: pointer number i in a
+file's list describes the byte at position i in that file, using only the
+information available up to (not including) position i -- this matches, byte
+for byte, the "label" tensor this project's training code already builds for
+that same window (see ByteStreamWindowDataset in litgpt/byte/data.py), with no
+extra shift needed. For a training window that starts at position
+`window_start` in the file, take pointers `window_start` through
+`window_start + window_len` and line them up one-to-one with that window's
+labels -- do not add or subtract one from these positions; this project's
+training code does not need that adjustment, even though a generic
+next-byte-prediction setup elsewhere might.
 
 Usage:
     python scripts/byte/build_legal_mask_table.py manifest.jsonl
@@ -88,18 +147,28 @@ def default_mask_table_path(manifest_path: Path) -> Path:
 
 
 def iter_legal_masks(data: bytes) -> Iterator[list[bool]]:
-    """Walk a raw Annex-B byte stream, yielding the legal-next-byte mask before
-    each byte is consumed. len(list(iter_legal_masks(data))) == len(data).
+    """Walk one raw H.264 file byte by byte and, for each position, report which
+    of the 256 possible byte values could legally appear there, given only the
+    real bytes that came before it. Returns exactly one 256-entry answer per
+    byte in the file, in file order.
 
-    Reuses MaskState/get_valid_byte_mask/advance exactly as free_run_eval.py does
-    at inference time, just walking the real GT bytes instead of sampled ones --
-    no new CAVLC parsing logic, only a new (offline, GT-driven) use of it.
+    This does not add any new checking logic. It calls the same
+    MaskState/get_valid_byte_mask/advance functions already used to keep
+    generated output valid at inference time (see free_run_eval.py), just
+    pointed at real recorded bytes instead of bytes the model is generating.
 
-    Asserts the fundamental invariant x_i in A(x_<i) for every i: the GT byte
-    must always be in its own predicted-legal set. A violation means the
-    automaton's trie-derived mask disagrees with its own bit-level transitions
-    -- a real automaton bug -- and must fail loudly rather than silently write a
-    corrupted mask table.
+    Before moving on to the next byte, this function checks one thing about the
+    answer it just got: that the real byte actually present in the file is one
+    of the ones marked legal. If that is ever false, it means the checker
+    disagrees with itself about a byte it just watched happen -- a bug in the
+    checker, not a problem with this particular file -- so this function stops
+    immediately with an error instead of quietly saving a wrong answer.
+
+    This check is useful but narrow: it only ever looks at the one byte that
+    really occurs at each position. It says nothing about whether the other
+    255 byte values at that same position have been correctly marked legal or
+    illegal. See the "What this mask does and does not guarantee" section at
+    the top of this file for what that limitation means in practice.
     """
     state = MaskState()
     for offset, byte in enumerate(data):
