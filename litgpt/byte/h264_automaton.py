@@ -29,13 +29,18 @@ except ImportError:  # pragma: no cover
     import h264_cavlc_tables as T
 
 # --- status codes returned by consume_bit ----------------------------------
-MORE = "more"            # element not finished; keep feeding bits
+MORE = "more"  # element not finished; keep feeding bits
 COMPLETE_MB = "complete_mb"  # a macroblock just finished (more may follow)
-DONE = "done"            # rbsp_trailing_bits consumed -> NAL fully parsed
-INVALID = "invalid"      # this bit makes the stream un-decodable
+DONE = "done"  # rbsp_trailing_bits consumed -> NAL fully parsed
+INVALID = "invalid"  # this bit makes the stream un-decodable
 
 _RESIDUAL_TAGS = {
-    "coeff_token", "signs", "level_prefix", "level_suffix", "total_zeros", "run_before"
+    "coeff_token",
+    "signs",
+    "level_prefix",
+    "level_suffix",
+    "total_zeros",
+    "run_before",
 }
 
 # P macroblock partition count: mb_type -> num_parts (mirror _P_MB).
@@ -216,8 +221,8 @@ class MbAutomaton:
     def _feed(self):
         """Feed self.ae_bits to the active element. Returns ('more',)/('done',v)/
         ('invalid',)."""
-        s = self.ae_bits
-        k = self.ae_kind
+        s = self.ae_bits  # string of bits (0/1) for the active element
+        k = self.ae_kind  # "u"|"ue"|"se"|"te"|"unary"|"vlc"
         if k == "u":
             if len(s) < self.ae_n:
                 return ("more",)
@@ -249,12 +254,16 @@ class MbAutomaton:
         raise AssertionError(f"bad ae_kind {k!r}")
 
     def consume_bit(self, bit: int):
+        # three stages: slice-data, trailing rbsp_trailing_bits, done. Each stage has its own
         self.pos += 1
         if self.stage == "trailing":
             return self._trailing_bit(bit)
         if self.stage == "done":
             return INVALID
-        self.ae_bits += "1" if bit else "0"
+        # slice stage: feed the bit to the active element and see if it completes.
+        self.ae_bits += (
+            "1" if bit else "0"
+        )  # append bit to the active element's bit buffer. "ae" stands for "active element"
         r = self._feed()
         if r[0] == "more":
             return MORE
@@ -581,7 +590,10 @@ class MbAutomaton:
         level = (level_code + 2) >> 1 if level_code % 2 == 0 else (-level_code - 1) >> 1
         if self.rb_suffix_length == 0:
             self.rb_suffix_length = 1
-        if abs(level) > (3 << (self.rb_suffix_length - 1)) and self.rb_suffix_length < 6:
+        if (
+            abs(level) > (3 << (self.rb_suffix_length - 1))
+            and self.rb_suffix_length < 6
+        ):
             self.rb_suffix_length += 1
         self.rb_i += 1
         if self.rb_i < self.rb_total_coeff - self.rb_trailing_ones:
@@ -624,7 +636,7 @@ def _try_ue(s: str):
     total = 2 * z + 1
     if len(s) < total:
         return ("more",)
-    suffix = s[z + 1:total]
+    suffix = s[z + 1 : total]
     return ("done", (1 << z) - 1 + (int(suffix, 2) if suffix else 0))
 
 

@@ -307,7 +307,9 @@ def free_run_rollout(
             )
         for step in range(max_gen):
             next_logits = logits[:, -1, :BYTE_VOCAB_SIZE]
+            forcing_this_byte = False
             if forced_used < len(forced):
+                forcing_this_byte = True
                 n_high = min(8, len(forced) - forced_used)
                 high_bits = 0
                 for j in range(n_high):
@@ -323,6 +325,15 @@ def free_run_rollout(
                 if forbidden:
                     next_logits = next_logits.clone()
                     next_logits[0, forbidden] = float("-inf")
+            # A forced syntax codeword and the online syntax mask are two separate
+            # restrictions on the same byte.  Detect an empty intersection instead
+            # of letting argmax silently select byte 0 from an all--inf vector.  In
+            # the legal-branch experiment this explicitly exposes disagreement
+            # between the recursive parser that chose the branch and the mask
+            # automaton that constrains generation.
+            if not torch.isfinite(next_logits).any():
+                _stop("forced_mask_conflict" if forcing_this_byte else "mask_boxed_in")
+                break
             token = _sample_token(next_logits, temperature, top_k, top_p)
             generated.append(token)
             if mask_state is not None:

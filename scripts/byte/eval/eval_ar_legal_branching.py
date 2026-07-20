@@ -23,8 +23,9 @@ training videos.
 Outputs:
   probes.json               shared legal alternatives and optional corpus coverage
   branch_details.jsonl      every alternative and matched GT-control rollout
-  metrics.jsonl             per-checkpoint summary and per-element/coverage breakdown
-  paired_comparisons.json   direct deltas on probes verified for both checkpoints
+  metrics.jsonl             per-checkpoint/mode summary and element/coverage breakdown
+  paired_comparisons.json   checkpoint deltas within each decoding mode
+  constraint_comparisons.json  constrained-minus-unconstrained paired deltas
   summary.csv               flat headline table
 
 Example:
@@ -35,6 +36,7 @@ Example:
         --out-dir OUT/legal_branching \
         --prefix-frames 8 --cont-frames 4 --num-clips 100 \
         --probes-per-element 10 --max-gen-bytes 512 --horizon-frames 1 \
+        --run-constrained \
         --coverage-source phase2=DATA/phase2_manifest.jsonl \
         --coverage-source phase3=DATA/phase3_manifest.jsonl
 """
@@ -169,6 +171,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.0, help="0 = greedy.")
     p.add_argument("--top-k", type=int, default=0)
     p.add_argument("--top-p", type=float, default=0.0)
+    p.add_argument(
+        "--run-constrained",
+        action="store_true",
+        help=(
+            "Run a second, paired rollout with online H.264 syntax masking for every "
+            "legal-alternative and GT-control probe. Unconstrained rollout is always run."
+        ),
+    )
     p.add_argument(
         "--no-gt-control",
         dest="gt_control",
@@ -698,7 +708,14 @@ def _ffmpeg_accepts(stream: bytes, args) -> tuple[bool | None, str | None]:
 
 
 @torch.inference_mode()
-def evaluate_probe(raw, probe: BranchProbe, device: torch.device, args) -> dict[str, Any]:
+def evaluate_probe(
+    raw,
+    probe: BranchProbe,
+    device: torch.device,
+    args,
+    *,
+    constrain: bool = False,
+) -> dict[str, Any]:
     max_gen = min(args.max_gen_bytes, model_max_gen(raw, probe.model_prompt))
     base = _probe_public(probe)
     if max_gen <= 0:
@@ -718,6 +735,8 @@ def evaluate_probe(raw, probe: BranchProbe, device: torch.device, args) -> dict[
         top_p=args.top_p,
         forced_bits=list(probe.forced_bits),
         init_offset=_init_offset(probe.model_prompt),
+        constrain=constrain,
+        prefix_bytes=probe.analysis_prefix,
         trace=trace,
     )
     stream = probe.analysis_prefix + generated
@@ -727,6 +746,7 @@ def evaluate_probe(raw, probe: BranchProbe, device: torch.device, args) -> dict[
         return {
             **base,
             "status": "branch_nal_missing",
+            "forced_value_verified": False,
             "generated_bytes": len(generated),
             "stop_reason": trace.get("stop_reason"),
             "_stream": stream,
@@ -801,7 +821,11 @@ def _rate(rows: list[dict[str, Any]], key: str) -> float | None:
 
 
 def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    evaluated = [row for row in rows if row.get("status") == "ok"]
+    evaluated = [
+        row
+        for row in rows
+        if not str(row.get("status", "")).startswith("skipped")
+    ]
     verified = [row for row in evaluated if row.get("forced_value_verified")]
     completed_bytes = [float(row["completed_bytes_after_branch"]) for row in verified]
     completed_nals = [float(row["completed_nals_after_branch"]) for row in verified]
@@ -839,13 +863,22 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "failure_reason_hist": dict(
             Counter((failure.get("reason") or "unknown") for failure in failures).most_common()
         ),
+        "stop_reason_hist": dict(
+            Counter((row.get("stop_reason") or "unknown") for row in evaluated).most_common()
+        ),
     }
 
 
-def summarize(checkpoint: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(
+    checkpoint: str, decoding_mode: str, rows: list[dict[str, Any]]
+) -> dict[str, Any]:
     alternatives = [row for row in rows if row.get("branch_kind") == "legal_alternative"]
     controls = [row for row in rows if row.get("branch_kind") == "gt_control"]
-    summary = {"checkpoint": checkpoint, **_summarize_rows(alternatives)}
+    summary = {
+        "checkpoint": checkpoint,
+        "decoding_mode": decoding_mode,
+        **_summarize_rows(alternatives),
+    }
     groups = sorted({row["element_group"] for row in alternatives})
     summary["by_element"] = {
         group: _summarize_rows(
@@ -912,55 +945,114 @@ def summarize(checkpoint: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def paired_comparisons(
-    details_by_checkpoint: dict[str, list[dict[str, Any]]]
+def _paired_delta(
+    baseline_rows: list[dict[str, Any]],
+    comparison_rows: list[dict[str, Any]],
+    *,
+    branch_kind: str,
+) -> dict[str, Any]:
+    baseline_all = {
+        row["probe_id"]: row
+        for row in baseline_rows
+        if row.get("branch_kind") == branch_kind
+    }
+    comparison_all = {
+        row["probe_id"]: row
+        for row in comparison_rows
+        if row.get("branch_kind") == branch_kind
+    }
+    shared_ids = sorted(baseline_all.keys() & comparison_all.keys())
+    pairs = [
+        (baseline_all[probe_id], comparison_all[probe_id])
+        for probe_id in shared_ids
+        if baseline_all[probe_id].get("forced_value_verified")
+        and comparison_all[probe_id].get("forced_value_verified")
+    ]
+    byte_deltas = [
+        float(b["completed_bytes_after_branch"] - a["completed_bytes_after_branch"])
+        for a, b in pairs
+    ]
+
+    def delta(key: str) -> float | None:
+        if not pairs:
+            return None
+        return (_rate([b for _, b in pairs], key) or 0.0) - (
+            _rate([a for a, _ in pairs], key) or 0.0
+        )
+
+    return {
+        "branch_kind": branch_kind,
+        "shared_probes": len(shared_ids),
+        "baseline_forced_value_verified": sum(
+            bool(baseline_all[probe_id].get("forced_value_verified"))
+            for probe_id in shared_ids
+        ),
+        "comparison_forced_value_verified": sum(
+            bool(comparison_all[probe_id].get("forced_value_verified"))
+            for probe_id in shared_ids
+        ),
+        "paired_verified_probes": len(pairs),
+        "current_nal_success_delta": delta("current_nal_success"),
+        "next_nal_success_delta": delta("next_nal_success"),
+        "no_parser_failure_delta": delta("no_parser_failure"),
+        "reached_next_frame_delta": delta("reached_next_frame"),
+        "horizon_success_delta": delta("horizon_success"),
+        "completed_bytes_delta_mean": _mean(byte_deltas),
+        "comparison_survives_longer_rate": (
+            sum(value > 0 for value in byte_deltas) / len(byte_deltas)
+            if byte_deltas else None
+        ),
+    }
+
+
+def paired_checkpoint_comparisons(
+    details_by_checkpoint: dict[str, dict[str, list[dict[str, Any]]]]
 ) -> list[dict[str, Any]]:
     names = list(details_by_checkpoint)
     if len(names) < 2:
         return []
-    base_name = names[0]
-    base = {
-        row["probe_id"]: row
-        for row in details_by_checkpoint[base_name]
-        if row.get("branch_kind") == "legal_alternative"
-    }
+    baseline_name = names[0]
     out = []
-    for name in names[1:]:
-        other = {
-            row["probe_id"]: row
-            for row in details_by_checkpoint[name]
-            if row.get("branch_kind") == "legal_alternative"
-        }
-        pairs = [
-            (base[probe_id], other[probe_id])
-            for probe_id in sorted(base.keys() & other.keys())
-            if base[probe_id].get("forced_value_verified")
-            and other[probe_id].get("forced_value_verified")
-        ]
-        byte_deltas = [
-            float(b["completed_bytes_after_branch"] - a["completed_bytes_after_branch"])
-            for a, b in pairs
-        ]
-        out.append(
-            {
-                "baseline": base_name,
-                "comparison": name,
-                "paired_probes": len(pairs),
-                "current_nal_success_delta": (
-                    _rate([b for _, b in pairs], "current_nal_success") or 0.0
-                ) - (_rate([a for a, _ in pairs], "current_nal_success") or 0.0)
-                if pairs else None,
-                "horizon_success_delta": (
-                    _rate([b for _, b in pairs], "horizon_success") or 0.0
-                ) - (_rate([a for a, _ in pairs], "horizon_success") or 0.0)
-                if pairs else None,
-                "completed_bytes_delta_mean": _mean(byte_deltas),
-                "comparison_survives_longer_rate": (
-                    sum(delta > 0 for delta in byte_deltas) / len(byte_deltas)
-                    if byte_deltas else None
-                ),
-            }
-        )
+    for decoding_mode, baseline_rows in details_by_checkpoint[baseline_name].items():
+        for comparison_name in names[1:]:
+            comparison_rows = details_by_checkpoint[comparison_name].get(decoding_mode)
+            if comparison_rows is None:
+                continue
+            row = _paired_delta(
+                baseline_rows, comparison_rows, branch_kind="legal_alternative"
+            )
+            out.append(
+                {
+                    "baseline": baseline_name,
+                    "comparison": comparison_name,
+                    "decoding_mode": decoding_mode,
+                    **row,
+                }
+            )
+    return out
+
+
+def paired_constraint_comparisons(
+    details_by_checkpoint: dict[str, dict[str, list[dict[str, Any]]]]
+) -> list[dict[str, Any]]:
+    out = []
+    for checkpoint, by_mode in details_by_checkpoint.items():
+        if "unconstrained" not in by_mode or "constrained" not in by_mode:
+            continue
+        for branch_kind in ("legal_alternative", "gt_control"):
+            row = _paired_delta(
+                by_mode["unconstrained"],
+                by_mode["constrained"],
+                branch_kind=branch_kind,
+            )
+            out.append(
+                {
+                    "checkpoint": checkpoint,
+                    "baseline_decoding_mode": "unconstrained",
+                    "comparison_decoding_mode": "constrained",
+                    **row,
+                }
+            )
     return out
 
 
@@ -971,7 +1063,12 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _persist_stream(
-    row: dict[str, Any], out_dir: Path, checkpoint: str, branch_kind: str, save: bool
+    row: dict[str, Any],
+    out_dir: Path,
+    checkpoint: str,
+    decoding_mode: str,
+    branch_kind: str,
+    save: bool,
 ) -> None:
     stream = row.pop("_stream", None)
     if not save or stream is None:
@@ -981,6 +1078,7 @@ def _persist_stream(
         out_dir
         / "streams"
         / safe_checkpoint
+        / decoding_mode
         / branch_kind
         / f"probe-{row['probe_id']:05d}.h264"
     )
@@ -1068,40 +1166,70 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    details_by_checkpoint: dict[str, list[dict[str, Any]]] = {}
+    decoding_modes = [("unconstrained", False)]
+    if args.run_constrained:
+        decoding_modes.append(("constrained", True))
+    details_by_checkpoint: dict[str, dict[str, list[dict[str, Any]]]] = {}
     summaries = []
     for checkpoint_dir, name in zip(args.checkpoint_dirs, checkpoint_labels):
         print(f"Loading checkpoint: {checkpoint_dir}", flush=True)
         model = load_model(checkpoint_dir, device)
         raw = model.module if hasattr(model, "module") else model
         raw.eval()
-        details = []
-        for i, probe in enumerate(probes):
-            print(f"  {name}: probe {i + 1}/{len(probes)}", flush=True)
-            row = evaluate_probe(raw, probe, device, args)
-            row["checkpoint"] = name
-            row["branch_kind"] = "legal_alternative"
-            _persist_stream(row, args.out_dir, name, "legal_alternative", args.save_streams)
-            details.append(row)
-            if args.gt_control:
-                control = evaluate_probe(raw, _gt_control_probe(probe), device, args)
-                control["checkpoint"] = name
-                control["branch_kind"] = "gt_control"
-                _persist_stream(control, args.out_dir, name, "gt_control", args.save_streams)
-                details.append(control)
+        details_by_checkpoint[name] = {}
+        for decoding_mode, constrain in decoding_modes:
+            details = []
+            for i, probe in enumerate(probes):
+                print(
+                    f"  {name}/{decoding_mode}: probe {i + 1}/{len(probes)}",
+                    flush=True,
+                )
+                row = evaluate_probe(raw, probe, device, args, constrain=constrain)
+                row["checkpoint"] = name
+                row["decoding_mode"] = decoding_mode
+                row["branch_kind"] = "legal_alternative"
+                _persist_stream(
+                    row,
+                    args.out_dir,
+                    name,
+                    decoding_mode,
+                    "legal_alternative",
+                    args.save_streams,
+                )
+                details.append(row)
+                if args.gt_control:
+                    control = evaluate_probe(
+                        raw, _gt_control_probe(probe), device, args, constrain=constrain
+                    )
+                    control["checkpoint"] = name
+                    control["decoding_mode"] = decoding_mode
+                    control["branch_kind"] = "gt_control"
+                    _persist_stream(
+                        control,
+                        args.out_dir,
+                        name,
+                        decoding_mode,
+                        "gt_control",
+                        args.save_streams,
+                    )
+                    details.append(control)
+            details_by_checkpoint[name][decoding_mode] = details
+            summary = summarize(name, decoding_mode, details)
+            summaries.append(summary)
+            _append_jsonl(args.out_dir / "branch_details.jsonl", details)
+            _append_jsonl(args.out_dir / "metrics.jsonl", [summary])
+            print(json.dumps(summary, indent=2), flush=True)
         del raw, model
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        details_by_checkpoint[name] = details
-        summary = summarize(name, details)
-        summaries.append(summary)
-        _append_jsonl(args.out_dir / "branch_details.jsonl", details)
-        _append_jsonl(args.out_dir / "metrics.jsonl", [summary])
-        print(json.dumps(summary, indent=2), flush=True)
 
-    comparisons = paired_comparisons(details_by_checkpoint)
+    comparisons = paired_checkpoint_comparisons(details_by_checkpoint)
     (args.out_dir / "paired_comparisons.json").write_text(
         json.dumps(comparisons, indent=2) + "\n", encoding="utf-8"
+    )
+    constraint_comparisons = paired_constraint_comparisons(details_by_checkpoint)
+    (args.out_dir / "constraint_comparisons.json").write_text(
+        json.dumps(constraint_comparisons, indent=2) + "\n", encoding="utf-8"
     )
     _write_summary_csv(args.out_dir / "summary.csv", summaries)
     print(f"Controlled legal-branch evaluation complete: {args.out_dir}", flush=True)

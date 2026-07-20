@@ -468,7 +468,10 @@ def evaluate_checkpoint(
         fed_prefix = _concat_nals(data, nals, vcl_start, clip.prefix_end_nal)
 
         if not args.survival_only:
-            gt_frames, _ = decode_h264(gt_bytes, args, strict=False)
+            # The continuation benchmark is strict end to end. Ground truth should
+            # already be a valid H.264 stream, so a strict-decode failure is an eval
+            # input problem rather than something error concealment should hide.
+            gt_frames, _ = decode_h264(gt_bytes, args, strict=True)
             if len(gt_frames) < clip.prefix_frames + clip.cont_frames:
                 skipped_gt_decode_short += 1
                 details.append(
@@ -565,8 +568,6 @@ def evaluate_checkpoint(
         # ---- frame-based path (needs ffmpeg): decode + PSNR/Fréchet ----
         model_bytes = prefix_bytes + gen_bytes
         model_frames, model_status = decode_h264(model_bytes, args, strict=True)
-        if not model_frames:
-            model_frames, model_status = decode_h264(model_bytes, args, strict=False)
         produced = max(0, len(model_frames) - n)
         frames_made.append(produced)
         strict_valid = model_status == "decoded" and len(model_frames) >= n + m
