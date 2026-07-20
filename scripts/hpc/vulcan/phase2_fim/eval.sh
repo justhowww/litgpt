@@ -80,7 +80,7 @@ def rows(name):
             cont = r
     return tf, cont
 
-hdr = f"{'sampling':<14} {'decode_rate':>11} {'full_cont':>10} {'survival_mean':>14} {'psnr':>8}  desync_top"
+hdr = f"{'sampling':<14} {'success':>10} {'frames(done/target)':>19} {'completed_bytes':>16} {'target_bytes':>14} {'psnr':>8}  desync_top"
 print(hdr)
 print("-" * len(hdr))
 for name in names:
@@ -88,20 +88,24 @@ for name in names:
     if cont is None:
         print(f"{name:<14} (missing metrics.jsonl)")
         continue
+    completed_frames = cont.get('completed_frames_mean')
+    frames_ref = f"{completed_frames:.1f}/{cont.get('target_frames', 0)}" if completed_frames is not None else f"-/{cont.get('target_frames', 0)}"
     print(
-        f"{name:<14} {cont.get('decode_rate', 0):>11.3f} "
-        f"{cont.get('full_continuation_rate', 0):>10.3f} "
-        f"{cont.get('survival_bytes_mean', 0):>14.1f} "
+        f"{name:<14} {cont.get('success_rate', 0):>10.3f} "
+        f"{frames_ref:>19} "
+        f"{cont.get('completed_bytes_mean', 0):>16.1f} "
+        f"{cont.get('target_bytes_mean', 0):>14.1f} "
         f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
     )
 print()
 for name in names:
     tf, _ = rows(name)
     if tf is not None:
+        elements = tf.get('element_correct', {})
         print(
             f"{name:<14} tf_byte_acc={tf.get('tf_byte_acc_mean'):.5f} "
-            f"correct_coeff_token={tf.get('correct_coeff_token')} "
-            f"correct_cbp={tf.get('correct_cbp')}"
+            f"coeff_token={elements.get('luma.coeff_token')} "
+            f"cbp={elements.get('coded_block_pattern')}"
         )
 print()
 print("Phase 1 @ step-00031000 for reference (260716 - Eval with syntax validation mask):")

@@ -7,7 +7,7 @@
 # The one signal phase 1/2 could NOT give: whether the train/val gap on residual
 # coding (coeff_token, level, total_zeros, run_before -- see
 # 04 - projects/real-time-diffusion-video-decoder/260712 - phase 1 result.md) shrinks
-# now that the corpus is ~45x larger. That gap, not full_continuation_rate alone, is
+# now that the corpus is ~45x larger. That gap, not success_rate alone, is
 # the actual test of whether 45k videos bought real generalization. Read the
 # per-element accuracy table this script's teacher-forced pass produces (via
 # eval_ar_continuation.py's own output) against phase 1's numbers directly.
@@ -80,7 +80,7 @@ def rows(name):
             cont = r
     return tf, cont
 
-hdr = f"{'sampling':<14} {'decode_rate':>11} {'full_cont':>10} {'survival_mean':>14} {'psnr':>8}  desync_top"
+hdr = f"{'sampling':<14} {'success':>10} {'frames(done/target)':>19} {'completed_bytes':>16} {'target_bytes':>14} {'psnr':>8}  desync_top"
 print(hdr)
 print("-" * len(hdr))
 for name in names:
@@ -88,20 +88,24 @@ for name in names:
     if cont is None:
         print(f"{name:<14} (missing metrics.jsonl)")
         continue
+    completed_frames = cont.get('completed_frames_mean')
+    frames_ref = f"{completed_frames:.1f}/{cont.get('target_frames', 0)}" if completed_frames is not None else f"-/{cont.get('target_frames', 0)}"
     print(
-        f"{name:<14} {cont.get('decode_rate', 0):>11.3f} "
-        f"{cont.get('full_continuation_rate', 0):>10.3f} "
-        f"{cont.get('survival_bytes_mean', 0):>14.1f} "
+        f"{name:<14} {cont.get('success_rate', 0):>10.3f} "
+        f"{frames_ref:>19} "
+        f"{cont.get('completed_bytes_mean', 0):>16.1f} "
+        f"{cont.get('target_bytes_mean', 0):>14.1f} "
         f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
     )
 print()
 for name in names:
     tf, _ = rows(name)
     if tf is not None:
+        elements = tf.get('element_correct', {})
         print(
             f"{name:<14} tf_byte_acc={tf.get('tf_byte_acc_mean'):.5f} "
-            f"correct_coeff_token={tf.get('correct_coeff_token')} "
-            f"correct_cbp={tf.get('correct_cbp')}"
+            f"coeff_token={elements.get('luma.coeff_token')} "
+            f"cbp={elements.get('coded_block_pattern')}"
         )
 print()
 print("Phase 1 @ step-00031000 for reference (260716 - Eval with syntax validation mask):")
@@ -109,10 +113,10 @@ print("  greedy         full_cont=0.750  tf_byte_acc=0.99978")
 print("  greedy_masked  full_cont=1.000  tf_byte_acc=0.99978")
 print()
 print("Phase 1's val/train gap on residual coding (260712 - phase 1 result.md), the")
-print("thing 45k videos is meant to fix -- compare correct_coeff_token/correct_cbp")
+print("thing 45k videos is meant to fix -- compare element_correct for coeff_token/CBP")
 print("above against these on a held-out (val) pass, not just this train pass:")
-print("  correct_coeff_token: train 0.9916 -> val 0.7609")
-print("  correct_cbp:          train 0.9896 -> val 0.9185")
+print("  coeff_token: train 0.9916 -> val 0.7609")
+print("  CBP:         train 0.9896 -> val 0.9185")
 PY
 
 NAL_TERM=scripts/byte/eval/analyze_nal_termination.py

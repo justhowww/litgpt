@@ -253,7 +253,7 @@ def _rows_for(details_path: Path) -> list[dict[str, Any]]:
     by_clip: dict[int, dict[str, Any]] = {}
     for line in details_path.open():
         r = json.loads(line)
-        if r.get("frames_target") == 2 or "stream_gen_path" in r:
+        if r.get("target_frames") == 2 or "stream_gen_path" in r:
             if r.get("stream_gen_path"):
                 by_clip[r["clip_index"]] = r
     return [by_clip[k] for k in sorted(by_clip)]

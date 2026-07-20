@@ -159,7 +159,7 @@ def _latest_rows(path: Path) -> dict[int, dict]:
     rows = {}
     for line in path.open():
         row = json.loads(line)
-        if row.get("stream_gen_path") and row.get("frames_target") == 2:
+        if row.get("stream_gen_path") and row.get("target_frames") == 2:
             rows[int(row["clip_index"])] = row
     return rows
 
@@ -230,7 +230,7 @@ def main() -> None:
             (n.get("failure_element") for n in term["nals"] if n.get("is_first_desync_nal")),
             None,
         )
-        baseline_survival = int(row["survival_bytes"])
+        baseline_survival = int(row["completed_bytes"])
         trials = []
         for _ in range(args.trials):
             for _attempt in range(100):
