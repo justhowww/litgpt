@@ -159,21 +159,11 @@ def advance(state: MaskState, byte: int) -> None:
     state.cur_nal_bytes.append(byte)
     if was_empty:
         state.cur_is_vcl = (byte & 0x1F) in HS.VCL_NAL_TYPES
-        if state.debug:
-            _debug(state, "nal-open", nal_type=byte & 0x1F, vcl=state.cur_is_vcl)
 
     tail = state.cur_nal_bytes
     if len(tail) >= 3 and tuple(tail[-3:]) == START_CODE:
         sc_len = 4 if len(tail) >= 4 and tuple(tail[-4:]) == (0, 0, 0, 1) else 3
         _close_nal(state, bytes(tail[:-sc_len]))
-        if state.debug:
-            _debug(
-                state,
-                "nal-close",
-                bytes=len(tail) - sc_len,
-                strict_masks=state.strict_mask_calls,
-                total_masks=state.mask_calls,
-            )
         state.cur_nal_bytes = bytearray()
         state.cur_is_vcl = False
         state.automaton = None
@@ -227,15 +217,6 @@ def _sync_automaton(state: MaskState) -> None:
                 slice_data_start_bit=reader.pos,
                 max_mbs=state.slice_max_mbs,
             )
-            _debug(
-                state,
-                "automaton-init",
-                first_mb=header.first_mb_in_slice,
-                max_mbs=state.slice_max_mbs,
-                rbsp_bit=reader.pos,
-                slice_type="P" if header.slice_type == HS.SLICE_TYPE_P else "I",
-                syntax=_syntax_name(state.automaton),
-            )
         except HS.BitReaderError:
             return
         except (ValueError, KeyError, IndexError, HS._DesyncError, HS._Unsupported) as exc:
@@ -246,7 +227,6 @@ def _sync_automaton(state: MaskState) -> None:
     auto = state.automaton
     assert auto is not None
     nbits = len(rbsp) * 8
-    old_stage = auto.stage
     while auto.pos < nbits and auto.stage != "done":
         pos = auto.pos
         bit = (rbsp[pos >> 3] >> (7 - (pos & 7))) & 1
@@ -283,8 +263,6 @@ def _sync_automaton(state: MaskState) -> None:
                 rbsp_bit=auto.pos,
                 next=after,
             )
-    if old_stage != "done" and auto.stage == "done":
-        _debug(state, "slice-complete", mbs=auto.mbs_done, rbsp_bits=auto.pos)
 
 
 def _debug(state: MaskState, event: str, **fields: object) -> None:

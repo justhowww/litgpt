@@ -38,6 +38,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,8 +173,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mask-debug",
         action="store_true",
-        help="Print low-volume h264_mask diagnostics: NAL open/close, automaton "
-        "initialization/completion, permissive fallbacks, and periodic mask summaries.",
+        help="Print low-volume h264_mask diagnostics: permissive fallbacks and "
+        "periodic mask summaries.",
     )
     parser.add_argument(
         "--mask-debug-stages",
@@ -441,6 +442,9 @@ def evaluate_checkpoint(
     desync_regions: Counter = Counter()  # syntax element where free-run first desyncs
     desync_categories: Counter = Counter()  # its coarse syntax category
     desync_reasons: Counter = Counter()  # parser exception class -> failure mechanism
+    strict_decode_statuses: Counter = Counter()
+    strict_decode_seconds: list[float] = []
+    timeout_partial_frames: list[int] = []
     details: list[dict[str, Any]] = []
     viz: dict[int, dict[str, Any]] = {}
     # Distributional-plausibility feature populations (metric 3). Appearance is
@@ -471,14 +475,21 @@ def evaluate_checkpoint(
             # The continuation benchmark is strict end to end. Ground truth should
             # already be a valid H.264 stream, so a strict-decode failure is an eval
             # input problem rather than something error concealment should hide.
-            gt_frames, _ = decode_h264(gt_bytes, args, strict=True)
+            gt_frames, _, gt_decode = decode_h264(
+                gt_bytes,
+                args,
+                strict=True,
+                max_frames=clip.prefix_frames + clip.cont_frames,
+            )
             if len(gt_frames) < clip.prefix_frames + clip.cont_frames:
                 skipped_gt_decode_short += 1
                 details.append(
                     {
                         "checkpoint": checkpoint_name,
+                        "mode": mode,
                         "clip_index": clip_idx,
                         "status": "gt_decode_short",
+                        "ffmpeg_decode": gt_decode,
                     }
                 )
                 continue
@@ -495,6 +506,7 @@ def evaluate_checkpoint(
             details.append(
                 {
                     "checkpoint": checkpoint_name,
+                    "mode": mode,
                     "clip_index": clip_idx,
                     "status": "skipped_no_budget",
                     "prefix_bytes": len(prefix_bytes),
@@ -519,9 +531,16 @@ def evaluate_checkpoint(
 
         # Persist both streams for offline analysis (scripts/byte/eval/analyze_nal_termination.py).
         stream_gen_path = _write_stream(
-            args.out_dir, checkpoint_name, clip_idx, "gen", prefix_bytes + gen_bytes
+            args.out_dir,
+            checkpoint_name,
+            clip_idx,
+            mode,
+            "gen",
+            prefix_bytes + gen_bytes,
         )
-        stream_gt_path = _write_stream(args.out_dir, checkpoint_name, clip_idx, "gt", gt_bytes)
+        stream_gt_path = _write_stream(
+            args.out_dir, checkpoint_name, clip_idx, mode, "gt", gt_bytes
+        )
         # stop_reason names which of free_run_rollout's six exits fired; it cannot be
         # recovered from the bytes (a clean frame-target stop, a pad-run stop, a mask
         # box-in and a first_mb desync all re-parse identically).
@@ -549,6 +568,7 @@ def evaluate_checkpoint(
             details.append(
                 {
                     "checkpoint": checkpoint_name,
+                    "mode": mode,
                     "clip_index": clip_idx,
                     "h264_path": str(clip.h264_path),
                     "completed_bytes": survival,
@@ -567,7 +587,15 @@ def evaluate_checkpoint(
 
         # ---- frame-based path (needs ffmpeg): decode + PSNR/Fréchet ----
         model_bytes = prefix_bytes + gen_bytes
-        model_frames, model_status = decode_h264(model_bytes, args, strict=True)
+        model_frames, model_status, model_decode = decode_h264(
+            model_bytes, args, strict=True, max_frames=n + m
+        )
+        strict_decode_statuses[model_status] += 1
+        strict_decode_seconds.append(float(model_decode["elapsed_seconds"]))
+        if model_status == "timeout":
+            timeout_partial_frames.append(
+                int(model_decode["complete_frames_before_exit"])
+            )
         produced = max(0, len(model_frames) - n)
         frames_made.append(produced)
         strict_valid = model_status == "decoded" and len(model_frames) >= n + m
@@ -593,6 +621,7 @@ def evaluate_checkpoint(
         details.append(
             {
                 "checkpoint": checkpoint_name,
+                "mode": mode,
                 "clip_index": clip_idx,
                 "h264_path": str(clip.h264_path),
                 "status": model_status,
@@ -609,6 +638,7 @@ def evaluate_checkpoint(
                 "cont_psnr_mean": mean(clip_psnr),
                 "cont_ssim_mean": mean(clip_ssim),
                 "first_desync": sr.first_desync,
+                "ffmpeg_decode": model_decode,
                 **stream_fields,
             }
         )
@@ -657,6 +687,13 @@ def evaluate_checkpoint(
         # (within-block constraint), BitReaderError = ran off the end.
         "desync_reason_hist": dict(desync_reasons.most_common()),
         "desync_category_hist": dict(desync_categories.most_common()),
+        "strict_decode_status_hist": dict(strict_decode_statuses.most_common()),
+        "strict_decode_timeout_count": strict_decode_statuses.get("timeout", 0),
+        "strict_decode_seconds_mean": mean(strict_decode_seconds),
+        "strict_decode_seconds_max": (
+            max(strict_decode_seconds) if strict_decode_seconds else None
+        ),
+        "timeout_complete_frames_hist": dict(Counter(timeout_partial_frames)),
         "cont_psnr_mean": mean(cont_psnr),
         "cont_ssim_mean": mean(cont_ssim),
         "prefix_frames": clips[0].prefix_frames if clips else 0,
@@ -1275,8 +1312,12 @@ def _concat_nals(data: bytes, nals: list[NALUnit], start: int, end: int) -> byte
 
 
 def decode_h264(
-    stream: bytes, args: argparse.Namespace, *, strict: bool
-) -> tuple[list[Tensor], str]:
+    stream: bytes,
+    args: argparse.Namespace,
+    *,
+    strict: bool,
+    max_frames: int | None = None,
+) -> tuple[list[Tensor], str, dict[str, Any]]:
     command = [args.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
     if strict:
         command.extend(
@@ -1294,23 +1335,69 @@ def decode_h264(
             "image2pipe",
             "-vcodec",
             "ppm",
-            "pipe:1",
         ]
     )
+    if max_frames is not None:
+        command.extend(["-frames:v", str(max_frames)])
+    command.append("pipe:1")
+    started = time.monotonic()
+
+    def diagnostics(
+        *,
+        status: str,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        returncode: int | None = None,
+    ) -> dict[str, Any]:
+        complete_frames = len(parse_ppm_sequence(stdout)) if stdout else 0
+        return {
+            "status": status,
+            "strict": strict,
+            "input_bytes": len(stream),
+            "max_output_frames": max_frames,
+            "timeout_limit_seconds": args.timeout_sec,
+            "elapsed_seconds": time.monotonic() - started,
+            "returncode": returncode,
+            "stdout_bytes": len(stdout),
+            "stderr_bytes": len(stderr),
+            "stderr_head": stderr.decode("utf-8", errors="replace")[:2000],
+            "stderr_tail": stderr.decode("utf-8", errors="replace")[-4000:],
+            "complete_frames_before_exit": complete_frames,
+            "command": command,
+        }
+
     try:
         result = subprocess.run(
             command, input=stream, capture_output=True, timeout=args.timeout_sec
         )
     except FileNotFoundError:
-        return [], "ffmpeg_not_found"
-    except subprocess.TimeoutExpired:
-        return [], "timeout"
+        info = diagnostics(status="ffmpeg_not_found")
+        return [], "ffmpeg_not_found", info
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or b""
+        stderr = exc.stderr or b""
+        if isinstance(stdout, str):
+            stdout = stdout.encode()
+        if isinstance(stderr, str):
+            stderr = stderr.encode()
+        info = diagnostics(status="timeout", stdout=stdout, stderr=stderr)
+        return [], "timeout", info
+    info = diagnostics(
+        status="completed",
+        stdout=result.stdout,
+        stderr=result.stderr,
+        returncode=result.returncode,
+    )
     if strict and result.returncode != 0:
-        return [], "decoder_error"
+        info["status"] = "decoder_error"
+        return [], "decoder_error", info
     if not result.stdout:
-        return [], "no_frame"
+        info["status"] = "no_frame"
+        return [], "no_frame", info
     frames = parse_ppm_sequence(result.stdout)
-    return frames, "decoded" if frames else "no_frame"
+    status = "decoded" if frames else "no_frame"
+    info["status"] = status
+    return frames, status, info
 
 
 def parse_ppm_sequence(data: bytes) -> list[Tensor]:
@@ -1329,10 +1416,19 @@ def parse_ppm_sequence(data: bytes) -> list[Tensor]:
             start = idx
             while idx < n and data[idx] not in b" \t\n\r":
                 idx += 1
-            fields.append(int(data[start:idx]))
+            if start == idx:
+                break
+            try:
+                fields.append(int(data[start:idx]))
+            except ValueError:
+                break
+        if len(fields) != 3 or idx >= n:
+            break
         width, height, _ = fields
         idx += 1  # single whitespace after maxval
         payload = idx + width * height * 3
+        if payload > n:
+            break
         frames.append(parse_ppm(data[cursor:payload]))
         cursor = payload
     return frames
@@ -1455,7 +1551,14 @@ def save_continuation_videos(
         )
 
 
-def _write_stream(out_dir: Path, checkpoint_name: str, clip_idx: int, kind: str, data: bytes) -> str:
+def _write_stream(
+    out_dir: Path,
+    checkpoint_name: str,
+    clip_idx: int,
+    mode: str,
+    kind: str,
+    data: bytes,
+) -> str:
     """Persist one Annex-B byte stream and return its path.
 
     Both streams are written with the SAME full prefix that ``_survival_and_validity``
@@ -1467,7 +1570,7 @@ def _write_stream(out_dir: Path, checkpoint_name: str, clip_idx: int, kind: str,
     """
     stream_dir = out_dir / "streams" / checkpoint_name
     stream_dir.mkdir(parents=True, exist_ok=True)
-    path = stream_dir / f"clip_{clip_idx:04d}_continuation_{kind}.h264"
+    path = stream_dir / f"clip_{clip_idx:04d}_{mode}_{kind}.h264"
     path.write_bytes(data)
     return str(path)
 
