@@ -20,6 +20,13 @@ syntax transition occurs naturally in a training corpus and across how many vide
 Use ``--coverage-train-split LABEL=SPLIT.json`` to restrict a source to its exact
 training videos.
 
+Outputs:
+  probes.json               shared legal alternatives and optional corpus coverage
+  branch_details.jsonl      every alternative and matched GT-control rollout
+  metrics.jsonl             per-checkpoint summary and per-element/coverage breakdown
+  paired_comparisons.json   direct deltas on probes verified for both checkpoints
+  summary.csv               flat headline table
+
 Example:
     python scripts/byte/eval/eval_ar_legal_branching.py DATA/manifest.jsonl \
         --nal-index-path DATA/nal_index.sqlite \
@@ -27,7 +34,7 @@ Example:
         --checkpoint-labels phase2 phase3 \
         --out-dir OUT/legal_branching \
         --prefix-frames 8 --cont-frames 4 --num-clips 100 \
-        --probes-per-element 40 --horizon-frames 1 \
+        --probes-per-element 10 --max-gen-bytes 512 --horizon-frames 1 \
         --coverage-source phase2=DATA/phase2_manifest.jsonl \
         --coverage-source phase3=DATA/phase3_manifest.jsonl
 """
@@ -79,7 +86,7 @@ from scripts.byte.eval.helpers.free_run_rescue_helpers import (  # noqa: E402
 
 
 _INDEX_RE = re.compile(r"\[\d+\]")
-_DEFAULT_ELEMENTS = (
+_SUPPORTED_ELEMENTS = (
     "mb_type",
     "sub_mb_type",
     "coded_block_pattern",
@@ -87,6 +94,7 @@ _DEFAULT_ELEMENTS = (
     "mvd_l0",
     "mb_qp_delta",
 )
+_DEFAULT_ELEMENTS = ("mb_type", "coded_block_pattern", "coeff_token")
 
 
 @dataclass(frozen=True)
@@ -143,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--probes-per-element",
         type=int,
-        default=40,
+        default=10,
         help="Maximum shared probes for each syntax-element group.",
     )
     p.add_argument(
@@ -152,7 +160,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Free-run horizon after the branch, measured by generated frame boundaries.",
     )
-    p.add_argument("--max-gen-bytes", type=int, default=8192)
+    p.add_argument(
+        "--max-gen-bytes",
+        type=int,
+        default=512,
+        help="Post-branch byte budget. Raise to 8192 for frame-level horizons.",
+    )
     p.add_argument("--temperature", type=float, default=0.0, help="0 = greedy.")
     p.add_argument("--top-k", type=int, default=0)
     p.add_argument("--top-p", type=float, default=0.0)
@@ -172,9 +185,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ffmpeg-binary", default="ffmpeg")
     p.add_argument("--timeout-sec", type=int, default=60)
     p.add_argument(
-        "--skip-ffmpeg",
+        "--run-ffmpeg",
         action="store_true",
-        help="Skip independent strict decoding; parser measurements still run.",
+        help="Also run independent strict decoding for each result (off by default).",
+    )
+    p.add_argument(
+        "--save-streams",
+        action="store_true",
+        help="Save every controlled generated H.264 stream for byte-level inspection.",
     )
     p.add_argument(
         "--coverage-source",
@@ -210,6 +228,10 @@ def _parse_named_paths(items: list[str], option: str) -> dict[str, Path]:
 
 def _normal_name(name: str) -> str:
     return _INDEX_RE.sub("", name)
+
+
+def _bits(data: bytes) -> list[int]:
+    return [(byte >> (7 - bit)) & 1 for byte in data for bit in range(8)]
 
 
 def _element_group(span: HS.SyntaxSpan) -> str | None:
@@ -271,11 +293,14 @@ def _prior_value(nal: HS.NALParse, span: HS.SyntaxSpan, name: str) -> Any:
 
 
 def _syntax_state(nal: HS.NALParse, span: HS.SyntaxSpan) -> dict[str, Any]:
+    slice_type = _prior_value(nal, span, "slice_type")
+    if isinstance(slice_type, int):
+        slice_type %= 5
     state: dict[str, Any] = {
         "element": _normal_name(span.name),
         "category": span.category.value,
         "nal_type": nal.nal.nal_type,
-        "slice_type": _prior_value(nal, span, "slice_type"),
+        "slice_type": slice_type,
     }
     mb_type = _prior_value(nal, span, "mb_type")
     if mb_type is not None and span.name != "mb_type":
@@ -379,7 +404,7 @@ def _probe_public(probe: BranchProbe) -> dict[str, Any]:
 
 def build_probes(clips, nal_index, args) -> list[BranchProbe]:
     enabled = {x.strip() for x in args.elements.split(",") if x.strip()}
-    unknown = enabled - set(_DEFAULT_ELEMENTS)
+    unknown = enabled - set(_SUPPORTED_ELEMENTS)
     if unknown:
         raise SystemExit(f"unsupported --elements: {sorted(unknown)}")
     rng = random.Random(args.seed)
@@ -395,6 +420,10 @@ def build_probes(clips, nal_index, args) -> list[BranchProbe]:
         for nal in parsed.nals:
             if nal.status != HS.ParseStatus.OK or nal.nal.nal_type not in VCL_NAL_TYPES:
                 continue
+            rbsp, _, _ = HS.unescape_rbsp(
+                stream, nal.nal.payload_start + 1, nal.nal.payload_end
+            )
+            rbsp_bits = _bits(rbsp)
             for span in nal.spans:
                 group = _element_group(span)
                 if group not in enabled or span.byte_start < len(prefix):
@@ -404,6 +433,12 @@ def build_probes(clips, nal_index, args) -> list[BranchProbe]:
                     continue
                 forced_value, codeword = rng.choice(alternatives)
                 gt_codeword = _codeword_for_gt(nal, span)
+                actual_gt_bits = rbsp_bits[span.bit_start : span.bit_end]
+                if actual_gt_bits != gt_codeword:
+                    raise RuntimeError(
+                        f"GT encoder mismatch for {span.name}: "
+                        f"parsed={span.value!r} encoded={gt_codeword} actual={actual_gt_bits}"
+                    )
                 branch_byte = span.byte_start
                 if args.exclude_param_sets and branch_byte <= ps_len:
                     continue
@@ -628,7 +663,7 @@ def _mask_audit(prefix: bytes, generated: bytes) -> dict[str, Any]:
 
 
 def _ffmpeg_accepts(stream: bytes, args) -> tuple[bool | None, str | None]:
-    if args.skip_ffmpeg:
+    if not args.run_ffmpeg:
         return None, None
     command = [
         args.ffmpeg_binary,
@@ -694,6 +729,7 @@ def evaluate_probe(raw, probe: BranchProbe, device: torch.device, args) -> dict[
             "status": "branch_nal_missing",
             "generated_bytes": len(generated),
             "stop_reason": trace.get("stop_reason"),
+            "_stream": stream,
         }
     branch_nal = parsed.nals[branch_nal_index]
     verified = _forced_value_verified(branch_nal, probe)
@@ -706,7 +742,9 @@ def evaluate_probe(raw, probe: BranchProbe, device: torch.device, args) -> dict[
         else len(stream) - probe.branch_byte
     )
     mask = _mask_audit(probe.analysis_prefix, generated)
-    ffmpeg_ok, ffmpeg_error = _ffmpeg_accepts(stream, args)
+    ffmpeg_ok, ffmpeg_error = (
+        _ffmpeg_accepts(stream, args) if verified else (None, "forced_value_not_verified")
+    )
     current_nal_success = bool(
         verified and branch_nal.status == HS.ParseStatus.OK and closed_nals >= 1
     )
@@ -723,17 +761,23 @@ def evaluate_probe(raw, probe: BranchProbe, device: torch.device, args) -> dict[
         "forced_value_verified": verified,
         "current_nal_success": current_nal_success,
         "next_nal_success": next_nal_success,
+        "no_parser_failure": bool(verified and failure is None),
+        "byte_budget_success": bool(
+            verified and failure is None and trace.get("stop_reason") == "budget"
+        ),
         "reached_next_frame": bool(verified and frame_boundaries >= 1),
         "horizon_success": horizon_success,
         "completed_nals_after_branch": closed_nals if verified else None,
         "completed_frame_boundaries_after_branch": frame_boundaries if verified else None,
         "completed_bytes_after_branch": completed_bytes if verified else None,
         "generated_bytes": len(generated),
+        "max_gen_bytes": max_gen,
         "stop_reason": trace.get("stop_reason"),
         "first_failure": failure,
         "mask_audit": mask,
         "ffmpeg_accepts": ffmpeg_ok,
         "ffmpeg_error": ffmpeg_error,
+        "_stream": stream,
     }
 
 
@@ -775,6 +819,8 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "current_nal_success_rate": _rate(verified, "current_nal_success"),
         "next_nal_success_rate": _rate(verified, "next_nal_success"),
+        "no_parser_failure_rate": _rate(verified, "no_parser_failure"),
+        "byte_budget_success_rate": _rate(verified, "byte_budget_success"),
         "reached_next_frame_rate": _rate(verified, "reached_next_frame"),
         "horizon_success_rate": _rate(verified, "horizon_success"),
         "completed_bytes_after_branch_mean": _mean(completed_bytes),
@@ -797,14 +843,18 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def summarize(checkpoint: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    summary = {"checkpoint": checkpoint, **_summarize_rows(rows)}
-    groups = sorted({row["element_group"] for row in rows})
+    alternatives = [row for row in rows if row.get("branch_kind") == "legal_alternative"]
+    controls = [row for row in rows if row.get("branch_kind") == "gt_control"]
+    summary = {"checkpoint": checkpoint, **_summarize_rows(alternatives)}
+    groups = sorted({row["element_group"] for row in alternatives})
     summary["by_element"] = {
-        group: _summarize_rows([row for row in rows if row["element_group"] == group])
+        group: _summarize_rows(
+            [row for row in alternatives if row["element_group"] == group]
+        )
         for group in groups
     }
     coverage_labels = sorted(
-        {label for row in rows for label in row.get("coverage", {})}
+        {label for row in alternatives for label in row.get("coverage", {})}
     )
     summary["by_coverage"] = {}
     for label in coverage_labels:
@@ -813,7 +863,7 @@ def summarize(checkpoint: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             "rare_1_to_15": [],
             "common_16_plus": [],
         }
-        for row in rows:
+        for row in alternatives:
             occurrences = int((row.get("coverage", {}).get(label) or {}).get("occurrences", 0))
             bucket = (
                 "unseen"
@@ -827,6 +877,38 @@ def summarize(checkpoint: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             bucket: _summarize_rows(bucket_rows)
             for bucket, bucket_rows in buckets.items()
         }
+    if controls:
+        summary["gt_control"] = _summarize_rows(controls)
+        alt_by_id = {
+            row["probe_id"]: row for row in alternatives
+            if row.get("forced_value_verified")
+        }
+        control_by_id = {
+            row["probe_id"]: row for row in controls
+            if row.get("forced_value_verified")
+        }
+        pairs = [
+            (control_by_id[probe_id], alt_by_id[probe_id])
+            for probe_id in sorted(control_by_id.keys() & alt_by_id.keys())
+        ]
+        byte_deltas = [
+            float(alt["completed_bytes_after_branch"] - control["completed_bytes_after_branch"])
+            for control, alt in pairs
+        ]
+        summary["alternative_minus_gt_control"] = {
+            "paired_probes": len(pairs),
+            "current_nal_success_delta": (
+                (_rate([alt for _, alt in pairs], "current_nal_success") or 0.0)
+                - (_rate([control for control, _ in pairs], "current_nal_success") or 0.0)
+                if pairs else None
+            ),
+            "horizon_success_delta": (
+                (_rate([alt for _, alt in pairs], "horizon_success") or 0.0)
+                - (_rate([control for control, _ in pairs], "horizon_success") or 0.0)
+                if pairs else None
+            ),
+            "completed_bytes_delta_mean": _mean(byte_deltas),
+        }
     return summary
 
 
@@ -837,10 +919,18 @@ def paired_comparisons(
     if len(names) < 2:
         return []
     base_name = names[0]
-    base = {row["probe_id"]: row for row in details_by_checkpoint[base_name]}
+    base = {
+        row["probe_id"]: row
+        for row in details_by_checkpoint[base_name]
+        if row.get("branch_kind") == "legal_alternative"
+    }
     out = []
     for name in names[1:]:
-        other = {row["probe_id"]: row for row in details_by_checkpoint[name]}
+        other = {
+            row["probe_id"]: row
+            for row in details_by_checkpoint[name]
+            if row.get("branch_kind") == "legal_alternative"
+        }
         pairs = [
             (base[probe_id], other[probe_id])
             for probe_id in sorted(base.keys() & other.keys())
@@ -880,15 +970,43 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(jsonable(row), sort_keys=True) + "\n")
 
 
+def _persist_stream(
+    row: dict[str, Any], out_dir: Path, checkpoint: str, branch_kind: str, save: bool
+) -> None:
+    stream = row.pop("_stream", None)
+    if not save or stream is None:
+        return
+    safe_checkpoint = re.sub(r"[^A-Za-z0-9_.-]+", "_", checkpoint)
+    path = (
+        out_dir
+        / "streams"
+        / safe_checkpoint
+        / branch_kind
+        / f"probe-{row['probe_id']:05d}.h264"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(stream)
+    row["stream_path"] = str(path)
+
+
 def _write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
     flat = []
     for summary in summaries:
         row = {
             k: v for k, v in summary.items()
-            if k not in ("by_element", "by_coverage")
+            if k not in (
+                "by_element",
+                "by_coverage",
+                "gt_control",
+                "alternative_minus_gt_control",
+            )
         }
         row["by_element"] = json.dumps(summary.get("by_element", {}), sort_keys=True)
         row["by_coverage"] = json.dumps(summary.get("by_coverage", {}), sort_keys=True)
+        row["gt_control"] = json.dumps(summary.get("gt_control", {}), sort_keys=True)
+        row["alternative_minus_gt_control"] = json.dumps(
+            summary.get("alternative_minus_gt_control", {}), sort_keys=True
+        )
         flat.append(row)
     fields = list(dict.fromkeys(key for row in flat for key in row))
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -922,6 +1040,8 @@ def main() -> None:
         args.manifest, max_rows=args.max_manifest_rows or None, report_progress=True
     )
     rows = _filter_train_rows(rows, args.train_split_file)
+    if not rows:
+        raise SystemExit("no manifest rows matched --train-split-file")
     index_path = args.nal_index_path or default_nal_index_path(args.manifest)
     nal_index = load_nal_index(index_path, args.manifest, rows)
     clips = select_continuation_clips(rows, nal_index, args)
@@ -960,7 +1080,15 @@ def main() -> None:
             print(f"  {name}: probe {i + 1}/{len(probes)}", flush=True)
             row = evaluate_probe(raw, probe, device, args)
             row["checkpoint"] = name
+            row["branch_kind"] = "legal_alternative"
+            _persist_stream(row, args.out_dir, name, "legal_alternative", args.save_streams)
             details.append(row)
+            if args.gt_control:
+                control = evaluate_probe(raw, _gt_control_probe(probe), device, args)
+                control["checkpoint"] = name
+                control["branch_kind"] = "gt_control"
+                _persist_stream(control, args.out_dir, name, "gt_control", args.save_streams)
+                details.append(control)
         del raw, model
         if device.type == "cuda":
             torch.cuda.empty_cache()
