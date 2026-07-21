@@ -98,6 +98,12 @@ def _consume(auto, bits):
     return status
 
 
+def _vlc(label, value):
+    return next(
+        code for code, decoded in A.T.code_map(label).items() if decoded == value
+    )
+
+
 def _vcl_parses(data):
     parsed = H.parse_stream(data, parse_slice_data=True)
     vcl = [
@@ -223,6 +229,64 @@ def test_baseline_mb_qp_delta_boundaries():
         rejected = _small_automaton()
         rejected._start("se", "mb_qp_delta")
         assert _consume(rejected, _se(value)) == A.INVALID
+
+
+def test_coeff_token_cannot_exceed_block_capacity():
+    rejected = _small_automaton()
+    rejected._rb_start(nc=0, max_coeff=15, set_target=None)
+    assert _consume(rejected, _vlc("coeff_token_0", (16, 0))) == A.INVALID
+
+
+def test_level_prefix_cannot_exceed_baseline_limit():
+    accepted = _small_automaton()
+    accepted.rb_total_coeff = 1
+    accepted.rb_trailing_ones = 0
+    accepted.rb_suffix_length = 0
+    accepted.rb_i = 0
+    accepted._start("unary", "level_prefix")
+    assert _consume(accepted, "0" * 28 + "1") != A.INVALID
+
+    rejected = _small_automaton()
+    rejected.rb_total_coeff = 1
+    rejected.rb_trailing_ones = 0
+    rejected.rb_suffix_length = 0
+    rejected.rb_i = 0
+    rejected._start("unary", "level_prefix")
+    assert _consume(rejected, "0" * 29) == A.INVALID
+
+
+def test_total_zeros_cannot_exceed_remaining_block_capacity():
+    rejected = _small_automaton()
+    rejected.rb_max = 15
+    rejected.rb_total_coeff = 1
+    rejected._start("vlc", "total_zeros", label="total_zeros_4x4_1")
+    assert _consume(rejected, _vlc("total_zeros_4x4_1", 15)) == A.INVALID
+
+
+def test_run_before_cannot_exceed_zeros_left():
+    rejected = _small_automaton()
+    rejected.rb_total_coeff = 2
+    rejected.rb_zeros_left = 7
+    rejected.rb_run_i = 0
+    rejected.res_phase = "luma"
+    rejected.res_blk = 16
+    rejected.cbp_chroma = 0
+    rejected._start("vlc", "run_before", label="run_before_7")
+    assert _consume(rejected, _vlc("run_before_7", 14)) == A.INVALID
+
+    # The invalid run has a long code. Its impossible first byte must be pruned
+    # now, rather than accepted until every next-byte choice becomes invalid.
+    rejected = _small_automaton()
+    rejected.rb_total_coeff = 2
+    rejected.rb_zeros_left = 7
+    rejected.rb_run_i = 0
+    rejected.res_phase = "luma"
+    rejected.res_blk = 16
+    rejected.cbp_chroma = 0
+    rejected._start("vlc", "run_before", label="run_before_7")
+    invalid = _vlc("run_before_7", 14)
+    first_byte = int((invalid + "0" * 8)[:8], 2)
+    assert not A.compile_byte_mask(rejected)[first_byte]
 
 
 def test_full_byte_mask_rejects_oversized_skip_run_prefix():

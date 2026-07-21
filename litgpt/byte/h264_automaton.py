@@ -82,16 +82,29 @@ def _valid_element_prefixes(kind: str, n: int, values: tuple[int, ...]):
             code = f"{value:0{n}b}"
         elif kind == "te":
             code = str(1 - value) if n == 1 else _ue_bits(value)
+        elif kind == "unary":
+            code = "0" * value + "1"
         else:
             raise ValueError(f"prefix pruning unsupported for {kind!r}")
         codes.append(code)
     return frozenset(code[:i] for code in codes for i in range(1, len(code) + 1))
 
 
-def _prefixes(kind: str, *, n: int = 0, values=None):
+@lru_cache(maxsize=None)
+def _valid_vlc_prefixes(label: str, values: tuple[object, ...]):
+    """Prefixes of codewords whose decoded value is valid in this block state."""
+    allowed = frozenset(values)
+    codes = [code for code, value in T.code_map(label).items() if value in allowed]
+    return frozenset(code[:i] for code in codes for i in range(1, len(code) + 1))
+
+
+def _prefixes(kind: str, *, n: int = 0, label: str = "", values=None):
     if values is None:
         return None
-    return _valid_element_prefixes(kind, n, tuple(sorted(set(values))))
+    normalized = tuple(sorted(set(values)))
+    if kind == "vlc":
+        return _valid_vlc_prefixes(label, normalized)
+    return _valid_element_prefixes(kind, n, normalized)
 
 
 class VclAutomaton:
@@ -709,10 +722,11 @@ class MbAutomaton:
         self.ae_prefixes = _prefixes(
             kind,
             n=xmax if kind == "te" else n,
-            values=self._allowed_element_values(kind, tag, xmax),
+            label=label,
+            values=self._allowed_element_values(kind, tag, xmax, label),
         )
 
-    def _allowed_element_values(self, kind, tag, xmax):
+    def _allowed_element_values(self, kind, tag, xmax, label):
         if tag == "mb_skip_run":
             return range(self.max_mbs - self.mbs_done + 1)
         if tag == "mb_type":
@@ -727,6 +741,16 @@ class MbAutomaton:
             return range(_BASELINE_MB_QP_DELTA_MIN, _BASELINE_MB_QP_DELTA_MAX + 1)
         if tag == "pcm_align":
             return (0,)
+        if tag == "coeff_token":
+            return (
+                value for value in T.code_map(label).values() if value[0] <= self.rb_max
+            )
+        if tag == "level_prefix":
+            return range(29)
+        if tag == "total_zeros":
+            return range(self.rb_max - self.rb_total_coeff + 1)
+        if tag == "run_before":
+            return range(self.rb_zeros_left + 1)
         if kind == "te":
             return range(xmax + 1)
         return None
@@ -758,7 +782,7 @@ class MbAutomaton:
         if k == "unary":
             z = s.find("1")
             if z == -1:
-                return ("invalid",) if len(s) > 60 else ("more",)
+                return ("invalid",) if len(s) > 28 else ("more",)
             return ("done", z)
         if k == "vlc":
             cmap = T.code_map(self.ae_label)
@@ -882,9 +906,13 @@ class MbAutomaton:
         if tag == "level_suffix":
             return self._rb_level_finish(val)
         if tag == "total_zeros":
+            if not 0 <= val <= self.rb_max - self.rb_total_coeff:
+                return INVALID
             self.rb_total_zeros = val
             return self._rb_init_run_before()
         if tag == "run_before":
+            if not 0 <= val <= self.rb_zeros_left:
+                return INVALID
             self.rb_zeros_left -= val
             self.rb_run_i += 1
             return self._rb_run_next()
@@ -1075,6 +1103,8 @@ class MbAutomaton:
 
     def _rb_coeff_token(self, val):
         tc, t1 = val
+        if tc > self.rb_max:
+            return INVALID
         self.rb_total_coeff = tc
         self.rb_trailing_ones = t1
         if tc == 0:

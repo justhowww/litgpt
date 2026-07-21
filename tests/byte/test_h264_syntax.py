@@ -117,6 +117,60 @@ def test_tables_validate_on_import():
     assert module.COEFF_TOKEN_BINS[0][(0, 0)] == "1"
 
 
+def _vlc(label, value):
+    return next(
+        code for code, decoded in H.T.code_map(label).items() if decoded == value
+    )
+
+
+def _parse_residual_bits(bits, *, max_coeff=16):
+    padded = bits + "0" * (-len(bits) % 8)
+    data = bytes(int(padded[i : i + 8], 2) for i in range(0, len(padded), 8))
+    reader = H.BitReader(data)
+    record = H._Recorder(list(range(len(data))), len(data))
+    return H._residual_block(
+        reader,
+        record,
+        nc=0,
+        max_coeff=max_coeff,
+        mb_addr=0,
+        cat=H.Category.RESIDUAL_LUMA,
+        name="luma[0]",
+    )
+
+
+def test_parser_rejects_total_coeff_above_block_capacity():
+    with pytest.raises(H._DesyncError, match="total_coeff .* exceeds max_coeff"):
+        _parse_residual_bits(_vlc("coeff_token_0", (16, 0)), max_coeff=15)
+
+
+def test_parser_rejects_level_prefix_above_baseline_limit():
+    bits = _vlc("coeff_token_0", (1, 0)) + "0" * 29
+    with pytest.raises(H._DesyncError, match="level_prefix out of range"):
+        _parse_residual_bits(bits)
+
+
+def test_parser_rejects_total_zeros_above_block_capacity():
+    bits = (
+        _vlc("coeff_token_0", (1, 1))
+        + "0"  # trailing-one sign
+        + _vlc("total_zeros_4x4_1", 15)
+    )
+    with pytest.raises(H._DesyncError, match=r"total_coeff \+ total_zeros"):
+        _parse_residual_bits(bits, max_coeff=15)
+
+
+def test_parser_rejects_run_before_above_zeros_left():
+    bits = (
+        _vlc("coeff_token_0", (2, 2))
+        + "00"  # trailing-one signs
+        + _vlc("total_zeros_4x4_2", 7)
+        + _vlc("run_before_7", 14)
+    )
+    with pytest.raises(H._DesyncError, match="run_before 14 exceeds zeros_left 7"):
+        _parse_residual_bits(bits)
+
+
 if __name__ == "__main__":
     # Local runner (no pytest/conftest, so no torch needed).
     paths = [p for p in (_FIXTURES / n for n in _FIXTURE_FILES) if p.exists()]

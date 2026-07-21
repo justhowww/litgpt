@@ -986,6 +986,8 @@ def _residual_block(
         {"total_coeff": total_coeff, "trailing_ones": trailing_ones, "nC": nc},
         mb_addr,
     )
+    if total_coeff > max_coeff:
+        raise _DesyncError(f"total_coeff {total_coeff} exceeds max_coeff {max_coeff}")
     if total_coeff == 0:
         return 0
     if trailing_ones > 0:
@@ -1016,8 +1018,8 @@ def _residual_block(
         )
         while reader.read_bit() == 0:
             level_prefix += 1
-            if level_prefix > 60:
-                raise _DesyncError("level_prefix overflow")
+            if level_prefix > 28:
+                raise _DesyncError(f"level_prefix out of range: {level_prefix}")
         if level_prefix == 14 and suffix_length == 0:
             suffix_size = 4
         elif level_prefix >= 15:
@@ -1064,6 +1066,11 @@ def _residual_block(
         total_zeros, _ = T.decode_vlc(reader.read_bit, T.code_map(tz_label), tz_label)
         reader.end()
         record.raw(f"{name}.total_zeros", cat, tz0, reader.pos, total_zeros, mb_addr)
+        if total_coeff + total_zeros > max_coeff:
+            raise _DesyncError(
+                f"total_coeff + total_zeros exceeds max_coeff: "
+                f"{total_coeff} + {total_zeros} > {max_coeff}"
+            )
     zeros_left = total_zeros
     for i in range(total_coeff - 1):
         if zeros_left <= 0:
@@ -1078,6 +1085,8 @@ def _residual_block(
         run, _ = T.decode_vlc(reader.read_bit, T.code_map(rb_label), rb_label)
         reader.end()
         record.raw(f"{name}.run_before[{i}]", cat, rb0, reader.pos, run, mb_addr)
+        if run > zeros_left:
+            raise _DesyncError(f"run_before {run} exceeds zeros_left {zeros_left}")
         zeros_left -= run
     return total_coeff
 
