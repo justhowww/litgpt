@@ -68,6 +68,36 @@ def _make_automaton(head, sps, start_bit):
     )
 
 
+def _small_automaton(*, is_p=True, max_mbs=1, num_ref=3):
+    return A.MbAutomaton(
+        pic_width_in_mbs=16,
+        pic_height_in_mbs=9,
+        slice_type=H.SLICE_TYPE_P if is_p else H.SLICE_TYPE_I,
+        num_ref_idx_l0_active=num_ref,
+        first_mb_in_slice=0,
+        slice_data_start_bit=0,
+        max_mbs=max_mbs,
+    )
+
+
+def _ue(value):
+    code_num = value + 1
+    suffix = f"{code_num:b}"
+    return "0" * (len(suffix) - 1) + suffix
+
+
+def _se(value):
+    code_num = 2 * abs(value) - (1 if value > 0 else 0)
+    return _ue(code_num)
+
+
+def _consume(auto, bits):
+    status = A.MORE
+    for bit in bits:
+        status = auto.consume_bit(int(bit))
+    return status
+
+
 def _vcl_parses(data):
     parsed = H.parse_stream(data, parse_slice_data=True)
     vcl = [
@@ -144,6 +174,78 @@ def test_automaton_matches_parser():
 def test_mask_never_rejects_real_byte():
     for name in _FIXTURE_FILES:
         _assert_mask_never_rejects_real_byte(name)
+
+
+def test_skip_run_cannot_exceed_profile_slice_size():
+    assert _consume(_small_automaton(), _ue(1)) == A.COMPLETE_MB
+    assert _consume(_small_automaton(), _ue(2)) == A.INVALID
+
+
+def test_standard_macroblock_type_boundaries_keep_p_slice_intra_valid():
+    p_30 = _small_automaton()
+    p_30._start("ue", "mb_type")
+    assert _consume(p_30, _ue(30)) != A.INVALID
+    p_31 = _small_automaton()
+    p_31._start("ue", "mb_type")
+    assert _consume(p_31, _ue(31)) == A.INVALID
+    assert _consume(_small_automaton(is_p=False), _ue(25)) != A.INVALID
+    assert _consume(_small_automaton(is_p=False), _ue(26)) == A.INVALID
+
+
+def test_truncated_exp_golomb_reference_index_checks_xmax():
+    accepted = _small_automaton()
+    accepted._start("te", "ref_idx", xmax=2)
+    assert _consume(accepted, _ue(2)) != A.INVALID
+    rejected = _small_automaton()
+    rejected._start("te", "ref_idx", xmax=2)
+    assert _consume(rejected, _ue(3)) == A.INVALID
+
+
+def test_intra_chroma_prediction_mode_boundaries():
+    accepted = _small_automaton(is_p=False)
+    accepted.mb_mode = "I_NxN"
+    accepted._start("ue", "intra_chroma")
+    assert _consume(accepted, _ue(3)) != A.INVALID
+    rejected = _small_automaton(is_p=False)
+    rejected.mb_mode = "I_NxN"
+    rejected._start("ue", "intra_chroma")
+    assert _consume(rejected, _ue(4)) == A.INVALID
+
+
+def test_baseline_mb_qp_delta_boundaries():
+    for value in (-26, 25):
+        accepted = _small_automaton()
+        accepted.cbp_luma = 0
+        accepted.cbp_chroma = 0
+        accepted._start("se", "mb_qp_delta")
+        assert _consume(accepted, _se(value)) != A.INVALID
+    for value in (-27, 26):
+        rejected = _small_automaton()
+        rejected._start("se", "mb_qp_delta")
+        assert _consume(rejected, _se(value)) == A.INVALID
+
+
+def test_full_byte_mask_rejects_oversized_skip_run_prefix():
+    mask = A.compile_byte_mask(_small_automaton(), residual_only=False)
+    # ue(2) == 011, so every byte with that high-bit prefix must be rejected.
+    assert not any(mask[0b01100000:0b10000000])
+
+
+def test_automaton_rejects_slice_extent_outside_picture():
+    try:
+        A.MbAutomaton(
+            pic_width_in_mbs=16,
+            pic_height_in_mbs=9,
+            slice_type=H.SLICE_TYPE_P,
+            num_ref_idx_l0_active=3,
+            first_mb_in_slice=144,
+            slice_data_start_bit=0,
+            max_mbs=1,
+        )
+    except ValueError as exc:
+        assert "first_mb_in_slice" in str(exc)
+    else:
+        raise AssertionError("out-of-picture first_mb_in_slice was accepted")
 
 
 if __name__ == "__main__":  # stdlib runner (no pytest/torch)

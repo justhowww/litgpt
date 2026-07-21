@@ -56,11 +56,13 @@ run() {  # name  out_root  extra-sampling-args...
 
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
 run greedy        "${TRAIN_OUT}" --temperature 0.0
-run greedy_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --mask-debug
+run greedy_residual_masked "${TRAIN_OUT}" \
+    --temperature 0.0 --mask-illegal-bytes --mask-residual-only --mask-debug
+run greedy_full_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --mask-debug
 
 echo
 echo "===================== train sweep summary ====================="
-python3 - "${TRAIN_OUT}" greedy greedy_masked <<'PY'
+python3 - "${TRAIN_OUT}" greedy greedy_residual_masked greedy_full_masked <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -108,9 +110,9 @@ for name in names:
             f"cbp={elements.get('coded_block_pattern')}"
         )
 print()
-print("Phase 1 @ step-00031000 for reference (260716 - Eval with syntax validation mask):")
-print("  greedy         full_cont=0.750  tf_byte_acc=0.99978")
-print("  greedy_masked  full_cont=1.000  tf_byte_acc=0.99978")
+print("Historical phase 1 @ step-00031000 (the old residual-only mask):")
+print("  greedy                   full_cont=0.750  tf_byte_acc=0.99978")
+print("  greedy_residual_masked   full_cont=1.000  tf_byte_acc=0.99978")
 print("A phase-2 full_cont at or near these means FIM did not cost AR.")
 PY
 
@@ -118,7 +120,7 @@ PY
 # `set -e` a non-zero exit here would otherwise kill the script before the headline
 # ever printed. A diagnostic must never suppress the result it explains.
 NAL_TERM=scripts/byte/eval/analyze_nal_termination.py
-for name in greedy greedy_masked; do
+for name in greedy greedy_residual_masked greedy_full_masked; do
     echo
     echo "===================== [nal-termination/${name}] ====================="
     python "${NAL_TERM}" "${TRAIN_OUT}/${name}" --slice-max-mbs 1 \

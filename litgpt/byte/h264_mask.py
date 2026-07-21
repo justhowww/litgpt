@@ -6,9 +6,9 @@ The recursive-descent parser is used only when a NAL closes (to retain
 SPS/PPS) and once when enough of a VCL slice header has arrived to initialize the
 automaton; it is never run once per candidate byte.
 
-V1 is deliberately residual-first: header fields are decoded to maintain state but
-receive a permissive mask. Strict trie-derived masks apply to CAVLC residual fields
-and chain across all syntax-element boundaries contained in the next byte.
+The default mask covers the complete supported slice-data path: macroblock header,
+prediction, CBP, QP delta, CAVLC residual fields, and rbsp_trailing_bits. A legacy
+``residual_only`` state option is retained solely for paired ablations.
 """
 
 from __future__ import annotations
@@ -49,12 +49,16 @@ class MaskState:
     automaton: "HA.MbAutomaton | None" = None
     automaton_unknown: bool = False
     slice_max_mbs: int = 1
+    residual_only: bool = False
+    fail_closed: bool = True
     debug: bool = field(default_factory=lambda: _DEBUG_DEFAULT)
     debug_stages: bool = field(default_factory=lambda: _DEBUG_STAGES_DEFAULT)
     debug_every_masks: int = 250
     nal_index: int = field(default=0, init=False)
     mask_calls: int = field(default=0, init=False)
     strict_mask_calls: int = field(default=0, init=False)
+    permissive_mask_calls: int = field(default=0, init=False)
+    failure_reason: str | None = field(default=None, init=False)
 
     def last_two_raw(self) -> tuple[int, int] | None:
         if len(self.cur_nal_bytes) < 2:
@@ -113,31 +117,55 @@ def _apply_annexb_mask(
 def get_valid_byte_mask(state: MaskState) -> list[bool]:
     """Return a 256-entry mask for the next emitted byte.
 
-    Unknown/unsupported syntax remains permissive. Definite residual CAVLC
-    incompatibilities and Annex-B violations are rejected.
+    Before the slice header is complete the mask is necessarily permissive. Once a
+    supported slice-data automaton exists, every supported field is constrained.
+    Invalid/unsupported committed slice data fails closed by default instead of
+    silently reverting to unconstrained generation.
     """
     auto = state.automaton
     state.mask_calls += 1
     strict = False
-    if (
+    active = (
         state.cur_is_vcl
         and auto is not None
         and not state.automaton_unknown
         and auto.stage != "done"
-        and auto.ae_tag in _RESIDUAL_TAGS
+    )
+    should_compile = active and (
+        not state.residual_only or auto.ae_tag in _RESIDUAL_TAGS
+    )
+    if should_compile:
+        mask = HA.compile_byte_mask(auto, residual_only=state.residual_only)
+        strict = True
+        state.strict_mask_calls += 1
+    elif state.cur_is_vcl and state.automaton_unknown and state.fail_closed:
+        mask = [False] * 256
+    elif (
+        state.cur_is_vcl
+        and auto is not None
+        and auto.stage == "done"
+        and not state.residual_only
     ):
-        mask = HA.compile_byte_mask(auto, residual_only=True)
+        mask = _nal_boundary_mask(state)
         strict = True
         state.strict_mask_calls += 1
     else:
         mask = [True] * 256
+        state.permissive_mask_calls += 1
 
     boundary = (
         True
         if not state.cur_is_vcl or state.automaton_unknown or auto is None
         else state.at_nal_boundary
     )
-    _apply_annexb_mask(state, mask, at_nal_boundary=boundary)
+    full_boundary = (
+        state.cur_is_vcl
+        and auto is not None
+        and auto.stage == "done"
+        and not state.residual_only
+    )
+    if not full_boundary:
+        _apply_annexb_mask(state, mask, at_nal_boundary=boundary)
     if state.debug and state.mask_calls % state.debug_every_masks == 0:
         _debug(
             state,
@@ -147,6 +175,20 @@ def get_valid_byte_mask(state: MaskState) -> list[bool]:
             syntax=auto.ae_tag if auto is not None else "unknown",
             strict=strict,
         )
+    return mask
+
+
+def _nal_boundary_mask(state: MaskState) -> list[bool]:
+    """Allow only Annex-B zero bytes and the terminating ``00 00 01`` prefix.
+
+    ``rbsp_trailing_bits`` ends on an RBSP byte boundary. Non-zero payload bytes
+    after that point are not part of the completed NAL and must not be accepted as
+    if the automaton still described them.
+    """
+    mask = [False] * 256
+    mask[0x00] = True
+    if state.last_two_raw() == (0x00, 0x00):
+        mask[0x01] = True
     return mask
 
 
@@ -168,6 +210,7 @@ def advance(state: MaskState, byte: int) -> None:
         state.cur_is_vcl = False
         state.automaton = None
         state.automaton_unknown = False
+        state.failure_reason = None
         state.nal_index += 1
         return
 
@@ -193,20 +236,55 @@ def _sync_automaton(state: MaskState) -> None:
             reader = HS.BitReader(rbsp)
             record = HS._Recorder(byte_map, len(rbsp))
             save = reader.pos
-            reader.read_ue()
-            reader.read_ue()
-            pps = state.pps_map.get(reader.read_ue())
+            first_mb = reader.read_ue()
+            slice_type_raw = reader.read_ue()
+            pps_id = reader.read_ue()
             reader.pos = save
+            if slice_type_raw > 9:
+                state.automaton_unknown = True
+                state.failure_reason = f"slice_type_out_of_range:{slice_type_raw}"
+                return
+            pps = state.pps_map.get(pps_id)
             if pps is None:
+                state.automaton_unknown = True
+                state.failure_reason = f"unknown_pps:{pps_id}"
                 return
             sps = state.sps_map.get(pps.sps_id)
             if sps is None:
+                state.automaton_unknown = True
+                state.failure_reason = f"unknown_sps:{pps.sps_id}"
+                return
+            picture_mbs = sps.pic_width_in_mbs * sps.pic_height_in_mbs
+            if first_mb >= picture_mbs:
+                state.automaton_unknown = True
+                state.failure_reason = f"first_mb_out_of_range:{first_mb}/{picture_mbs}"
                 return
             nal = _nal_info(state.cur_nal_bytes)
             header = HS.parse_slice_header(reader, record, nal, sps, pps)
             if header.slice_type not in (HS.SLICE_TYPE_P, HS.SLICE_TYPE_I):
                 state.automaton_unknown = True
+                state.failure_reason = f"unsupported_slice_type:{header.slice_type}"
                 _debug(state, "fallback-permissive", reason=f"slice_type={header.slice_type}")
+                return
+            if (
+                nal.nal_type == HS.NAL_SLICE_IDR
+                and header.slice_type != HS.SLICE_TYPE_I
+            ):
+                state.automaton_unknown = True
+                state.failure_reason = f"idr_non_i_slice:{header.slice_type}"
+                return
+            if not 0 <= header.slice_qp <= 51:
+                state.automaton_unknown = True
+                state.failure_reason = f"slice_qp_out_of_range:{header.slice_qp}"
+                return
+            if (
+                header.slice_type == HS.SLICE_TYPE_P
+                and not 1 <= header.num_ref_idx_l0_active <= 16
+            ):
+                state.automaton_unknown = True
+                state.failure_reason = (
+                    f"active_refs_out_of_range:{header.num_ref_idx_l0_active}"
+                )
                 return
             state.automaton = HA.MbAutomaton(
                 pic_width_in_mbs=sps.pic_width_in_mbs,
@@ -221,6 +299,7 @@ def _sync_automaton(state: MaskState) -> None:
             return
         except (ValueError, KeyError, IndexError, HS._DesyncError, HS._Unsupported) as exc:
             state.automaton_unknown = True
+            state.failure_reason = f"slice_header:{type(exc).__name__}:{exc}"
             _debug(state, "fallback-permissive", reason=f"{type(exc).__name__}: {exc}")
             return
 
@@ -233,9 +312,10 @@ def _sync_automaton(state: MaskState) -> None:
         before = _syntax_name(auto)
         status = auto.consume_bit(bit)
         if status == HA.INVALID:
-            # Conservative fallback: unsupported or already-corrupt prefixes must not
-            # turn into an all-false mask and crash generation.
+            # The next mask call fails closed by default. Keeping the state transition
+            # here (instead of raising) gives rollout a deterministic stop reason.
             state.automaton_unknown = True
+            state.failure_reason = f"automaton_invalid:{auto.ae_tag}@{pos}"
             _debug(
                 state,
                 "fallback-permissive",

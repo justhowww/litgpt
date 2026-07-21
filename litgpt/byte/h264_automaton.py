@@ -11,8 +11,10 @@ compile a 256-byte legal-continuation mask without replaying the NAL prefix.
 Scope: Constrained Baseline, CAVLC, P/I slices (the corpus we generate). It decodes
 the *entire* MB (mb_skip_run -> mb_type -> prediction -> cbp -> mb_qp_delta ->
 residual) because reaching residual with correct nC/cbp context requires consuming
-every prior field. Fields whose legal set is bounded (mb_type, cbp) get pruned for
-free by decoding; genuinely unbounded fields (mvd, mb_qp_delta) accept anything.
+every prior field. Fields whose legal set is bounded (mb_type, sub_mb_type, ref_idx,
+intra_chroma_pred_mode, cbp, and 8-bit mb_qp_delta) are pruned while decoding.
+Motion-vector differences accept every successfully decoded se(v); their derived
+level-dependent range is outside this slice-data automaton.
 I_PCM is handled as raw bytes. B-slices / non-CAVLC are out of scope.
 
 Stdlib-only (imports only ``h264_cavlc_tables``) so tests load it by path.
@@ -46,6 +48,8 @@ _RESIDUAL_TAGS = {
 # P macroblock partition count: mb_type -> num_parts (mirror _P_MB).
 _P_NUM_PARTS = {0: 1, 1: 2, 2: 2, 3: 4, 4: 4}
 _SUB_MB_NUM_PARTS = {0: 1, 1: 2, 2: 2, 3: 4}  # P sub_mb_type -> sub-partitions
+_BASELINE_MB_QP_DELTA_MIN = -26
+_BASELINE_MB_QP_DELTA_MAX = 25
 
 
 class MbAutomaton:
@@ -67,6 +71,13 @@ class MbAutomaton:
         slice_data_start_bit: int,
         max_mbs: int,
     ) -> None:
+        picture_mbs = pic_width_in_mbs * pic_height_in_mbs
+        if pic_width_in_mbs <= 0 or pic_height_in_mbs <= 0:
+            raise ValueError("picture dimensions must be positive")
+        if not 0 <= first_mb_in_slice < picture_mbs:
+            raise ValueError("first_mb_in_slice outside picture")
+        if max_mbs <= 0 or first_mb_in_slice + max_mbs > picture_mbs:
+            raise ValueError("max_mbs exceeds remaining picture macroblocks")
         self.W = pic_width_in_mbs
         self.H = pic_height_in_mbs
         self.is_p = (slice_type % 5) == 0
@@ -237,7 +248,9 @@ class MbAutomaton:
             if self.ae_xmax == 1:
                 return ("done", 1 - int(s[-1]))  # exactly one bit
             r = _try_ue(s)
-            return r
+            if r[0] != "done":
+                return r
+            return ("done", r[1]) if r[1] <= self.ae_xmax else ("invalid",)
         if k == "unary":
             z = s.find("1")
             if z == -1:
@@ -334,6 +347,8 @@ class MbAutomaton:
         if tag == "rem_intra":
             return self._advance_pred_blk()
         if tag == "intra_chroma":
+            if not 0 <= val <= 3:
+                return INVALID
             if self.mb_mode == "I_16x16":
                 _, self.cbp_chroma, self.cbp_luma = self.i16_pred_cbp
                 return self._residual_gate()
@@ -342,7 +357,14 @@ class MbAutomaton:
         if tag == "cbp":
             return self._on_cbp(val)
         if tag == "mb_qp_delta":
+            if not _BASELINE_MB_QP_DELTA_MIN <= val <= _BASELINE_MB_QP_DELTA_MAX:
+                return INVALID
             return self._res_begin()
+        if tag == "pcm_align":
+            if val != 0:
+                return INVALID
+            self._start("u", "pcm", n=(256 + 2 * 64) * 8)
+            return MORE
         if tag == "pcm":
             self._set_mb(self.cur_mbx, self.cur_mby, 16, 16)
             return self._finish_mb()
@@ -365,7 +387,10 @@ class MbAutomaton:
         raise AssertionError(f"bad tag {tag!r}")
 
     def _on_skip_run(self, run):
-        skipped = min(run, self.max_mbs - self.mbs_done)
+        remaining = self.max_mbs - self.mbs_done
+        if run > remaining:
+            return INVALID
+        skipped = run
         for k in range(skipped):
             addr = self.first_mb + self.mbs_done + k
             self._set_mb(addr % self.W, addr // self.W, 0, 0)
@@ -393,7 +418,10 @@ class MbAutomaton:
         if i_mb_type == 25:
             self.mb_mode = "I_PCM"
             align = (8 - self.pos % 8) % 8
-            self._start("u", "pcm", n=align + (256 + 2 * 64) * 8)
+            if align:
+                self._start("u", "pcm_align", n=align)
+            else:
+                self._start("u", "pcm", n=(256 + 2 * 64) * 8)
             return MORE
         if 1 <= i_mb_type <= 24:
             self.mb_mode = "I_16x16"
