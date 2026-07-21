@@ -74,8 +74,10 @@ from litgpt.byte.reconstruction import image_psnr, image_ssim, parse_ppm  # noqa
 from scripts.byte.eval.helpers.checkpoint_eval_helpers import (
     jsonable,
     load_model,
-    save_png,
 )  # noqa: E402
+from scripts.byte.eval.helpers.comparison_video import (  # noqa: E402
+    save_comparison_video,
+)
 
 PSNR_PERFECT_CAP = 100.0
 START_CODE = (0, 0, 1)
@@ -1311,11 +1313,7 @@ def evaluate_teacher_forced(
         # the denominator is the ERROR count, which is ~1e-3 of the occurrence count, so
         # a threshold would empty this dict. Raw counts keep uncertainty visible.
         "syntax_illegal_when_different_by_element": {
-            e: {
-                "illegal_rate": h / t,
-                "illegal_count": h,
-                "different_count": t,
-            }
+            e: {"illegal_rate": h / t, "illegal_count": h, "different_count": t,}
             for e, (h, t) in sorted(elem_illegal_different.items())
             if t > 0
         },
@@ -1561,106 +1559,28 @@ def save_continuation_videos(
         model = item["model_frames"]
         if not gt:
             continue
-        reference = gt[0]
-        missing = torch.zeros_like(reference)
-        missing[..., 0] = 1.0
-        separator = torch.ones(
-            (reference.shape[0], 4, reference.shape[2]), dtype=reference.dtype
-        )
-        panels: list[Tensor] = []
-        for t in range(len(gt)):
-            gt_f = gt[t]
-            model_f = (
-                model[t] if t < len(model) and model[t].shape == gt_f.shape else missing
-            )
-            panels.append(torch.cat((gt_f, separator, model_f), dim=1).clamp(0, 1))
-        h, w = panels[0].shape[0], panels[0].shape[1]
-        pad_h, pad_w = h % 2, w % 2
-        if pad_h or pad_w:
-            panels = [
-                torch.nn.functional.pad(p.permute(2, 0, 1), (0, pad_w, 0, pad_h))
-                .permute(1, 2, 0)
-                .contiguous()
-                for p in panels
-            ]
-        height, width = panels[0].shape[0], panels[0].shape[1]
-        buffer = b"".join(
-            p.mul(255)
-            .round()
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .contiguous()
-            .numpy()
-            .tobytes()
-            for p in panels
-        )
         out_path = frame_dir / f"clip_{clip_idx:04d}_{tag}.mp4"
-        command = [
-            args.ffmpeg_binary,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{width}x{height}",
-            "-r",
-            str(args.viz_fps),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            "mpeg4",
-            "-q:v",
-            "3",
-            "-pix_fmt",
-            "yuv420p",
-            str(out_path),
-        ]
-        try:
-            subprocess.run(
-                command,
-                input=buffer,
-                capture_output=True,
-                check=True,
-                timeout=args.timeout_sec,
-            )
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            FileNotFoundError,
-        ) as exc:
-            print(f"  continuation video failed for clip {clip_idx}: {exc}", flush=True)
-            continue
-        # Still of the first generated frame for a quick thumbnail.
-        save_png(
-            (
-                panels[item["prefix_frames"]]
-                if item["prefix_frames"] < len(panels)
-                else panels[-1]
-            ),
-            frame_dir / f"clip_{clip_idx:04d}_{tag}_firstgen.png",
+        saved = save_comparison_video(
+            reference_frames=gt,
+            result_frames=model,
+            out_path=out_path,
+            ffmpeg_binary=args.ffmpeg_binary,
+            fps=args.viz_fps,
+            timeout_sec=args.timeout_sec,
+            columns=("AR input", "model output"),
+            left_blank_from=item["prefix_frames"],
+            thumbnail_frame=item["prefix_frames"],
+            metadata={
+                "checkpoint": checkpoint_name,
+                "clip_index": clip_idx,
+                "prefix_frames": item["prefix_frames"],
+                "generation_starts_at_frame": item["prefix_frames"],
+                "black_left_tile": "unknown continuation; not given to the model",
+                "h264_path": item["h264_path"],
+            },
         )
-        (frame_dir / f"clip_{clip_idx:04d}_{tag}.json").write_text(
-            json.dumps(
-                {
-                    "checkpoint": checkpoint_name,
-                    "clip_index": clip_idx,
-                    "columns": ["GT", "model"],
-                    "prefix_frames": item["prefix_frames"],
-                    "generation_starts_at_frame": item["prefix_frames"],
-                    "fps": args.viz_fps,
-                    "red_tile": "model frame failed to decode",
-                    "h264_path": item["h264_path"],
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        if not saved:
+            print(f"  continuation video failed for clip {clip_idx}", flush=True)
 
 
 def _write_stream(

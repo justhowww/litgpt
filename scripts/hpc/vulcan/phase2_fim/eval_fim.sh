@@ -18,7 +18,7 @@ set -euo pipefail
 DATA=${DATA:-/fs/nexus-projects/time-control-videogen/OpenVid-1M_Data/data-avclm}
 OUT_DIR=${OUT_DIR:-${DATA}/runs/byte-phase2-fim-1000v-85m}
 CKPT=${CKPT:-step-00006000}
-NUM_CLIPS=${NUM_CLIPS:-100}
+NUM_CLIPS=${NUM_CLIPS:-20}  # Match the existing AR eval.sh by default.
 SEED=${SEED:-42}
 DEVICE=${DEVICE:-cuda}
 PYTHON_BIN=${PYTHON_BIN:-python}
@@ -41,6 +41,8 @@ COMMON=(
     --device "${DEVICE}"
     --max-manifest-rows 1000
     --num-clips "${NUM_CLIPS}"
+    --num-visualizations 8
+    --viz-fps 6
     --seed "${SEED}"
     --max-window-bytes 16384
     --window-min-frames 2
@@ -92,9 +94,9 @@ root = Path(sys.argv[1])
 names = sys.argv[2:]
 
 header = (
-    f"{'variant':<20} {'stop':<12} {'n':>4} {'exact':>8} {'byte_acc':>10} "
-    f"{'len_match':>10} {'eos_stop':>9} {'parse_ok':>9} {'decode_ok':>10} "
-    f"{'eos_blocked':>12}"
+    f"{'variant':<20} {'stop':<12} {'n':>4} {'success':>8} {'frames':>11} "
+    f"{'bytes':>17} {'tf_acc':>9} {'psnr':>8} {'eos_stop':>9} "
+    f"{'desync_top':<18} {'eos_blocked':>12}"
 )
 print(header)
 print("-" * len(header))
@@ -108,16 +110,21 @@ for name in names:
         row = json.loads(line)
         blocked = row.get("mask_eos_blocked_total")
         blocked_text = "-" if blocked is None else str(blocked)
-        decode = row.get("decode_ok_rate")
-        decode_text = "-" if decode is None else f"{decode:.3f}"
+        success = row.get("success_rate")
+        success_text = "-" if success is None else f"{success:.3f}"
+        tf_acc = row.get("tf_byte_acc_mean")
+        tf_text = "-" if tf_acc is None else f"{tf_acc:.4f}"
+        psnr = row.get("cont_psnr_mean")
+        psnr_text = "-" if psnr is None else f"{psnr:.2f}"
+        eos = row.get("eos_stop_rate")
+        eos_text = "-" if eos is None else f"{eos:.3f}"
+        frames = f"{row.get('completed_frames_total', 0)}/{row.get('target_frames_total', 0)}"
+        byte_counts = f"{row.get('completed_bytes_total', 0)}/{row.get('target_bytes_total', 0)}"
         print(
-            f"{name:<20} {row.get('stop_mode', '-'):<12} {row.get('n', 0):>4} "
-            f"{row.get('exact_match_rate', 0):>8.3f} "
-            f"{row.get('byte_acc_mean', 0):>10.4f} "
-            f"{row.get('length_match_rate', 0):>10.3f} "
-            f"{row.get('eos_stop_rate', 0):>9.3f} "
-            f"{row.get('parse_ok_rate', 0):>9.3f} "
-            f"{decode_text:>10} {blocked_text:>12}"
+            f"{name:<20} {row.get('stop_mode', '-'):<12} {row.get('num_clips', 0):>4} "
+            f"{success_text:>8} {frames:>11} {byte_counts:>17} {tf_text:>9} "
+            f"{psnr_text:>8} {eos_text:>9} "
+            f"{str(row.get('desync_region_top') or '-'): <18} {blocked_text:>12}"
         )
 
 print()
