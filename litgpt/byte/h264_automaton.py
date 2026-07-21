@@ -52,6 +52,400 @@ _BASELINE_MB_QP_DELTA_MIN = -26
 _BASELINE_MB_QP_DELTA_MAX = 25
 
 
+class VclAutomaton:
+    """Bit-stepped VCL slice-header wrapper around :class:`MbAutomaton`.
+
+    The old mask instantiated ``MbAutomaton`` only after a complete slice header
+    had already been committed.  This wrapper starts at RBSP bit zero, validates
+    the supported slice-header fields incrementally, and hands the remaining bits
+    to ``MbAutomaton`` without a permissive gap at a byte boundary.
+
+    Scope intentionally matches the phase-2 encoder profile: progressive P/I
+    CAVLC, no reference-list modification, and no adaptive reference marking.
+    ``constraints`` carries cross-NAL expectations derived from the generated
+    prefix (expected macroblock address, frame number, PPS, and picture identity).
+    """
+
+    def __init__(
+        self,
+        *,
+        nal_type: int,
+        nal_ref_idc: int,
+        sps_map: dict,
+        pps_map: dict,
+        constraints: dict,
+        max_mbs: int,
+    ) -> None:
+        if nal_type not in (1, 5):
+            raise ValueError(f"unsupported VCL NAL type {nal_type}")
+        self.nal_type = nal_type
+        self.nal_ref_idc = nal_ref_idc
+        self.sps_map = sps_map
+        self.pps_map = pps_map
+        self.constraints = dict(constraints)
+        self.max_mbs = max_mbs
+        expected_nal_type = self.constraints.get("nal_type")
+        expected_ref_idc = self.constraints.get("nal_ref_idc")
+        if expected_nal_type is not None and nal_type != expected_nal_type:
+            raise ValueError(f"nal_type {nal_type} != expected {expected_nal_type}")
+        if expected_ref_idc is not None and nal_ref_idc != expected_ref_idc:
+            raise ValueError(
+                f"nal_ref_idc {nal_ref_idc} != expected {expected_ref_idc}"
+            )
+        self._pos = 0
+        self._mb = None
+        self._lookahead = False
+        self.header = {}
+        self.invalid_reason = None
+        self.sps = None
+        self.pps = None
+
+        self.ae_kind = None
+        self._ae_tag = None
+        self.ae_bits = ""
+        self.ae_n = 0
+        self._start("ue", "first_mb_in_slice")
+
+    @property
+    def stage(self):
+        return self._mb.stage if self._mb is not None else "header"
+
+    @property
+    def pos(self):
+        return self._mb.pos if self._mb is not None else self._pos
+
+    @property
+    def mbs_done(self):
+        return self._mb.mbs_done if self._mb is not None else 0
+
+    @property
+    def ae_tag(self):
+        return self._mb.ae_tag if self._mb is not None else self._ae_tag
+
+    @property
+    def overlay(self):
+        return self._mb.overlay if self._mb is not None else None
+
+    @overlay.setter
+    def overlay(self, value):
+        self._lookahead = value is not None
+        if self._mb is not None:
+            self._mb.overlay = value
+
+    def __getattr__(self, name):
+        # Debug/reporting code reads the macroblock automaton's detailed state.
+        # Before the header finishes those values have harmless empty defaults.
+        mb = self.__dict__.get("_mb")
+        if mb is not None:
+            return getattr(mb, name)
+        if name in {
+            "res_phase",
+            "mb_mode",
+        }:
+            return ""
+        if name in {
+            "res_blk",
+            "rb_total_coeff",
+            "rb_i",
+            "rb_zeros_left",
+        }:
+            return 0
+        raise AttributeError(name)
+
+    def clone(self):
+        c = VclAutomaton.__new__(VclAutomaton)
+        c.__dict__.update(self.__dict__)
+        c.constraints = dict(self.constraints)
+        c.header = dict(self.header)
+        c._mb = None if self._mb is None else self._mb.clone()
+        return c
+
+    def prepare_lookahead(self):
+        self._lookahead = True
+        if self._mb is not None:
+            self._mb.overlay = (
+                {} if self._mb.overlay is None else dict(self._mb.overlay)
+            )
+
+    def _start(self, kind, tag, *, n=0):
+        self.ae_kind = kind
+        self._ae_tag = tag
+        self.ae_bits = ""
+        self.ae_n = n
+
+    def _feed(self):
+        if self.ae_kind == "u":
+            if len(self.ae_bits) < self.ae_n:
+                return ("more",)
+            return ("done", int(self.ae_bits, 2) if self.ae_bits else 0)
+        if self.ae_kind in ("ue", "se"):
+            result = _try_ue(self.ae_bits)
+            if result[0] != "done":
+                return result
+            value = _se(result[1]) if self.ae_kind == "se" else result[1]
+            return ("done", value)
+        raise AssertionError(f"unsupported slice-header code {self.ae_kind!r}")
+
+    def consume_bit(self, bit: int):
+        if self._mb is not None:
+            return self._mb.consume_bit(bit)
+        self._pos += 1
+        self.ae_bits += "1" if bit else "0"
+        result = self._feed()
+        if result[0] == "more":
+            return MORE
+        if result[0] == "invalid":
+            return INVALID
+        return self._on_done(result[1])
+
+    def _expected(self, name):
+        return self.constraints.get(name)
+
+    def _matches(self, name, value):
+        expected = self._expected(name)
+        return expected is None or value == expected
+
+    def _invalid(self, reason):
+        self.invalid_reason = reason
+        return INVALID
+
+    def _on_done(self, value):
+        tag = self._ae_tag
+        self.header[tag] = value
+
+        if tag == "first_mb_in_slice":
+            if not self._matches(tag, value):
+                return self._invalid(
+                    f"first_mb_in_slice:{value}!={self._expected(tag)}"
+                )
+            self._start("ue", "slice_type_raw")
+            return MORE
+
+        if tag == "slice_type_raw":
+            if value > 9:
+                return self._invalid(f"slice_type_raw_out_of_range:{value}")
+            slice_type = value % 5
+            self.header["slice_type"] = slice_type
+            if slice_type not in (0, 2):
+                return self._invalid(f"unsupported_slice_type:{slice_type}")
+            if self.nal_type == 5 and slice_type != 2:
+                return self._invalid(f"idr_non_i_slice:{slice_type}")
+            if not self._matches("slice_type", slice_type):
+                return self._invalid(
+                    f"slice_type:{slice_type}!={self._expected('slice_type')}"
+                )
+            self._start("ue", "pic_parameter_set_id")
+            return MORE
+
+        if tag == "pic_parameter_set_id":
+            if not self._matches("pic_parameter_set_id", value):
+                return self._invalid(
+                    f"pic_parameter_set_id:{value}!={self._expected('pic_parameter_set_id')}"
+                )
+            self.pps = self.pps_map.get(value)
+            if self.pps is None:
+                return self._invalid(f"unknown_pps:{value}")
+            self.sps = self.sps_map.get(self.pps.sps_id)
+            if self.sps is None:
+                return self._invalid(f"unknown_sps:{self.pps.sps_id}")
+            first_mb = self.header["first_mb_in_slice"]
+            picture_mbs = self.sps.pic_width_in_mbs * self.sps.pic_height_in_mbs
+            if not 0 <= first_mb < picture_mbs:
+                return self._invalid(f"first_mb_out_of_range:{first_mb}/{picture_mbs}")
+            if first_mb + self.max_mbs > picture_mbs:
+                return self._invalid(
+                    f"slice_extent_out_of_range:{first_mb}+{self.max_mbs}/{picture_mbs}"
+                )
+            self._start("u", "frame_num", n=self.sps.log2_max_frame_num)
+            return MORE
+
+        if tag == "frame_num":
+            if not self._matches(tag, value):
+                return self._invalid(f"frame_num:{value}!={self._expected(tag)}")
+            if not self.sps.frame_mbs_only_flag:
+                self._start("u", "field_pic_flag", n=1)
+                return MORE
+            return self._after_field_picture()
+
+        if tag == "field_pic_flag":
+            # The parser and encoder profile are progressive-only.
+            if value != 0:
+                return self._invalid("field_coding_unsupported")
+            return self._after_field_picture()
+
+        if tag == "idr_pic_id":
+            if not self._matches(tag, value):
+                return INVALID
+            return self._begin_poc()
+
+        if tag == "pic_order_cnt_lsb":
+            if not self._matches(tag, value):
+                return INVALID
+            if self.pps.bottom_field_pic_order_in_frame_present_flag:
+                self._start("se", "delta_pic_order_cnt_bottom")
+                return MORE
+            return self._begin_redundant_picture_count()
+
+        if tag == "delta_pic_order_cnt_bottom":
+            if not self._matches(tag, value):
+                return INVALID
+            return self._begin_redundant_picture_count()
+
+        if tag == "delta_pic_order_cnt[0]":
+            if not self._matches(tag, value):
+                return INVALID
+            if self.pps.bottom_field_pic_order_in_frame_present_flag:
+                self._start("se", "delta_pic_order_cnt[1]")
+                return MORE
+            return self._begin_redundant_picture_count()
+
+        if tag == "delta_pic_order_cnt[1]":
+            if not self._matches(tag, value):
+                return INVALID
+            return self._begin_redundant_picture_count()
+
+        if tag == "redundant_pic_cnt":
+            # The pinned PPS never uses redundant slices.  If a future profile
+            # enables them, only the primary representation is supported here.
+            if value != 0:
+                return self._invalid(f"redundant_pic_cnt:{value}")
+            return self._begin_reference_fields()
+
+        if tag == "num_ref_idx_active_override_flag":
+            if value == 0:
+                self.header[
+                    "num_ref_idx_l0_active"
+                ] = self.pps.num_ref_idx_l0_default_active
+                return self._validate_reference_count()
+            self._start("ue", "num_ref_idx_l0_active_minus1")
+            return MORE
+
+        if tag == "num_ref_idx_l0_active_minus1":
+            self.header["num_ref_idx_l0_active"] = value + 1
+            return self._validate_reference_count()
+
+        if tag == "ref_pic_list_modification_flag_l0":
+            # Phase 2 never emits list modification.  Supporting the loop requires
+            # a DPB/list model, so fail closed rather than pretending to track it.
+            if value != 0:
+                return self._invalid("ref_pic_list_modification_unsupported")
+            return self._begin_reference_marking()
+
+        if tag == "no_output_of_prior_pics_flag":
+            self._start("u", "long_term_reference_flag", n=1)
+            return MORE
+
+        if tag == "long_term_reference_flag":
+            return self._begin_slice_qp()
+
+        if tag == "adaptive_ref_pic_marking_mode_flag":
+            if value != 0:
+                return self._invalid("adaptive_ref_pic_marking_unsupported")
+            return self._begin_slice_qp()
+
+        if tag == "slice_qp_delta":
+            slice_qp = self.pps.pic_init_qp + value
+            self.header["slice_qp"] = slice_qp
+            if not 0 <= slice_qp <= 51:
+                return self._invalid(f"slice_qp_out_of_range:{slice_qp}")
+            if self.pps.deblocking_filter_control_present_flag:
+                self._start("ue", "disable_deblocking_filter_idc")
+                return MORE
+            return self._finish_header()
+
+        if tag == "disable_deblocking_filter_idc":
+            if value > 2:
+                return self._invalid(f"deblocking_idc_out_of_range:{value}")
+            if value != 1:
+                self._start("se", "slice_alpha_c0_offset_div2")
+                return MORE
+            return self._finish_header()
+
+        if tag == "slice_alpha_c0_offset_div2":
+            if not -6 <= value <= 6:
+                return self._invalid(f"alpha_offset_out_of_range:{value}")
+            self._start("se", "slice_beta_offset_div2")
+            return MORE
+
+        if tag == "slice_beta_offset_div2":
+            if not -6 <= value <= 6:
+                return self._invalid(f"beta_offset_out_of_range:{value}")
+            return self._finish_header()
+
+        raise AssertionError(f"unknown slice-header tag {tag!r}")
+
+    def _after_field_picture(self):
+        if self.nal_type == 5:
+            self._start("ue", "idr_pic_id")
+            return MORE
+        return self._begin_poc()
+
+    def _begin_poc(self):
+        if self.sps.pic_order_cnt_type == 0:
+            self._start(
+                "u",
+                "pic_order_cnt_lsb",
+                n=self.sps.log2_max_pic_order_cnt_lsb,
+            )
+            return MORE
+        if (
+            self.sps.pic_order_cnt_type == 1
+            and not self.sps.delta_pic_order_always_zero_flag
+        ):
+            self._start("se", "delta_pic_order_cnt[0]")
+            return MORE
+        return self._begin_redundant_picture_count()
+
+    def _begin_redundant_picture_count(self):
+        if self.pps.redundant_pic_cnt_present_flag:
+            self._start("ue", "redundant_pic_cnt")
+            return MORE
+        return self._begin_reference_fields()
+
+    def _begin_reference_fields(self):
+        if self.header["slice_type"] == 0:
+            self._start("u", "num_ref_idx_active_override_flag", n=1)
+            return MORE
+        return self._begin_reference_marking()
+
+    def _validate_reference_count(self):
+        num_ref = self.header["num_ref_idx_l0_active"]
+        if not 1 <= num_ref <= 16:
+            return self._invalid(f"active_refs_out_of_range:{num_ref}")
+        available = self._expected("available_reference_pictures")
+        if available is not None and num_ref > available:
+            return self._invalid(f"active_refs_unavailable:{num_ref}/{available}")
+        self._start("u", "ref_pic_list_modification_flag_l0", n=1)
+        return MORE
+
+    def _begin_reference_marking(self):
+        if self.nal_ref_idc == 0:
+            return self._begin_slice_qp()
+        if self.nal_type == 5:
+            self._start("u", "no_output_of_prior_pics_flag", n=1)
+        else:
+            self._start("u", "adaptive_ref_pic_marking_mode_flag", n=1)
+        return MORE
+
+    def _begin_slice_qp(self):
+        self._start("se", "slice_qp_delta")
+        return MORE
+
+    def _finish_header(self):
+        self._mb = MbAutomaton(
+            pic_width_in_mbs=self.sps.pic_width_in_mbs,
+            pic_height_in_mbs=self.sps.pic_height_in_mbs,
+            slice_type=self.header["slice_type"],
+            num_ref_idx_l0_active=self.header.get("num_ref_idx_l0_active", 1),
+            first_mb_in_slice=self.header["first_mb_in_slice"],
+            slice_data_start_bit=self._pos,
+            max_mbs=self.max_mbs,
+        )
+        if self._lookahead:
+            self._mb.overlay = {}
+        return MORE
+
+
 class MbAutomaton:
     """Bit-stepped decoder for the slice-data (macroblock) portion of one VCL NAL.
 
@@ -675,14 +1069,17 @@ def _se(k: int) -> int:
 
 
 # --- byte-mask compilation --------------------------------------------------
-def compile_byte_mask(auto: MbAutomaton, *, residual_only: bool = False) -> list:
+def compile_byte_mask(auto, *, residual_only: bool = False) -> list:
     """bool[256]: which next emitted byte keeps the RBSP grammar legal, checked by
     chaining through element boundaries within the byte (strict). Caller ANDs Layer-1
     Annex-B on top. Uses a fresh overlay so lookahead nnz writes don't touch the grid.
     """
     mask = [False] * 256
     root = auto.clone()
-    root.overlay = {} if auto.overlay is None else dict(auto.overlay)
+    if hasattr(root, "prepare_lookahead"):
+        root.prepare_lookahead()
+    else:
+        root.overlay = {} if auto.overlay is None else dict(auto.overlay)
 
     def visit(node, depth, prefix):
         for bit in (0, 1):

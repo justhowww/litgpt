@@ -107,6 +107,126 @@ def test_completed_header_with_unknown_pps_fails_closed():
     assert not any(mask_module.get_valid_byte_mask(state))
 
 
+def _phase_parameter_sets(syntax):
+    sps = syntax.SPS(
+        sps_id=0,
+        profile_idc=66,
+        level_idc=10,
+        log2_max_frame_num=4,
+        pic_order_cnt_type=2,
+        log2_max_pic_order_cnt_lsb=0,
+        delta_pic_order_always_zero_flag=0,
+        frame_mbs_only_flag=1,
+        pic_width_in_mbs=16,
+        pic_height_in_mbs=9,
+    )
+    pps = syntax.PPS(
+        pps_id=0,
+        sps_id=0,
+        entropy_coding_mode_flag=0,
+        bottom_field_pic_order_in_frame_present_flag=0,
+        num_ref_idx_l0_default_active=3,
+        num_ref_idx_l1_default_active=1,
+        weighted_pred_flag=0,
+        weighted_bipred_idc=0,
+        pic_init_qp=26,
+        deblocking_filter_control_present_flag=1,
+        constrained_intra_pred_flag=0,
+        redundant_pic_cnt_present_flag=0,
+    )
+    return sps, pps
+
+
+def test_picture_state_constrains_nal_header_and_slice_identity():
+    syntax, _, mask_module, _ = _load_stack()
+    sps, _ = _phase_parameter_sets(syntax)
+    picture = mask_module.PictureState()
+    picture.observe(
+        {
+            "first_mb_in_slice": 0,
+            "slice_type": syntax.SLICE_TYPE_P,
+            "pic_parameter_set_id": 0,
+            "frame_num": 4,
+        },
+        nal_type=syntax.NAL_SLICE_NONIDR,
+        nal_ref_idc=2,
+        sps=sps,
+        max_mbs=1,
+    )
+    state = mask_module.MaskState(picture=picture, expect_nal_header=True)
+    allowed = mask_module.get_valid_byte_mask(state)
+    assert [i for i, ok in enumerate(allowed) if ok] == [0x41]
+
+    constraints = picture.constraints(1, 2, {0: sps}, {})
+    assert constraints["first_mb_in_slice"] == 1
+    assert constraints["frame_num"] == 4
+    assert constraints["pic_parameter_set_id"] == 0
+    assert constraints["slice_type"] == syntax.SLICE_TYPE_P
+
+
+def test_generation_without_prior_picture_starts_with_idr():
+    _, _, mask_module, _ = _load_stack()
+    state = mask_module.MaskState(
+        expect_nal_header=True,
+        generation_started=True,
+    )
+    allowed = mask_module.get_valid_byte_mask(state)
+    assert [i for i, ok in enumerate(allowed) if ok] == [0x65]
+
+
+def test_slice_header_mask_rejects_wrong_first_mb_before_commit():
+    syntax, automaton, _, _ = _load_stack()
+    sps, pps = _phase_parameter_sets(syntax)
+    auto = automaton.VclAutomaton(
+        nal_type=syntax.NAL_SLICE_NONIDR,
+        nal_ref_idc=2,
+        sps_map={0: sps},
+        pps_map={0: pps},
+        constraints={
+            "first_mb_in_slice": 1,
+            "frame_num": 4,
+            "pic_parameter_set_id": 0,
+            "slice_type": syntax.SLICE_TYPE_P,
+            "available_reference_pictures": 3,
+        },
+        max_mbs=1,
+    )
+    allowed = automaton.compile_byte_mask(auto)
+    # ue(0) begins with one, while the required ue(1) begins with 010.  Reject
+    # every byte whose first bit commits the wrong macroblock address.
+    assert not any(allowed[0x80:])
+
+
+def test_picture_state_advances_frame_after_last_macroblock():
+    syntax, _, mask_module, _ = _load_stack()
+    sps, pps = _phase_parameter_sets(syntax)
+    picture = mask_module.PictureState()
+    common = {
+        "slice_type": syntax.SLICE_TYPE_P,
+        "pic_parameter_set_id": 0,
+        "frame_num": 4,
+    }
+    picture.observe(
+        {**common, "first_mb_in_slice": 0},
+        nal_type=1,
+        nal_ref_idc=2,
+        sps=sps,
+        max_mbs=1,
+    )
+    for first_mb in range(1, 144):
+        picture.observe(
+            {**common, "first_mb_in_slice": first_mb},
+            nal_type=1,
+            nal_ref_idc=2,
+            sps=sps,
+            max_mbs=1,
+        )
+    constraints = picture.constraints(1, 2, {0: sps}, {0: pps})
+    assert picture.picture_complete
+    assert constraints["first_mb_in_slice"] == 0
+    assert constraints["frame_num"] == 5
+
+
 def test_annexb_mid_nal_rules():
     _, _, mask_module, _ = _load_stack()
     state = mask_module.MaskState(cur_nal_bytes=bytearray((0, 0)))

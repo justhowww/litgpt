@@ -147,18 +147,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy.")
     parser.add_argument(
-        "--top-k", type=int, default=0,
+        "--top-k",
+        type=int,
+        default=0,
         help="Nucleus/top-k sampling: keep the k highest-prob bytes. AVC-LM uses 50 "
         "(with --temperature 1.0). 0 = off. Greedy (temp 0) degenerates for these AR "
         "byte-LMs; top-k+top-p is the AVC-LM-faithful setting.",
     )
     parser.add_argument(
-        "--top-p", type=float, default=0.0,
+        "--top-p",
+        type=float,
+        default=0.0,
         help="Top-p (nucleus) sampling: smallest byte set with cumulative prob >= p. "
         "AVC-LM uses 0.9 (with --temperature 1.0). 0 = off.",
     )
     parser.add_argument(
-        "--stop-pad-run", type=int, default=0,
+        "--stop-pad-run",
+        type=int,
+        default=0,
         help="Gave-up stop: end free-run when the model emits this many identical bytes "
         "in a row (the padding/rbsp_trailing attractor it falls into without a learned "
         "EOS), trimming the run. 0 = off. Try 32.",
@@ -166,20 +172,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mask-illegal-bytes",
         action="store_true",
-        help="Constrained decoding for supported H.264 slice data plus Annex-B "
-        "framing. Slice headers remain outside the online automaton.",
+        help="Constrained decoding for the supported phase-profile NAL header, "
+        "slice header, slice data, picture progression, and Annex-B framing.",
     )
     parser.add_argument(
         "--mask-residual-only",
         action="store_true",
         help="With --mask-illegal-bytes, reproduce the legacy residual-only, "
-        "fail-open mask for ablation. The default is the full slice-data mask.",
+        "fail-open mask for ablation. The default is the full profile mask.",
     )
     parser.add_argument(
         "--mask-debug",
         action="store_true",
-        help="Print low-volume h264_mask diagnostics: permissive fallbacks and "
-        "periodic mask summaries.",
+        help="Print low-volume h264_mask diagnostics: state failures, legacy "
+        "permissive fallbacks, and periodic mask summaries.",
     )
     parser.add_argument(
         "--mask-debug-stages",
@@ -223,7 +229,9 @@ def main() -> None:
     args = parse_args()
     if args.mask_residual_only and not args.mask_illegal_bytes:
         raise SystemExit("--mask-residual-only requires --mask-illegal-bytes")
-    HM.configure_debug(args.mask_debug or args.mask_debug_stages, stages=args.mask_debug_stages)
+    HM.configure_debug(
+        args.mask_debug or args.mask_debug_stages, stages=args.mask_debug_stages
+    )
     if args.prefix_frames < 1 or args.cont_frames < 1:
         raise SystemExit("--prefix-frames and --cont-frames must be positive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -409,7 +417,9 @@ def select_intra_clips(
         # stopping at the previous VCL slice -- matches _windows_for_video.
         while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
             start -= 1
-        if not any(nals[i].nal_type in PARAMETER_SET_NAL_TYPES for i in range(start, idr)):
+        if not any(
+            nals[i].nal_type in PARAMETER_SET_NAL_TYPES for i in range(start, idr)
+        ):
             continue  # no SPS/PPS before the IDR -> cannot decode the generated frame
         psp = sum(nals[i].end - nals[i].start for i in range(start, idr))
         idr_len = nals[idr].end - nals[idr].start
@@ -454,6 +464,10 @@ def evaluate_checkpoint(
     mask_calls_total = 0
     mask_strict_calls_total = 0
     mask_permissive_calls_total = 0
+    mask_argmax_rejected_total = 0
+    mask_probability_mass_weighted_sum = 0.0
+    mask_probability_mass_count = 0
+    first_mask_intervention_syntaxes: Counter = Counter()
     strict_decode_statuses: Counter = Counter()
     strict_decode_seconds: list[float] = []
     timeout_partial_frames: list[int] = []
@@ -479,7 +493,8 @@ def evaluate_checkpoint(
         # kept only for the parser), so the desync location is unaffected.
         vcl_start = (
             _leading_param_bytes(nals, clip.prefix_end_nal)[0]
-            if args.exclude_param_sets else 0
+            if args.exclude_param_sets
+            else 0
         )
         fed_prefix = _concat_nals(data, nals, vcl_start, clip.prefix_end_nal)
 
@@ -548,6 +563,18 @@ def evaluate_checkpoint(
         mask_permissive_calls_total += int(
             rollout_trace.get("mask_permissive_calls") or 0
         )
+        rejected = int(rollout_trace.get("mask_argmax_rejected") or 0)
+        mask_argmax_rejected_total += rejected
+        mask_calls = int(rollout_trace.get("mask_probability_mass_count") or 0)
+        probability_mass = rollout_trace.get("mask_allowed_probability_mass_mean")
+        if probability_mass is not None and mask_calls:
+            mask_probability_mass_weighted_sum += float(probability_mass) * mask_calls
+            mask_probability_mass_count += mask_calls
+        first_intervention = rollout_trace.get("first_mask_intervention")
+        if first_intervention:
+            first_mask_intervention_syntaxes[
+                first_intervention.get("syntax") or "unknown"
+            ] += 1
         n, m = clip.prefix_frames, clip.cont_frames
 
         # Persist both streams for offline analysis (scripts/byte/eval/analyze_nal_termination.py).
@@ -575,6 +602,15 @@ def evaluate_checkpoint(
             "mask_calls": rollout_trace.get("mask_calls"),
             "mask_strict_calls": rollout_trace.get("mask_strict_calls"),
             "mask_permissive_calls": rollout_trace.get("mask_permissive_calls"),
+            "mask_argmax_rejected": rollout_trace.get("mask_argmax_rejected"),
+            "mask_argmax_rejection_rate": rollout_trace.get(
+                "mask_argmax_rejection_rate"
+            ),
+            "mask_allowed_probability_mass_mean": rollout_trace.get(
+                "mask_allowed_probability_mass_mean"
+            ),
+            "mask_decisions_measured": rollout_trace.get("mask_probability_mass_count"),
+            "first_mask_intervention": rollout_trace.get("first_mask_intervention"),
         }
 
         # Byte-level survival + desync (parse-only, no ffmpeg) -- runs in BOTH modes.
@@ -696,7 +732,8 @@ def evaluate_checkpoint(
         "target_bytes_mean": mean([float(n) for n in target_byte_counts]),
         "target_bytes_median": (
             float(sorted(target_byte_counts)[len(target_byte_counts) // 2])
-            if target_byte_counts else None
+            if target_byte_counts
+            else None
         ),
         "target_bytes_max": (
             float(max(target_byte_counts)) if target_byte_counts else None
@@ -723,6 +760,27 @@ def evaluate_checkpoint(
         ),
         "mask_strict_call_rate": (
             mask_strict_calls_total / mask_calls_total if mask_calls_total else None
+        ),
+        "mask_argmax_rejected_total": (
+            mask_argmax_rejected_total if args.mask_illegal_bytes else None
+        ),
+        "mask_decisions_measured_total": (
+            mask_probability_mass_count if args.mask_illegal_bytes else None
+        ),
+        "mask_argmax_rejection_rate": (
+            mask_argmax_rejected_total / mask_probability_mass_count
+            if mask_probability_mass_count
+            else None
+        ),
+        "mask_allowed_probability_mass_mean": (
+            mask_probability_mass_weighted_sum / mask_probability_mass_count
+            if mask_probability_mass_count
+            else None
+        ),
+        "mask_first_intervention_syntax_hist": (
+            dict(first_mask_intervention_syntaxes.most_common())
+            if args.mask_illegal_bytes
+            else None
         ),
         "strict_decode_status_hist": dict(strict_decode_statuses.most_common()),
         "strict_decode_timeout_count": strict_decode_statuses.get("timeout", 0),
@@ -792,19 +850,23 @@ def _merge_counts(dst: dict[str, list[int]], src: dict[str, list[int]]) -> None:
         acc[1] += tot
 
 
-def _argmax_bit_reader(pred_list: list[int], prefix_len: int, byte_start: int, rbsp_bit0: int):
+def _argmax_bit_reader(
+    pred_list: list[int], prefix_len: int, byte_start: int, rbsp_bit0: int
+):
     """A reader over the model's argmax RBSP bits, addressed by absolute RBSP bit index,
     for a field whose RBSP starts at ``rbsp_bit0`` / raw byte ``byte_start``. Maps RBSP
     bit -> raw byte (byte_start + (bit>>3 - rbsp_bit0>>3), valid when no emulation-
     prevention byte lies in the field, as the caller ensures) -> argmax byte in
     ``pred_list`` (indexed by raw_offset - prefix_len). Returns 0/1 or None past the end.
     """
+
     def bit(b: int):
         raw_off = byte_start + ((b >> 3) - (rbsp_bit0 >> 3))
         k = raw_off - prefix_len
         if 0 <= k < len(pred_list):
             return (pred_list[k] >> (7 - (b & 7))) & 1
         return None
+
     return bit
 
 
@@ -864,7 +926,9 @@ def _vlc_legal(bit, start: int, label: str, max_len: int = 32) -> bool | None:
 def _leading_param_bytes(nals: list[NALUnit], end_nal: int) -> tuple[int, int]:
     """(vcl_start, ps_len): index of the first VCL NAL in [0, end_nal) and the byte length
     of the leading non-VCL NALs (SPS/PPS/SEI) before it. (0, 0) if it starts at a VCL NAL."""
-    vcl_start = next((i for i in range(end_nal) if nals[i].nal_type in VCL_NAL_TYPES), 0)
+    vcl_start = next(
+        (i for i in range(end_nal) if nals[i].nal_type in VCL_NAL_TYPES), 0
+    )
     ps_len = sum(nals[i].end - nals[i].start for i in range(vcl_start))
     return vcl_start, ps_len
 
@@ -963,7 +1027,9 @@ def _value_legal_hits(
         if span.name == "mb_type":
             v = _decode_ue_bits(bit, b0)
             if v is not None and slice_type is not None:
-                hi = 25 if (slice_type % 5 == 2) else 30  # I-slice caps at 25, else P (30)
+                hi = (
+                    25 if (slice_type % 5 == 2) else 30
+                )  # I-slice caps at 25, else P (30)
                 is_legal = 0 <= v <= hi
         elif span.name == "coded_block_pattern":
             v = _decode_ue_bits(bit, b0)
@@ -1000,7 +1066,9 @@ def _value_legal_hits(
         # Advance GT block context AFTER the check above (the check reads the state the
         # parser would be in when it reaches this field).
         if ename.endswith(".coeff_token"):
-            blk_tc = span.value.get("total_coeff") if isinstance(span.value, dict) else None
+            blk_tc = (
+                span.value.get("total_coeff") if isinstance(span.value, dict) else None
+            )
             blk_max = _MAX_COEFF.get(base)
             # total_zeros is only coded when TotalCoeff < max_coeff; otherwise zerosLeft
             # is 0 and no run_before follows.
@@ -1113,7 +1181,9 @@ def evaluate_teacher_forced(
         # training windows. The full window is still parsed below (SPS/PPS kept for the
         # parser); spans are shifted into fed coords. ps_len = leading param-set bytes.
         vcl_start, ps_len = (
-            _leading_param_bytes(nals, clip.cont_end_nal) if args.exclude_param_sets else (0, 0)
+            _leading_param_bytes(nals, clip.cont_end_nal)
+            if args.exclude_param_sets
+            else (0, 0)
         )
         fed_bytes = gt_bytes[ps_len:]
         fed_prefix_len = prefix_len - ps_len

@@ -2,9 +2,9 @@
 
 Layer 1 enforces Annex-B emulation prevention in emitted EBSP byte space. Layer 2
 uses the resumable CAVLC automaton in :mod:`h264_automaton` and its byte masks.
-The recursive-descent parser is used only when a NAL closes (to retain
-SPS/PPS) and once when enough of a VCL slice header has arrived to initialize the
-automaton; it is never run once per candidate byte.
+The recursive-descent parser is used only when a NAL closes to retain SPS/PPS.
+The resumable VCL automaton covers the slice header and slice data without
+re-parsing the prefix once per candidate byte.
 
 The default mask covers the complete supported slice-data path: macroblock header,
 prediction, CBP, QP delta, CAVLC residual fields, and rbsp_trailing_bits. A legacy
@@ -39,6 +39,115 @@ def configure_debug(enabled: bool = True, *, stages: bool = False) -> None:
 
 
 @dataclass
+class PictureState:
+    """Cross-NAL state for the pinned one-macroblock-per-slice profile."""
+
+    active: bool = False
+    picture_complete: bool = False
+    picture_mbs: int | None = None
+    next_first_mb: int | None = None
+    frame_num: int | None = None
+    pps_id: int | None = None
+    slice_type: int | None = None
+    nal_type: int | None = None
+    nal_ref_idc: int | None = None
+    identity: dict[str, int] = field(default_factory=dict)
+    reference_pictures: int = 0
+    last_nonidr_nal_type: int | None = None
+    last_nonidr_ref_idc: int | None = None
+    last_nonidr_slice_type: int | None = None
+
+    def allowed_nal_headers(self) -> list[int]:
+        """Return profile-consistent VCL NAL header bytes for the next slice."""
+        if self.active and not self.picture_complete:
+            return [(self.nal_ref_idc << 5) | self.nal_type]
+        if self.last_nonidr_nal_type is not None:
+            return [(self.last_nonidr_ref_idc << 5) | self.last_nonidr_nal_type]
+        if self.active and self.nal_type == HS.NAL_SLICE_IDR:
+            # The first predictive picture after an IDR is non-IDR.  The prefix
+            # normally teaches ref_idc=2 before free-run begins; permit all legal
+            # reference strengths only for this bootstrap transition.
+            return [(ref_idc << 5) | HS.NAL_SLICE_NONIDR for ref_idc in (1, 2, 3)]
+        # A phase-profile stream begins with a reference IDR picture.
+        return [(3 << 5) | HS.NAL_SLICE_IDR]
+
+    def constraints(
+        self, nal_type: int, nal_ref_idc: int, sps_map: dict, pps_map: dict
+    ) -> dict:
+        same_picture = self.active and not self.picture_complete
+        expected_frame = self.frame_num
+        if self.active and self.picture_complete:
+            # Resolve MaxFrameNum through the active PPS/SPS if still available.
+            # Unknown maps are handled by the header automaton itself.
+            expected_frame = None
+            pps = pps_map.get(self.pps_id)
+            sps = None if pps is None else sps_map.get(pps.sps_id)
+            if sps is not None:
+                expected_frame = (self.frame_num + 1) % (1 << sps.log2_max_frame_num)
+            if nal_type == HS.NAL_SLICE_IDR:
+                expected_frame = 0
+        result = {
+            "nal_type": self.nal_type if same_picture else nal_type,
+            "nal_ref_idc": self.nal_ref_idc if same_picture else nal_ref_idc,
+            "first_mb_in_slice": self.next_first_mb if same_picture else 0,
+            "frame_num": expected_frame,
+            "pic_parameter_set_id": self.pps_id,
+            "slice_type": (
+                self.slice_type
+                if same_picture
+                else (
+                    HS.SLICE_TYPE_I
+                    if nal_type == HS.NAL_SLICE_IDR
+                    else self.last_nonidr_slice_type
+                )
+            ),
+            "available_reference_pictures": self.reference_pictures,
+        }
+        if same_picture:
+            result.update(self.identity)
+        return result
+
+    def observe(
+        self, header: dict, *, nal_type: int, nal_ref_idc: int, sps, max_mbs: int
+    ) -> None:
+        """Commit one completely parsed slice header to picture state."""
+        first_mb = header["first_mb_in_slice"]
+        picture_mbs = sps.pic_width_in_mbs * sps.pic_height_in_mbs
+        new_picture = not self.active or self.picture_complete
+        if new_picture:
+            self.active = True
+            self.picture_complete = False
+            self.picture_mbs = picture_mbs
+            self.frame_num = header["frame_num"]
+            self.pps_id = header["pic_parameter_set_id"]
+            self.slice_type = header["slice_type"]
+            self.nal_type = nal_type
+            self.nal_ref_idc = nal_ref_idc
+            self.identity = {
+                key: header[key]
+                for key in (
+                    "idr_pic_id",
+                    "pic_order_cnt_lsb",
+                    "delta_pic_order_cnt_bottom",
+                    "delta_pic_order_cnt[0]",
+                    "delta_pic_order_cnt[1]",
+                    "no_output_of_prior_pics_flag",
+                    "long_term_reference_flag",
+                )
+                if key in header
+            }
+        self.next_first_mb = first_mb + max_mbs
+        if nal_type == HS.NAL_SLICE_NONIDR:
+            self.last_nonidr_nal_type = nal_type
+            self.last_nonidr_ref_idc = nal_ref_idc
+            self.last_nonidr_slice_type = header["slice_type"]
+        if self.next_first_mb >= picture_mbs:
+            self.picture_complete = True
+            if nal_ref_idc != 0:
+                self.reference_pictures = min(16, self.reference_pictures + 1)
+
+
+@dataclass
 class MaskState:
     """Streaming state for Annex-B framing and one open CAVLC NAL."""
 
@@ -46,8 +155,11 @@ class MaskState:
     pps_map: dict[int, "HS.PPS"] = field(default_factory=dict)
     cur_nal_bytes: bytearray = field(default_factory=bytearray)
     cur_is_vcl: bool = False
-    automaton: "HA.MbAutomaton | None" = None
+    automaton: "HA.MbAutomaton | HA.VclAutomaton | None" = None
     automaton_unknown: bool = False
+    picture: PictureState = field(default_factory=PictureState)
+    expect_nal_header: bool = False
+    generation_started: bool = False
     slice_max_mbs: int = 1
     residual_only: bool = False
     fail_closed: bool = True
@@ -80,9 +192,10 @@ def annexb_forbidden(state: MaskState, *, at_nal_boundary: bool) -> list[int]:
 
 
 def _has_pending_emulation_prevention(state: MaskState) -> bool:
-    return (
-        len(state.cur_nal_bytes) >= 3
-        and tuple(state.cur_nal_bytes[-3:]) == (0x00, 0x00, 0x03)
+    return len(state.cur_nal_bytes) >= 3 and tuple(state.cur_nal_bytes[-3:]) == (
+        0x00,
+        0x00,
+        0x03,
     )
 
 
@@ -117,14 +230,32 @@ def _apply_annexb_mask(
 def get_valid_byte_mask(state: MaskState) -> list[bool]:
     """Return a 256-entry mask for the next emitted byte.
 
-    Before the slice header is complete the mask is necessarily permissive. Once a
-    supported slice-data automaton exists, every supported field is constrained.
-    Invalid/unsupported committed slice data fails closed by default instead of
-    silently reverting to unconstrained generation.
+    In full mode, the NAL header, slice header, and supported slice data are all
+    constrained before commitment. Invalid/unsupported state fails closed instead
+    of silently reverting to unconstrained generation.
     """
     auto = state.automaton
     state.mask_calls += 1
     strict = False
+    if (
+        state.expect_nal_header
+        and not state.residual_only
+        and (state.picture.active or state.generation_started)
+    ):
+        mask = [False] * 256
+        for header in state.picture.allowed_nal_headers():
+            mask[header] = True
+        state.strict_mask_calls += 1
+        if state.debug and state.mask_calls % state.debug_every_masks == 0:
+            _debug(
+                state,
+                "mask-summary",
+                allowed=sum(mask),
+                stage="nal_header",
+                syntax="nal_header",
+                strict=True,
+            )
+        return mask
     active = (
         state.cur_is_vcl
         and auto is not None
@@ -138,6 +269,15 @@ def get_valid_byte_mask(state: MaskState) -> list[bool]:
         mask = HA.compile_byte_mask(auto, residual_only=state.residual_only)
         strict = True
         state.strict_mask_calls += 1
+        if not any(mask) and state.failure_reason is None:
+            state.failure_reason = (
+                f"no_valid_byte:{auto.stage}:{auto.ae_tag}@{auto.pos}"
+            )
+            _debug(
+                state,
+                "mask-state-invalid",
+                reason=state.failure_reason,
+            )
     elif state.cur_is_vcl and state.automaton_unknown and state.fail_closed:
         mask = [False] * 256
     elif (
@@ -201,6 +341,9 @@ def advance(state: MaskState, byte: int) -> None:
     state.cur_nal_bytes.append(byte)
     if was_empty:
         state.cur_is_vcl = (byte & 0x1F) in HS.VCL_NAL_TYPES
+        state.expect_nal_header = False
+        if state.cur_is_vcl and not state.residual_only:
+            _init_vcl_automaton(state)
 
     tail = state.cur_nal_bytes
     if len(tail) >= 3 and tuple(tail[-3:]) == START_CODE:
@@ -210,6 +353,7 @@ def advance(state: MaskState, byte: int) -> None:
         state.cur_is_vcl = False
         state.automaton = None
         state.automaton_unknown = False
+        state.expect_nal_header = True
         state.failure_reason = None
         state.nal_index += 1
         return
@@ -230,6 +374,11 @@ def _sync_automaton(state: MaskState) -> None:
     rbsp, byte_map, _ = HS.unescape_rbsp(bytes(state.cur_nal_bytes), 1, payload_end)
     if not byte_map:
         return
+
+    if state.automaton is None and not state.residual_only:
+        _init_vcl_automaton(state)
+        if state.automaton_unknown:
+            return
 
     if state.automaton is None:
         try:
@@ -264,7 +413,11 @@ def _sync_automaton(state: MaskState) -> None:
             if header.slice_type not in (HS.SLICE_TYPE_P, HS.SLICE_TYPE_I):
                 state.automaton_unknown = True
                 state.failure_reason = f"unsupported_slice_type:{header.slice_type}"
-                _debug(state, "fallback-permissive", reason=f"slice_type={header.slice_type}")
+                _debug(
+                    state,
+                    "fallback-permissive",
+                    reason=f"slice_type={header.slice_type}",
+                )
                 return
             if (
                 nal.nal_type == HS.NAL_SLICE_IDR
@@ -297,7 +450,13 @@ def _sync_automaton(state: MaskState) -> None:
             )
         except HS.BitReaderError:
             return
-        except (ValueError, KeyError, IndexError, HS._DesyncError, HS._Unsupported) as exc:
+        except (
+            ValueError,
+            KeyError,
+            IndexError,
+            HS._DesyncError,
+            HS._Unsupported,
+        ) as exc:
             state.automaton_unknown = True
             state.failure_reason = f"slice_header:{type(exc).__name__}:{exc}"
             _debug(state, "fallback-permissive", reason=f"{type(exc).__name__}: {exc}")
@@ -316,10 +475,13 @@ def _sync_automaton(state: MaskState) -> None:
             # here (instead of raising) gives rollout a deterministic stop reason.
             state.automaton_unknown = True
             state.failure_reason = f"automaton_invalid:{auto.ae_tag}@{pos}"
+            invalid_reason = getattr(auto, "invalid_reason", None)
+            if invalid_reason:
+                state.failure_reason = invalid_reason
             _debug(
                 state,
-                "fallback-permissive",
-                reason="automaton-invalid",
+                "mask-state-invalid" if state.fail_closed else "fallback-permissive",
+                reason=state.failure_reason,
                 rbsp_bit=pos,
                 syntax=auto.ae_tag,
             )
@@ -353,7 +515,9 @@ def _debug(state: MaskState, event: str, **fields: object) -> None:
     print(f"[h264-mask] nal={state.nal_index} event={event}{suffix}", flush=True)
 
 
-def _syntax_name(auto: "HA.MbAutomaton") -> str:
+def _syntax_name(auto) -> str:
+    if auto.stage == "header":
+        return f"slice_header.{auto.ae_tag}"
     if auto.stage == "trailing":
         return "rbsp_trailing_bits"
     if auto.stage == "done":
@@ -392,6 +556,31 @@ def _nal_info(payload: bytes | bytearray) -> "HS.NALInfo":
     )
 
 
+def _init_vcl_automaton(state: MaskState) -> None:
+    if not state.cur_nal_bytes:
+        return
+    nal = _nal_info(state.cur_nal_bytes)
+    try:
+        state.automaton = HA.VclAutomaton(
+            nal_type=nal.nal_type,
+            nal_ref_idc=nal.ref_idc,
+            sps_map=state.sps_map,
+            pps_map=state.pps_map,
+            constraints=state.picture.constraints(
+                nal.nal_type, nal.ref_idc, state.sps_map, state.pps_map
+            ),
+            max_mbs=state.slice_max_mbs,
+        )
+    except ValueError as exc:
+        state.automaton_unknown = True
+        state.failure_reason = f"vcl_header:{exc}"
+        _debug(
+            state,
+            "mask-state-invalid" if state.fail_closed else "fallback-permissive",
+            reason=state.failure_reason,
+        )
+
+
 def _close_nal(state: MaskState, nal_payload: bytes) -> None:
     """Parse a closed NAL once so newly defined SPS/PPS remain available."""
     if not nal_payload:
@@ -400,9 +589,29 @@ def _close_nal(state: MaskState, nal_payload: bytes) -> None:
     nals = HS.iter_nals(buf)
     if not nals:
         return
+    auto = state.automaton
+    if (
+        isinstance(auto, HA.VclAutomaton)
+        and auto.stage == "done"
+        and auto.sps is not None
+    ):
+        state.picture.observe(
+            auto.header,
+            nal_type=nals[0].nal_type,
+            nal_ref_idc=nals[0].ref_idc,
+            sps=auto.sps,
+            max_mbs=state.slice_max_mbs,
+        )
     try:
         HS.parse_nal(buf, nals[0], state.sps_map, state.pps_map, parse_slice_data=False)
-    except (ValueError, KeyError, IndexError, HS.BitReaderError, HS._DesyncError, HS._Unsupported):
+    except (
+        ValueError,
+        KeyError,
+        IndexError,
+        HS.BitReaderError,
+        HS._DesyncError,
+        HS._Unsupported,
+    ):
         # Generated non-parameter NALs can be incomplete or unsupported. Parameter
         # maps already populated by earlier valid NALs remain usable.
         return
