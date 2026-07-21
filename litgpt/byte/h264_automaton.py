@@ -25,6 +25,8 @@ Mirrors, bit-for-bit: ``_residual_block`` / ``_parse_residual`` / ``_parse_macro
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 try:  # package import (full env) vs flat import (stdlib-only tests)
     from . import h264_cavlc_tables as T
 except ImportError:  # pragma: no cover
@@ -50,6 +52,46 @@ _P_NUM_PARTS = {0: 1, 1: 2, 2: 2, 3: 4, 4: 4}
 _SUB_MB_NUM_PARTS = {0: 1, 1: 2, 2: 2, 3: 4}  # P sub_mb_type -> sub-partitions
 _BASELINE_MB_QP_DELTA_MIN = -26
 _BASELINE_MB_QP_DELTA_MAX = 25
+
+
+def _ue_bits(value: int) -> str:
+    if value < 0:
+        raise ValueError("ue(v) cannot encode a negative value")
+    payload = f"{value + 1:b}"
+    return "0" * (len(payload) - 1) + payload
+
+
+def _se_code_num(value: int) -> int:
+    if value == 0:
+        return 0
+    return 2 * value - 1 if value > 0 else -2 * value
+
+
+@lru_cache(maxsize=None)
+def _valid_element_prefixes(kind: str, n: int, values: tuple[int, ...]):
+    """All non-empty bit prefixes that can still finish as an allowed value."""
+    codes = []
+    for value in values:
+        if kind == "ue":
+            code = _ue_bits(value)
+        elif kind == "se":
+            code = _ue_bits(_se_code_num(value))
+        elif kind == "u":
+            if not 0 <= value < (1 << n):
+                raise ValueError(f"u({n}) cannot encode {value}")
+            code = f"{value:0{n}b}"
+        elif kind == "te":
+            code = str(1 - value) if n == 1 else _ue_bits(value)
+        else:
+            raise ValueError(f"prefix pruning unsupported for {kind!r}")
+        codes.append(code)
+    return frozenset(code[:i] for code in codes for i in range(1, len(code) + 1))
+
+
+def _prefixes(kind: str, *, n: int = 0, values=None):
+    if values is None:
+        return None
+    return _valid_element_prefixes(kind, n, tuple(sorted(set(values))))
 
 
 class VclAutomaton:
@@ -104,6 +146,7 @@ class VclAutomaton:
         self._ae_tag = None
         self.ae_bits = ""
         self.ae_n = 0
+        self.ae_prefixes = None
         self._start("ue", "first_mb_in_slice")
 
     @property
@@ -172,8 +215,48 @@ class VclAutomaton:
         self._ae_tag = tag
         self.ae_bits = ""
         self.ae_n = n
+        self.ae_prefixes = _prefixes(
+            kind,
+            n=n,
+            values=self._allowed_header_values(kind, tag, n),
+        )
+
+    def _allowed_header_values(self, kind, tag, n):
+        expected = self._expected(tag)
+        if tag == "slice_type_raw":
+            slice_type = self._expected("slice_type")
+            return None if slice_type is None else (slice_type, slice_type + 5)
+        if tag == "pic_parameter_set_id":
+            known_pps_ids = tuple(self.pps_map)
+            if expected is not None:
+                return (expected,)
+            return known_pps_ids or None
+        if expected is not None:
+            return (expected,)
+        if tag == "field_pic_flag":
+            return (0,)
+        if tag == "redundant_pic_cnt":
+            return (0,)
+        if tag == "num_ref_idx_l0_active_minus1":
+            available = self._expected("available_reference_pictures")
+            upper = 15 if available is None else min(15, available - 1)
+            return range(upper + 1)
+        if tag in (
+            "ref_pic_list_modification_flag_l0",
+            "adaptive_ref_pic_marking_mode_flag",
+        ):
+            return (0,)
+        if tag == "slice_qp_delta" and self.pps is not None:
+            return range(-self.pps.pic_init_qp, 52 - self.pps.pic_init_qp)
+        if tag == "disable_deblocking_filter_idc":
+            return (0, 1, 2)
+        if tag in ("slice_alpha_c0_offset_div2", "slice_beta_offset_div2"):
+            return range(-6, 7)
+        return None
 
     def _feed(self):
+        if self.ae_prefixes is not None and self.ae_bits not in self.ae_prefixes:
+            return ("invalid",)
         if self.ae_kind == "u":
             if len(self.ae_bits) < self.ae_n:
                 return ("more",)
@@ -500,6 +583,7 @@ class MbAutomaton:
         self.ae_n = 0
         self.ae_label = ""
         self.ae_xmax = 0
+        self.ae_prefixes = None
 
         # Per-MB context.
         self.cur_mbx = 0
@@ -622,12 +706,38 @@ class MbAutomaton:
         self.ae_n = n
         self.ae_label = label
         self.ae_xmax = xmax
+        self.ae_prefixes = _prefixes(
+            kind,
+            n=xmax if kind == "te" else n,
+            values=self._allowed_element_values(kind, tag, xmax),
+        )
+
+    def _allowed_element_values(self, kind, tag, xmax):
+        if tag == "mb_skip_run":
+            return range(self.max_mbs - self.mbs_done + 1)
+        if tag == "mb_type":
+            return range(31 if self.is_p else 26)
+        if tag == "sub_mb_type":
+            return _SUB_MB_NUM_PARTS.keys()
+        if tag == "intra_chroma":
+            return range(4)
+        if tag == "cbp":
+            return range(48)
+        if tag == "mb_qp_delta":
+            return range(_BASELINE_MB_QP_DELTA_MIN, _BASELINE_MB_QP_DELTA_MAX + 1)
+        if tag == "pcm_align":
+            return (0,)
+        if kind == "te":
+            return range(xmax + 1)
+        return None
 
     def _feed(self):
         """Feed self.ae_bits to the active element. Returns ('more',)/('done',v)/
         ('invalid',)."""
         s = self.ae_bits  # string of bits (0/1) for the active element
         k = self.ae_kind  # "u"|"ue"|"se"|"te"|"unary"|"vlc"
+        if self.ae_prefixes is not None and s not in self.ae_prefixes:
+            return ("invalid",)
         if k == "u":
             if len(s) < self.ae_n:
                 return ("more",)

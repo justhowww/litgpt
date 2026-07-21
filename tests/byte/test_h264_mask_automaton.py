@@ -197,6 +197,52 @@ def test_slice_header_mask_rejects_wrong_first_mb_before_commit():
     assert not any(allowed[0x80:])
 
 
+def test_slice_header_mask_prunes_impossible_partial_first_mb_prefixes():
+    syntax, automaton, _, _ = _load_stack()
+    sps, pps = _phase_parameter_sets(syntax)
+
+    def allowed_for(first_mb):
+        auto = automaton.VclAutomaton(
+            nal_type=syntax.NAL_SLICE_NONIDR,
+            nal_ref_idc=2,
+            sps_map={0: sps},
+            pps_map={0: pps},
+            constraints={
+                "first_mb_in_slice": first_mb,
+                "frame_num": 4,
+                "pic_parameter_set_id": 0,
+                "slice_type": syntax.SLICE_TYPE_P,
+                "available_reference_pictures": 3,
+            },
+            max_mbs=1,
+        )
+        return automaton.compile_byte_mask(auto)
+
+    # These bytes caused the previous mask to get boxed in one byte later.  Each
+    # byte is already incompatible with the required ue(v) codeword prefix.
+    assert not allowed_for(7)[0x0A]
+    assert not allowed_for(140)[0x03]
+    assert not allowed_for(125)[0x01]
+
+
+def test_macroblock_mask_prunes_impossible_partial_cbp_prefix():
+    syntax, automaton, _, _ = _load_stack()
+    auto = automaton.MbAutomaton(
+        pic_width_in_mbs=16,
+        pic_height_in_mbs=9,
+        slice_type=syntax.SLICE_TYPE_P,
+        num_ref_idx_l0_active=3,
+        first_mb_in_slice=0,
+        slice_data_start_bit=0,
+        max_mbs=1,
+    )
+    auto._start("ue", "cbp")
+    allowed = automaton.compile_byte_mask(auto)
+    # cbp is bounded to 0..47, whose longest ue(v) codeword has five leading
+    # zeroes.  Eight zero bits cannot be completed into a valid cbp.
+    assert not allowed[0x00]
+
+
 def test_picture_state_advances_frame_after_last_macroblock():
     syntax, _, mask_module, _ = _load_stack()
     sps, pps = _phase_parameter_sets(syntax)
