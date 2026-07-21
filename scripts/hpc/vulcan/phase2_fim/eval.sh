@@ -55,7 +55,7 @@ run() {  # name  out_root  extra-sampling-args...
 }
 
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
-# run greedy        "${TRAIN_OUT}" --temperature 0.0
+run greedy        "${TRAIN_OUT}" --temperature 0.0
 # run greedy_residual_masked "${TRAIN_OUT}" \
 #     --temperature 0.0 --mask-illegal-bytes --mask-residual-only --mask-debug
 run greedy_full_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --mask-debug
