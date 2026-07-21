@@ -13,6 +13,7 @@ prediction, CBP, QP delta, CAVLC residual fields, and rbsp_trailing_bits. A lega
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 from litgpt.byte import h264_automaton as HA
@@ -316,6 +317,41 @@ def get_valid_byte_mask(state: MaskState) -> list[bool]:
             strict=strict,
         )
     return mask
+
+
+def can_append_bytes(
+    state: MaskState,
+    data: bytes | bytearray,
+    *,
+    require_complete: bool = False,
+) -> bool:
+    """Return whether ``data`` can legally continue ``state`` without mutating it.
+
+    FIM generation needs this to decide whether EOS is legal: the generated middle
+    may stop only when the fixed orphan/suffix can be consumed from the resulting
+    parser state.  Copying the state is intentional--probing EOS must not commit the
+    suffix to the live generation state.
+
+    ``require_complete`` additionally rejects a suffix that ends in an unfinished
+    VCL NAL or a dangling start code.  This is the mode used by the FIM evaluator at
+    the end of the repaired frame.
+    """
+    probe = deepcopy(state)
+    for byte in data:
+        allowed = get_valid_byte_mask(probe)
+        if not allowed[byte]:
+            return False
+        advance(probe, byte)
+        if probe.automaton_unknown:
+            return False
+
+    if not require_complete:
+        return True
+    if probe.automaton_unknown or probe.expect_nal_header:
+        return False
+    if probe.cur_is_vcl:
+        return probe.automaton is not None and probe.automaton.stage == "done"
+    return True
 
 
 def _nal_boundary_mask(state: MaskState) -> list[bool]:

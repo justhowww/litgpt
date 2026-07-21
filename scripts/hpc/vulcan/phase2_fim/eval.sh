@@ -12,9 +12,9 @@
 # train_split.json's video list is ~all 1000 videos, so --train-split-file gives a
 # "did we train on these videos" filter, NOT a leakage-free held-out set).
 #
-# NOT covered here: FIM reconstruction. The probe is slice-only (reconstruction.py
-# reads sample.target_index), and on this per-MB corpus a repair number would not be a
-# task result anyway -- val_loss_fim from training is the FIM signal. See train.sh.
+# FIM reconstruction is evaluated separately by eval_fim.sh.  Keep this file focused
+# on the phase-1-matched AR comparison so changes to the FIM probe cannot drift its
+# sampling or clip selection.
 set -euo pipefail
 
 DATA=/fs/nexus-projects/time-control-videogen/OpenVid-1M_Data/data-avclm

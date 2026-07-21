@@ -341,6 +341,40 @@ def test_completed_vcl_nal_only_allows_annexb_boundary_bytes():
     assert [i for i, ok in enumerate(allowed) if ok] == [0x00, 0x01]
 
 
+def test_can_append_bytes_is_non_mutating_and_checks_completion():
+    _, automaton, mask_module, _ = _load_stack()
+
+    def state(stage):
+        auto = automaton.MbAutomaton(
+            pic_width_in_mbs=1,
+            pic_height_in_mbs=1,
+            slice_type=0,
+            num_ref_idx_l0_active=1,
+            first_mb_in_slice=0,
+            slice_data_start_bit=0,
+            max_mbs=1,
+        )
+        auto.stage = stage
+        return mask_module.MaskState(
+            cur_nal_bytes=bytearray((0x61, 0x80)),
+            cur_is_vcl=True,
+            automaton=auto,
+        )
+
+    complete = state("done")
+    assert mask_module.can_append_bytes(complete, b"", require_complete=True)
+    assert mask_module.can_append_bytes(complete, b"\x00\x00\x01")
+    assert not mask_module.can_append_bytes(
+        complete, b"\x00\x00\x01", require_complete=True
+    )  # dangling next-NAL start code
+    assert not mask_module.can_append_bytes(complete, b"\x12")
+    assert complete.mask_calls == 0
+    assert complete.cur_nal_bytes == bytearray((0x61, 0x80))
+
+    incomplete = state("slice")
+    assert not mask_module.can_append_bytes(incomplete, b"", require_complete=True)
+
+
 def test_default_wrapper_masks_header_but_legacy_residual_mode_does_not():
     syntax, automaton, mask_module, _ = _load_stack()
 
