@@ -46,6 +46,9 @@ COMMON_TRAIN=(
 run() {  # name  out_root  extra-sampling-args...
     local name="$1" out_root="$2"; shift 2
     local dir="${out_root}/${name}"
+    # Start clean: metrics.jsonl is append-only while config.json/summary.csv are
+    # overwritten, so re-running into a populated dir interleaves two runs' rows and
+    # destroys the record of which config produced them.
     if [[ -d "${dir}" ]]; then
         echo "[clean] removing previous ${dir}"
         rm -rf "${dir}"
@@ -56,11 +59,13 @@ run() {  # name  out_root  extra-sampling-args...
 
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
 run greedy        "${TRAIN_OUT}" --temperature 0.0
-run greedy_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --mask-debug
+# run greedy_residual_masked "${TRAIN_OUT}" \
+#     --temperature 0.0 --mask-illegal-bytes --mask-residual-only --mask-debug
+run greedy_full_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --mask-debug
 
 echo
 echo "===================== train sweep summary ====================="
-python3 - "${TRAIN_OUT}" greedy greedy_masked <<'PY'
+python3 - "${TRAIN_OUT}" greedy greedy_residual_masked greedy_full_masked <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -108,9 +113,10 @@ for name in names:
             f"cbp={elements.get('coded_block_pattern')}"
         )
 print()
-print("Phase 1 @ step-00031000 for reference (260716 - Eval with syntax validation mask):")
-print("  greedy         full_cont=0.750  tf_byte_acc=0.99978")
-print("  greedy_masked  full_cont=1.000  tf_byte_acc=0.99978")
+print("Historical phase 1 @ step-00031000 (the old residual-only mask):")
+print("  greedy                   full_cont=0.750  tf_byte_acc=0.99978")
+print("  greedy_residual_masked   full_cont=1.000  tf_byte_acc=0.99978")
+print("Read greedy_full_masked as the current constrained-decoding result.")
 print()
 print("Phase 1's val/train gap on residual coding (260712 - phase 1 result.md), the")
 print("thing 45k videos is meant to fix -- compare element_correct for coeff_token/CBP")
@@ -119,8 +125,11 @@ print("  coeff_token: train 0.9916 -> val 0.7609")
 print("  CBP:         train 0.9896 -> val 0.9185")
 PY
 
+# Per-NAL termination diagnostics. Runs AFTER the summary and cannot abort it: under
+# `set -e` a non-zero exit here would otherwise kill the script before the headline
+# ever printed. A diagnostic must never suppress the result it explains.
 NAL_TERM=scripts/byte/eval/analyze_nal_termination.py
-for name in greedy greedy_masked; do
+for name in greedy greedy_residual_masked greedy_full_masked; do
     echo
     echo "===================== [nal-termination/${name}] ====================="
     python "${NAL_TERM}" "${TRAIN_OUT}/${name}" --slice-max-mbs 1 \
