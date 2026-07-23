@@ -3,7 +3,7 @@
 #SBATCH --partition=vulcan-ampere
 #SBATCH --qos=vulcan-medium
 #SBATCH --account=vulcan-metzler
-#SBATCH --time=14:00:00
+#SBATCH --time=4:00:00
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --cpus-per-task=4
