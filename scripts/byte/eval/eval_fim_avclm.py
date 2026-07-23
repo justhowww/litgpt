@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -236,14 +237,54 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _load_train_split(path: Path) -> tuple[set[tuple[str, int, int]], set[str]]:
+def _load_train_split(
+    path: Path,
+) -> tuple[
+    set[tuple[str, int, int]],
+    set[str],
+    dict[tuple[str, int, int], dict[str, Any]],
+]:
     split = json.loads(path.read_text(encoding="utf-8"))
     windows = {
         (str(Path(w["h264_path"])), int(w["start_nal"]), int(w["end_nal"]))
         for w in split.get("windows", [])
     }
     videos = {str(Path(v)) for v in split.get("videos", [])}
-    return windows, videos
+    fixed_holes = {
+        (
+            str(Path(h["h264_path"])),
+            int(h["start_nal"]),
+            int(h["end_nal"]),
+        ): h
+        for h in split.get("fixed_fim_holes", [])
+    }
+    return windows, videos, fixed_holes
+
+
+def _verify_fixed_hole_replay(
+    expected: dict[str, Any],
+    meta: dict[str, Any],
+    target_ids: list[int],
+    window_key: tuple[str, int, int],
+) -> None:
+    actual = {
+        "frame_lo": int(meta["frame_lo"]),
+        "frame_hi": int(meta["frame_hi"]),
+        "fim_split": int(meta["fim_split"]),
+        "fim_gap": int(meta["fim_gap"]),
+        "target_length": len(target_ids),
+        "target_sha256": hashlib.sha256(bytes(target_ids)).hexdigest(),
+    }
+    mismatches = {
+        key: (expected.get(key), value)
+        for key, value in actual.items()
+        if expected.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"Fixed-hole replay mismatch for {window_key}: {mismatches}. "
+            "Use the same manifest, seed, window, and FIM settings as training."
+        )
 
 
 def _split_indices(
@@ -307,8 +348,11 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         seed=args.seed,
     )
 
+    fixed_holes: dict[tuple[str, int, int], dict[str, Any]] = {}
     if args.train_split_file is not None:
-        train_windows, train_videos = _load_train_split(args.train_split_file)
+        train_windows, train_videos, fixed_holes = _load_train_split(
+            args.train_split_file
+        )
         if train_windows:
             indices = [
                 i
@@ -338,6 +382,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         )
 
     selected: list[WindowFimSample] = []
+    verified_fixed_holes = 0
     for idx in indices:
         item = dataset[idx]
         if item["sample_meta"].get("task") != "fim":
@@ -357,6 +402,20 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         first_supervised = int(supervised.nonzero()[0])
         prompt_end = first_supervised + 1
         meta = item["sample_meta"]
+        window_key = (
+            str(Path(meta["h264_path"])),
+            int(meta["start_nal"]),
+            int(meta["end_nal"]),
+        )
+        if fixed_holes:
+            expected = fixed_holes.get(window_key)
+            if expected is None:
+                raise RuntimeError(
+                    "Fixed-hole replay mismatch: selected train window has no "
+                    f"recorded hole: {window_key}"
+                )
+            _verify_fixed_hole_replay(expected, meta, target_ids, window_key)
+            verified_fixed_holes += 1
         window_bytes = bytes(dataset.ar_item(idx)["labels"].tolist())
         selected.append(
             WindowFimSample(
@@ -386,6 +445,14 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         raise RuntimeError(
             "No FIM samples selected. Lower gap/guard constraints or check that window-FIM is reachable."
         )
+    if fixed_holes:
+        print(
+            f"Exact fixed training holes verified: "
+            f"{verified_fixed_holes}/{len(selected)}",
+            flush=True,
+        )
+    args.exact_training_holes_verified = verified_fixed_holes
+    args.fixed_training_holes_available = len(fixed_holes)
     print(f"Selected {len(selected)} FIM AVC-LM samples", flush=True)
     return selected
 
@@ -1422,6 +1489,12 @@ def main() -> None:
                 "checkpoint_dir": str(checkpoint_dir),
                 "mode": "fim_avclm",
                 "stop_mode": stop_mode,
+                "exact_training_holes_verified": int(
+                    getattr(args, "exact_training_holes_verified", 0)
+                ),
+                "fixed_training_holes_available": int(
+                    getattr(args, "fixed_training_holes_available", 0)
+                ),
                 **summarize(
                     valid_rows,
                     stop_mode=stop_mode,

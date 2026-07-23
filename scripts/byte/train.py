@@ -153,6 +153,15 @@ def parse_args() -> argparse.Namespace:
         help="Minimum VCL frames per stream window (dataset-mode=window).",
     )
     parser.add_argument("--p-fim", type=float, default=0.0)
+    parser.add_argument(
+        "--fixed-fim-holes",
+        action="store_true",
+        help=(
+            "Debug overfit mode for window FIM: select one deterministic hole per "
+            "training window instead of redrawing it on every access. Requires "
+            "--dataset-mode window and --p-fim 1.0."
+        ),
+    )
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="bridge")
     parser.add_argument(
         "--use-eos",
@@ -290,6 +299,12 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
     if args.ce_byte_only and args.use_eos:
         raise ValueError("--ce-byte-only cannot train supervised EOS targets")
+    if args.fixed_fim_holes and (
+        args.dataset_mode != "window" or args.p_fim != 1.0
+    ):
+        raise ValueError(
+            "--fixed-fim-holes requires --dataset-mode window and --p-fim 1.0"
+        )
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
     if (
@@ -352,6 +367,7 @@ def main() -> None:
     )
     data_config = ByteDataConfig(
         p_fim=args.p_fim,
+        fixed_fim_holes=args.fixed_fim_holes,
         fim_format=args.fim_format,
         use_eos=args.use_eos,
         num_ref_slices=args.num_ref_slices,

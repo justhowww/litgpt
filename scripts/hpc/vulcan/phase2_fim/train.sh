@@ -61,6 +61,7 @@ SPLIT_BY_VIDEO=${SPLIT_BY_VIDEO:-0}
 # P_FIM is the per-sample probability of an infill sample; the rest stay AR, so the
 # run trains both modes over the same windows. P_FIM=0 reproduces phase 1 exactly.
 P_FIM=${P_FIM:-0.5}
+FIXED_FIM_HOLES=${FIXED_FIM_HOLES:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
 # On by default: train a terminator (SEQ_EOS after f_middle) rather than relying on
 # an oracle-supplied span length, which is a training-time convenience a real
@@ -137,6 +138,9 @@ fi
 if [[ "${USE_EOS}" == "1" ]]; then
     cmd+=(--use-eos)
 fi
+if [[ "${FIXED_FIM_HOLES}" == "1" ]]; then
+    cmd+=(--fixed-fim-holes)
+fi
 # NO_ENCODING is not optional here: train.py rejects window FIM with offset ids on,
 # because a hole spanning ~100 NALs has no single within-NAL offset to encode.
 # Phase 1 runs NO_ENCODING=1 anyway (AVC-LM-faithful), so this also keeps the arms
@@ -164,7 +168,7 @@ if [[ "${COMPILE}" == "1" ]]; then
 fi
 
 echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP}"
-echo "[phase2-fim] p_fim=${P_FIM} fim_format=${FIM_FORMAT} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
+echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fim_format=${FIM_FORMAT} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
 
 flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2

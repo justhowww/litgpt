@@ -11,6 +11,7 @@ unit used by the byte model.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -80,6 +81,10 @@ class ByteDataConfig:
     """Hyperparameters controlling byte-domain sample construction."""
 
     p_fim: float = 0.0  # Probability of FIM sample; otherwise sample is AR.
+    # Debug-only overfit mode. Normal training redraws a window-FIM hole on every
+    # access. When true, seed+dataset-index selects one stable hole per train window
+    # so the exact same examples can be replayed by the evaluator.
+    fixed_fim_holes: bool = False
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -1577,7 +1582,9 @@ class ByteDataModule(DataModule):
             self.val_dataset = _build_dataset(val_rows)
             # Separate instances here, so train resamples and val simply does not.
             if isinstance(self.train_dataset, ByteStreamWindowDataset):
-                self.train_dataset.resample_fim = self.config.p_fim > 0
+                self.train_dataset.resample_fim = (
+                    self.config.p_fim > 0 and not self.config.fixed_fim_holes
+                )
         else:
             dataset = _build_dataset(rows)
             val_size = max(1, int(len(dataset) * self.config.val_fraction))
@@ -1593,7 +1600,7 @@ class ByteDataModule(DataModule):
             # One shared instance: turn resampling on, then pin the val indices back to
             # deterministic holes so val_loss_fim is the same spans at every eval.
             if isinstance(dataset, ByteStreamWindowDataset) and self.config.p_fim > 0:
-                dataset.resample_fim = True
+                dataset.resample_fim = not self.config.fixed_fim_holes
                 dataset.pin_fixed_indices(self.val_dataset.indices)
 
         if self.train_split_dump_path is not None:
@@ -1607,15 +1614,51 @@ class ByteDataModule(DataModule):
         ds = self.train_dataset
         if hasattr(ds, "indices") and hasattr(ds, "dataset"):  # torch Subset (window split)
             base = ds.dataset
-            samples = [base.samples[i] for i in ds.indices]
+            sample_indices = [int(i) for i in ds.indices]
+            samples = [base.samples[i] for i in sample_indices]
         else:
+            base = ds
             samples = list(getattr(ds, "samples", []))
+            sample_indices = list(range(len(samples)))
         windows = [
             {"h264_path": str(s.h264_path), "start_nal": s.start_nal, "end_nal": s.end_nal}
             for s in samples
             if hasattr(s, "start_nal")
         ]
         videos = sorted({str(s.h264_path) for s in samples if hasattr(s, "h264_path")})
+        fixed_holes: list[dict[str, Any]] = []
+        if self.config.fixed_fim_holes:
+            if not isinstance(base, ByteStreamWindowDataset):
+                raise RuntimeError("fixed FIM holes require ByteStreamWindowDataset")
+            for index in sample_indices:
+                item = base[index]
+                meta = item["sample_meta"]
+                if meta.get("task") != "fim":
+                    raise RuntimeError(
+                        "fixed FIM hole recording expected every train item to be FIM; "
+                        "use p_fim=1.0"
+                    )
+                labels = item["labels"]
+                supervised = labels[labels != IGNORE_INDEX]
+                target = bytes(
+                    int(token)
+                    for token in supervised.tolist()
+                    if 0 <= int(token) < BYTE_VOCAB_SIZE
+                )
+                fixed_holes.append(
+                    {
+                        "dataset_index": index,
+                        "h264_path": str(meta["h264_path"]),
+                        "start_nal": int(meta["start_nal"]),
+                        "end_nal": int(meta["end_nal"]),
+                        "frame_lo": int(meta["frame_lo"]),
+                        "frame_hi": int(meta["frame_hi"]),
+                        "fim_split": int(meta["fim_split"]),
+                        "fim_gap": int(meta["fim_gap"]),
+                        "target_length": len(target),
+                        "target_sha256": hashlib.sha256(target).hexdigest(),
+                    }
+                )
         payload = {
             "manifest": str(self.manifest_path),
             "max_manifest_rows": self.max_manifest_rows,
@@ -1623,10 +1666,12 @@ class ByteDataModule(DataModule):
             "val_fraction": self.config.val_fraction,
             "seed": self.config.seed,
             "dataset_mode": self.config.dataset_mode,
+            "fixed_fim_holes_enabled": self.config.fixed_fim_holes,
             "n_train_videos": len(videos),
             "n_train_windows": len(windows),
             "videos": videos,
             "windows": windows,
+            "fixed_fim_holes": fixed_holes,
         }
         path = Path(self.train_split_dump_path)
         path.parent.mkdir(parents=True, exist_ok=True)

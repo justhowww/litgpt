@@ -13,6 +13,9 @@ first_mb_in_slice is ue(v) at the top of the slice payload, so payload byte 0x80
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 import torch
 
@@ -25,6 +28,8 @@ from litgpt.byte.data import (
     REGION_ORPHAN,
     REGION_PREFIX,
     SEQ_EOS_ID,
+    ByteDataConfig,
+    ByteDataModule,
     ByteStreamWindowDataset,
     parse_annexb_nals,
 )
@@ -234,6 +239,74 @@ def test_pinned_indices_stay_deterministic_under_resampling(tmp_path):
     ds.pin_fixed_indices([0])
     draws = {(_meta(ds[0])["fim_split"], _meta(ds[0])["fim_gap"]) for _ in range(24)}
     assert len(draws) == 1
+
+
+@pytest.mark.parametrize(
+    ("fixed_fim_holes", "expected_resampling"),
+    [(False, True), (True, False)],
+)
+def test_data_module_propagates_fixed_hole_mode(
+    tmp_path, fixed_fim_holes, expected_resampling
+):
+    rows = []
+    for index in range(2):
+        path = tmp_path / f"clip_{index}.h264"
+        path.write_bytes(_stream())
+        rows.append({"h264_path": str(path), "status": "ok"})
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    split_path = tmp_path / "train_split.json"
+    module = ByteDataModule(
+        manifest_path=manifest,
+        config=ByteDataConfig(
+            p_fim=1.0,
+            fixed_fim_holes=fixed_fim_holes,
+            fim_format="psm",
+            use_eos=True,
+            fim_min_gap=16,
+            fim_max_gap=64,
+            slice_header_guard_bytes=16,
+            val_fraction=0.5,
+            dataset_mode="window",
+            window_min_frames=2,
+            num_workers=0,
+        ),
+        train_split_dump_path=split_path,
+    )
+    module.connect(batch_size=1, max_seq_length=4096)
+    module.setup()
+
+    base = module.train_dataset.dataset
+    assert isinstance(base, ByteStreamWindowDataset)
+    assert base.resample_fim is expected_resampling
+
+    payload = json.loads(split_path.read_text(encoding="utf-8"))
+    assert payload["fixed_fim_holes_enabled"] is fixed_fim_holes
+    if not fixed_fim_holes:
+        assert payload["fixed_fim_holes"] == []
+        return
+
+    assert len(payload["fixed_fim_holes"]) == 1
+    train_index = int(module.train_dataset.indices[0])
+    draws = [
+        (
+            _meta(base[train_index])["fim_split"],
+            _meta(base[train_index])["fim_gap"],
+        )
+        for _ in range(8)
+    ]
+    assert len(set(draws)) == 1
+    item = base[train_index]
+    target = bytes(
+        int(token)
+        for token in item["labels"][item["labels"] != IGNORE_INDEX].tolist()
+        if 0 <= int(token) < 256
+    )
+    recorded = payload["fixed_fim_holes"][0]
+    assert recorded["target_length"] == len(target)
+    assert recorded["target_sha256"] == hashlib.sha256(target).hexdigest()
 
 
 def test_ar_item_returns_raw_window_bytes_under_p_fim(tmp_path):
