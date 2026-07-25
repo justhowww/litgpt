@@ -24,6 +24,7 @@ from litgpt.byte.data import (
 )
 from litgpt.byte.reconstruction import ReconstructionEvalConfig
 from litgpt.byte.free_run_eval import FreeRunEvalConfig
+from litgpt.byte.h264_mask import SLICE_LAYOUT_MACROBLOCK, SLICE_LAYOUTS
 from litgpt.pretrain import setup
 
 
@@ -90,6 +91,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--free-run-cont-frames", type=int, default=4)
     parser.add_argument("--free-run-temperature", type=float, default=1.0)
     parser.add_argument("--free-run-max-gen-multiple", type=float, default=2.0)
+    parser.add_argument(
+        "--free-run-slice-layout",
+        choices=SLICE_LAYOUTS,
+        default=SLICE_LAYOUT_MACROBLOCK,
+    )
     parser.add_argument(
         "--reconstruction-oracle-length",
         action="store_true",
@@ -445,6 +451,7 @@ def main() -> None:
             temperature=args.free_run_temperature,
             max_gen_multiple=args.free_run_max_gen_multiple,
             seed=args.seed,
+            slice_layout=args.free_run_slice_layout,
         )
         if args.free_run_eval_interval > 0
         else None

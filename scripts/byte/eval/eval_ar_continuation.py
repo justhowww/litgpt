@@ -178,6 +178,16 @@ def parse_args() -> argparse.Namespace:
         "slice header, slice data, picture progression, and Annex-B framing.",
     )
     parser.add_argument(
+        "--slice-layout",
+        choices=HM.SLICE_LAYOUTS,
+        default=HM.SLICE_LAYOUT_MACROBLOCK,
+        help=(
+            "Slice extent assumed by constrained decoding and rollout stopping. "
+            "macroblock preserves AVC-LM's one-MB slices; frame requires one complete "
+            "progressive picture per slice and resolves its MB count from SPS."
+        ),
+    )
+    parser.add_argument(
         "--mask-residual-only",
         action="store_true",
         help="With --mask-illegal-bytes, reproduce the legacy residual-only, "
@@ -270,6 +280,8 @@ def main() -> None:
         raise SystemExit(
             "No clips with enough frames; lower --prefix-frames/--cont-frames or raise --max-window-bytes"
         )
+    if args.mask_illegal_bytes:
+        _preflight_gt_mask(clips, nal_index, args.slice_layout)
     intra_clips = select_intra_clips(rows, nal_index, args) if args.eval_intra else []
     if args.eval_intra:
         print(f"Selected {len(intra_clips)} intra (I-frame) clips", flush=True)
@@ -336,6 +348,112 @@ def select_continuation_clips(
         if len(clips) >= args.num_clips:
             break
     return clips
+
+
+def _mask_audit_snapshot(state: HM.MaskState, byte_offset: int) -> dict[str, Any]:
+    auto = state.automaton
+    return {
+        "byte_offset": byte_offset,
+        "failure_reason": state.failure_reason,
+        "nal_index": state.nal_index,
+        "stage": getattr(auto, "stage", None),
+        "syntax": getattr(auto, "ae_tag", None),
+        "rbsp_bit": getattr(auto, "pos", None),
+        "mbs_done": getattr(auto, "mbs_done", None),
+        "slice_max_mbs": getattr(auto, "max_mbs", None),
+    }
+
+
+def audit_gt_continuation_mask(
+    prefix_bytes: bytes, continuation_bytes: bytes, slice_layout: str
+) -> dict[str, Any]:
+    """Replay the exact generation boundary and prove the mask accepts GT.
+
+    Seeding with ``advance`` mirrors free_run_rollout: the prefix is observed but not
+    constrained, then every continuation byte is checked before commitment. This
+    catches layout/parser disagreement before a model result can be blamed for it.
+    """
+    state = HM.MaskState(
+        slice_max_mbs=HM.slice_max_mbs_for_layout(slice_layout),
+        fail_closed=True,
+    )
+    for byte in prefix_bytes:
+        HM.advance(state, byte)
+    state.generation_started = True
+
+    for offset, byte in enumerate(continuation_bytes):
+        allowed = HM.get_valid_byte_mask(state)
+        if not any(allowed):
+            return {
+                "ok": False,
+                "reason": "no_allowed_byte",
+                "gt_byte": byte,
+                **_mask_audit_snapshot(state, offset),
+            }
+        if not allowed[byte]:
+            return {
+                "ok": False,
+                "reason": "gt_byte_rejected",
+                "gt_byte": byte,
+                "allowed_count": sum(allowed),
+                **_mask_audit_snapshot(state, offset),
+            }
+        HM.advance(state, byte)
+        if state.automaton_unknown:
+            return {
+                "ok": False,
+                "reason": "automaton_invalid_after_gt_byte",
+                "gt_byte": byte,
+                **_mask_audit_snapshot(state, offset),
+            }
+
+    auto = state.automaton
+    if (
+        not state.cur_is_vcl
+        or auto is None
+        or state.automaton_unknown
+        or auto.stage != "done"
+    ):
+        return {
+            "ok": False,
+            "reason": "gt_continuation_ends_before_complete_slice",
+            **_mask_audit_snapshot(state, len(continuation_bytes)),
+        }
+    return {
+        "ok": True,
+        "checked_bytes": len(continuation_bytes),
+        "completed_mbs": auto.mbs_done,
+        "slice_max_mbs": auto.max_mbs,
+    }
+
+
+def _preflight_gt_mask(
+    clips: list[ContinuationClip],
+    nal_index: dict[str, list[NALUnit]],
+    slice_layout: str,
+) -> None:
+    started = time.perf_counter()
+    checked_bytes = 0
+    for clip_index, clip in enumerate(clips):
+        data = clip.h264_path.read_bytes()
+        nals = nal_index[str(clip.h264_path)]
+        prefix = _concat_nals(data, nals, 0, clip.prefix_end_nal)
+        continuation = _concat_nals(
+            data, nals, clip.prefix_end_nal, clip.cont_end_nal
+        )
+        result = audit_gt_continuation_mask(prefix, continuation, slice_layout)
+        if not result["ok"]:
+            raise SystemExit(
+                "GT syntax-mask preflight failed before model evaluation: "
+                f"clip={clip_index} path={clip.h264_path} details={result}"
+            )
+        checked_bytes += int(result["checked_bytes"])
+    elapsed = time.perf_counter() - started
+    print(
+        f"GT syntax-mask preflight: {len(clips)}/{len(clips)} accepted "
+        f"(slice_layout={slice_layout}, bytes={checked_bytes}, seconds={elapsed:.1f})",
+        flush=True,
+    )
 
 
 def _first_qualifying_window(
@@ -470,6 +588,8 @@ def evaluate_checkpoint(
     mask_probability_mass_weighted_sum = 0.0
     mask_probability_mass_count = 0
     first_mask_intervention_syntaxes: Counter = Counter()
+    generation_seconds: list[float] = []
+    generation_bytes_per_second: list[float] = []
     strict_decode_statuses: Counter = Counter()
     strict_decode_seconds: list[float] = []
     timeout_partial_frames: list[int] = []
@@ -544,6 +664,7 @@ def evaluate_checkpoint(
             continue
         target_byte_counts.append(gt_cont_len)
         rollout_trace: dict[str, Any] = {}
+        generation_started = time.perf_counter()
         gen_bytes, gen_frames_emitted = generate_continuation(
             model,
             fed_prefix,
@@ -557,6 +678,10 @@ def evaluate_checkpoint(
             mask_prefix_bytes=prefix_bytes,
             trace=rollout_trace,
         )
+        generation_elapsed = time.perf_counter() - generation_started
+        generation_seconds.append(generation_elapsed)
+        if generation_elapsed > 0:
+            generation_bytes_per_second.append(len(gen_bytes) / generation_elapsed)
         rollout_stop_reasons[rollout_trace.get("stop_reason") or "none"] += 1
         if rollout_trace.get("mask_failure_reason"):
             mask_failure_reasons[rollout_trace["mask_failure_reason"]] += 1
@@ -613,6 +738,11 @@ def evaluate_checkpoint(
             ),
             "mask_decisions_measured": rollout_trace.get("mask_probability_mass_count"),
             "first_mask_intervention": rollout_trace.get("first_mask_intervention"),
+            "slice_layout": args.slice_layout,
+            "generation_seconds": generation_elapsed,
+            "generation_bytes_per_second": (
+                len(gen_bytes) / generation_elapsed if generation_elapsed > 0 else None
+            ),
         }
 
         # Byte-level survival + desync (parse-only, no ffmpeg) -- runs in BOTH modes.
@@ -752,6 +882,11 @@ def evaluate_checkpoint(
         "desync_reason_hist": dict(desync_reasons.most_common()),
         "desync_category_hist": dict(desync_categories.most_common()),
         "generation_stop_reason_hist": dict(rollout_stop_reasons.most_common()),
+        "generation_seconds_mean": mean(generation_seconds),
+        "generation_seconds_max": (
+            max(generation_seconds) if generation_seconds else None
+        ),
+        "generation_bytes_per_second_mean": mean(generation_bytes_per_second),
         "mask_failure_reason_hist": dict(mask_failure_reasons.most_common()),
         "mask_calls_total": mask_calls_total if args.mask_illegal_bytes else None,
         "mask_strict_calls_total": (
@@ -795,6 +930,7 @@ def evaluate_checkpoint(
         "cont_ssim_mean": mean(cont_ssim),
         "prefix_frames": clips[0].prefix_frames if clips else 0,
         "temperature": args.temperature,
+        "slice_layout": args.slice_layout,
     }
     summary.update(distribution_metrics(real_app, gen_app, real_mot, gen_mot))
     return summary, details, viz
@@ -1388,6 +1524,7 @@ def generate_continuation(
         mask_residual_only=args.mask_residual_only,
         prefix_bytes=mask_prefix_bytes or prefix_bytes,
         trace=trace,
+        slice_layout=args.slice_layout,
     )
 
 

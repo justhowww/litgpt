@@ -81,6 +81,7 @@ FREE_RUN_TEMP=${FREE_RUN_TEMP:-1.0}
 FREE_RUN_CLIPS=${FREE_RUN_CLIPS:-8}
 FREE_RUN_PREFIX_FRAMES=${FREE_RUN_PREFIX_FRAMES:-288}
 FREE_RUN_CONT_FRAMES=${FREE_RUN_CONT_FRAMES:-144}
+FREE_RUN_SLICE_LAYOUT=${FREE_RUN_SLICE_LAYOUT:-macroblock}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -159,6 +160,7 @@ if [[ "${FREE_RUN_INTERVAL}" != "0" ]]; then
         --free-run-eval-clips "${FREE_RUN_CLIPS}"
         --free-run-prefix-frames "${FREE_RUN_PREFIX_FRAMES}"
         --free-run-cont-frames "${FREE_RUN_CONT_FRAMES}"
+        --free-run-slice-layout "${FREE_RUN_SLICE_LAYOUT}"
     )
 fi
 
@@ -167,7 +169,7 @@ if [[ "${COMPILE}" == "1" ]]; then
     cmd+=(--compile)
 fi
 
-echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP}"
+echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
 echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fim_format=${FIM_FORMAT} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
 
 flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {

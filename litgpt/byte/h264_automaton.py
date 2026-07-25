@@ -129,7 +129,7 @@ class VclAutomaton:
         sps_map: dict,
         pps_map: dict,
         constraints: dict,
-        max_mbs: int,
+        max_mbs: int | None,
     ) -> None:
         if nal_type not in (1, 5):
             raise ValueError(f"unsupported VCL NAL type {nal_type}")
@@ -138,6 +138,11 @@ class VclAutomaton:
         self.sps_map = sps_map
         self.pps_map = pps_map
         self.constraints = dict(constraints)
+        # ``None`` is the one-slice-per-progressive-picture layout.  Its concrete
+        # extent cannot be known until pic_parameter_set_id resolves the active SPS.
+        # A positive integer retains the legacy fixed-MBs-per-slice profile.
+        if max_mbs is not None and max_mbs <= 0:
+            raise ValueError("max_mbs must be positive or None")
         self.max_mbs = max_mbs
         expected_nal_type = self.constraints.get("nal_type")
         expected_ref_idc = self.constraints.get("nal_ref_idc")
@@ -348,6 +353,15 @@ class VclAutomaton:
             picture_mbs = self.sps.pic_width_in_mbs * self.sps.pic_height_in_mbs
             if not 0 <= first_mb < picture_mbs:
                 return self._invalid(f"first_mb_out_of_range:{first_mb}/{picture_mbs}")
+            if self.max_mbs is None:
+                # The BSCV profile is one slice per progressive picture.  Accepting
+                # ``picture_mbs - first_mb`` here would silently permit a partial
+                # picture beginning in the middle, which is a different layout.
+                if first_mb != 0:
+                    return self._invalid(
+                        f"frame_slice_first_mb_not_zero:{first_mb}"
+                    )
+                self.max_mbs = picture_mbs
             if first_mb + self.max_mbs > picture_mbs:
                 return self._invalid(
                     f"slice_extent_out_of_range:{first_mb}+{self.max_mbs}/{picture_mbs}"
@@ -528,6 +542,8 @@ class VclAutomaton:
         return MORE
 
     def _finish_header(self):
+        if self.max_mbs is None:  # resolved when pic_parameter_set_id was parsed
+            return self._invalid("slice_extent_unresolved")
         self._mb = MbAutomaton(
             pic_width_in_mbs=self.sps.pic_width_in_mbs,
             pic_height_in_mbs=self.sps.pic_height_in_mbs,

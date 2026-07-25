@@ -212,7 +212,21 @@ def parse_args() -> argparse.Namespace:
             "Parser-reconnection stopping can also be evaluated without masking."
         ),
     )
-    parser.add_argument("--slice-max-mbs", type=int, default=1)
+    parser.add_argument(
+        "--slice-layout",
+        choices=HM.SLICE_LAYOUTS,
+        default=HM.SLICE_LAYOUT_MACROBLOCK,
+        help=(
+            "macroblock uses --slice-max-mbs (default 1); frame requires one "
+            "complete progressive picture per slice and resolves its extent from SPS."
+        ),
+    )
+    parser.add_argument(
+        "--slice-max-mbs",
+        type=int,
+        default=1,
+        help="Fixed slice extent used only with --slice-layout macroblock.",
+    )
     parser.add_argument("--mask-debug", action="store_true")
     parser.add_argument(
         "--save-streams",
@@ -481,7 +495,9 @@ def _sample_token(logits: Tensor, temperature: float, top_k: int, top_p: float) 
     return int(torch.multinomial(probs, num_samples=1))
 
 
-def _seed_parser_state(sample: WindowFimSample, *, slice_max_mbs: int) -> HM.MaskState:
+def _seed_parser_state(
+    sample: WindowFimSample, *, slice_max_mbs: int | None
+) -> HM.MaskState:
     """Build the H.264 state at the start of the missing span."""
     state = HM.MaskState(slice_max_mbs=slice_max_mbs, fail_closed=True)
     # Seed from ORIGINAL stream order. The PSM prompt contains model markers and
@@ -492,7 +508,9 @@ def _seed_parser_state(sample: WindowFimSample, *, slice_max_mbs: int) -> HM.Mas
     return state
 
 
-def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int) -> bool:
+def gt_parser_reconnects(
+    sample: WindowFimSample, *, slice_max_mbs: int | None
+) -> bool:
     """Check that the automaton accepts the unmodified GT middle and suffix."""
     state = _seed_parser_state(sample, slice_max_mbs=slice_max_mbs)
     for byte in sample.target_bytes:
@@ -528,7 +546,7 @@ def generate_span(
     top_p: float,
     max_gen_bytes: int,
     mask_illegal_bytes: bool,
-    slice_max_mbs: int,
+    slice_max_mbs: int | None,
 ) -> GenerationResult | None:
     raw = _unwrap_model(model)
     raw.eval()
@@ -1204,6 +1222,13 @@ def summarize(
 def main() -> None:
     args = parse_args()
     HM.configure_debug(args.mask_debug)
+    slice_max_mbs = (
+        HM.slice_max_mbs_for_layout(args.slice_layout)
+        if args.slice_layout == HM.SLICE_LAYOUT_FRAME
+        else args.slice_max_mbs
+    )
+    if slice_max_mbs is not None and slice_max_mbs <= 0:
+        raise SystemExit("--slice-max-mbs must be positive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
@@ -1212,7 +1237,7 @@ def main() -> None:
     gt_reconnect_ok: list[bool | None]
     if "parser_reconnect" in args.stop_modes:
         gt_reconnect_ok = [
-            gt_parser_reconnects(sample, slice_max_mbs=args.slice_max_mbs)
+            gt_parser_reconnects(sample, slice_max_mbs=slice_max_mbs)
             for sample in samples
         ]
         gt_reconnect_count = sum(gt_reconnect_ok)
@@ -1313,7 +1338,7 @@ def main() -> None:
                     top_p=args.top_p,
                     max_gen_bytes=args.max_gen_bytes,
                     mask_illegal_bytes=args.mask_illegal_bytes,
-                    slice_max_mbs=args.slice_max_mbs,
+                    slice_max_mbs=slice_max_mbs,
                 )
                 if result is None:
                     skipped_prompt_or_budget += 1
@@ -1363,6 +1388,7 @@ def main() -> None:
                     "parser_failure_reason": result.parser_failure_reason,
                     "gt_parser_reconnect_ok": gt_reconnect_ok[sample_id],
                     "mask_enabled": args.mask_illegal_bytes,
+                    "slice_layout": args.slice_layout,
                     "mask_calls": result.mask_calls,
                     "mask_strict_calls": result.mask_strict_calls,
                     "mask_permissive_calls": result.mask_permissive_calls,
@@ -1489,6 +1515,7 @@ def main() -> None:
                 "checkpoint_dir": str(checkpoint_dir),
                 "mode": "fim_avclm",
                 "stop_mode": stop_mode,
+                "slice_layout": args.slice_layout,
                 "exact_training_holes_verified": int(
                     getattr(args, "exact_training_holes_verified", 0)
                 ),

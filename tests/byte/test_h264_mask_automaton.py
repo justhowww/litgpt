@@ -50,6 +50,74 @@ def test_wrapper_never_rejects_fixture_prefix_and_uses_strict_masks():
     assert strict_masks > 0
 
 
+def test_frame_layout_never_rejects_full_picture_fixture():
+    """The dynamic layout must derive the fixture's 99-MB extent from its SPS."""
+    if not _FIXTURE.exists():
+        return
+    syntax, _, mask_module, _ = _load_stack()
+    data = _FIXTURE.read_bytes()
+    first_vcl = next(
+        nal for nal in syntax.iter_nals(data) if nal.nal_type in syntax.VCL_NAL_TYPES
+    )
+    state = mask_module.MaskState(
+        slice_max_mbs=mask_module.slice_max_mbs_for_layout("frame")
+    )
+    strict_masks = 0
+    # Exhaustively check candidate-byte membership through the first VCL header,
+    # where the dynamic SPS-derived extent is established. Replaying the remainder
+    # with advance() still exercises all 99 macroblocks without multiplying this
+    # regression test by 256 candidate branches at every residual byte.
+    exhaustive_end = first_vcl.payload_start + 16
+    for offset, byte in enumerate(data[: first_vcl.payload_end]):
+        if offset < exhaustive_end:
+            allowed = mask_module.get_valid_byte_mask(state)
+            assert allowed[byte], (
+                f"rejected frame-layout GT byte {byte:#04x} at {offset}"
+            )
+            strict_masks += sum(allowed) < 256
+        mask_module.advance(state, byte)
+        assert not state.automaton_unknown, (
+            f"frame-layout automaton rejected GT byte {byte:#04x} at {offset}: "
+            f"{state.failure_reason}"
+        )
+    assert strict_masks > 0
+    assert state.automaton.stage == "done"
+    assert state.automaton.mbs_done == state.automaton.max_mbs == 99
+
+
+def test_frame_layout_resolves_sps_extent_and_rejects_partial_picture_start():
+    syntax, automaton, _, _ = _load_stack()
+    sps, pps = _phase_parameter_sets(syntax)
+
+    full = automaton.VclAutomaton(
+        nal_type=syntax.NAL_SLICE_NONIDR,
+        nal_ref_idc=2,
+        sps_map={0: sps},
+        pps_map={0: pps},
+        constraints={},
+        max_mbs=None,
+    )
+    status = automaton.MORE
+    for bit in "111":  # ue(0) first_mb, ue(0) P slice, ue(0) PPS
+        status = full.consume_bit(int(bit))
+    assert status != automaton.INVALID
+    assert full.max_mbs == 16 * 9
+
+    partial = automaton.VclAutomaton(
+        nal_type=syntax.NAL_SLICE_NONIDR,
+        nal_ref_idc=2,
+        sps_map={0: sps},
+        pps_map={0: pps},
+        constraints={},
+        max_mbs=None,
+    )
+    status = automaton.MORE
+    for bit in "01011":  # ue(1) first_mb, ue(0) P slice, ue(0) PPS
+        status = partial.consume_bit(int(bit))
+    assert status == automaton.INVALID
+    assert partial.invalid_reason == "frame_slice_first_mb_not_zero:1"
+
+
 def test_mask_lookup_does_not_call_recursive_parser():
     if not _FIXTURE.exists():
         return

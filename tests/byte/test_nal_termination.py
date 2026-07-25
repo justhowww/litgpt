@@ -20,8 +20,7 @@ _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 _FIXTURE_FILES = ["baseline_qcif.h264", "baseline_qcif_lowqp.h264"]
 
 # The fixtures are one-slice-per-frame (99 MBs per slice), unlike the slice-max-mbs=1
-# corpus, so the automaton must be told how many MBs make a complete slice.
-_FIXTURE_MAX_MBS = 99
+# corpus. ``None`` asks the automaton to derive the complete picture extent from SPS.
 
 
 def _load_analyzer():
@@ -49,7 +48,7 @@ def _analyze_fixture(name: str):
     if not path.exists():
         return None
     data = path.read_bytes()
-    return NT.analyze_stream(data, data, 0, slice_max_mbs=_FIXTURE_MAX_MBS)
+    return NT.analyze_stream(data, data, 0, slice_max_mbs=None)
 
 
 def test_ground_truth_has_no_premature_boundaries():
@@ -105,7 +104,7 @@ def test_first_desync_at_start_code_maps_to_nal():
         cut_parsed = NT.HS.parse_stream(cut, parse_slice_data=True)
         cut_vcl = next(p for p in cut_parsed.nals if p.nal.nal_type in NT.HS.VCL_NAL_TYPES)
         res = NT.analyze_stream(
-            cut, data, 0, slice_max_mbs=_FIXTURE_MAX_MBS,
+            cut, data, 0, slice_max_mbs=None,
             first_desync=cut_vcl.nal.start_code_start,
         )
         marked = [n for n in res["nals"] if n.get("is_first_desync_nal")]

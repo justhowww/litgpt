@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Phase 3 eval: the same AR probes as phase2_fim/eval.sh, pointed at the 45k-video/
-# 341M run. Compare at a MATCHED STEP against phase 1/phase 2 checkpoints where
-# relevant -- all three anneal over STEPS=1M, so checkpoints at different steps sit at
-# different LR and are not directly comparable.
+# Phase 3 AR eval. By default this targets the 45k AVC-LM run; eval_bscv.sh supplies
+# the BSCV corpus and the one-progressive-picture-per-slice layout. Compare at a
+# MATCHED STEP against earlier checkpoints where relevant -- checkpoints at different
+# steps sit at different learning rates and are not directly comparable.
 #
 # The one signal phase 1/2 could NOT give: whether the train/val gap on residual
 # coding (coeff_token, level, total_zeros, run_before -- see
@@ -20,8 +20,16 @@
 # the FIM signal.
 set -euo pipefail
 
-DATA=/fs/nexus-projects/time-control-videogen/OpenVid-1M_Data/data-avclm
+DATA=${DATA:-/fs/nexus-projects/time-control-videogen/OpenVid-1M_Data/data-avclm}
 OUT_DIR=${OUT_DIR:-${DATA}/runs/byte-phase3-45kv-341m}
+NAL_INDEX=${NAL_INDEX:-${DATA}/nal_index.sqlite}
+MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-45000}
+NUM_CLIPS=${NUM_CLIPS:-20}
+PREFIX_FRAMES=${PREFIX_FRAMES:-4}
+CONT_FRAMES=${CONT_FRAMES:-2}
+MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-16384}
+SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
+EVAL_INTRA=${EVAL_INTRA:-1}
 
 CKPT=${CKPT:-$(basename "$(ls -d "${OUT_DIR}"/step-* 2>/dev/null | sort | tail -1)")}
 if [[ -z "${CKPT}" ]]; then
@@ -33,15 +41,19 @@ echo "[phase3 eval] checkpoint=${CKPT}"
 EVAL=scripts/byte/eval/eval_ar_continuation.py
 COMMON_TRAIN=(
     "${DATA}/manifest.jsonl"
-    --nal-index-path "${DATA}/nal_index.sqlite"
+    --nal-index-path "${NAL_INDEX}"
     --checkpoint-dirs "${OUT_DIR}/${CKPT}"
     --train-split-file "${OUT_DIR}/train_split.json"
-    --max-manifest-rows 45000
-    --num-clips 20
+    --max-manifest-rows "${MAX_MANIFEST_ROWS}"
+    --num-clips "${NUM_CLIPS}"
     --seed 42
-    --prefix-frames 4 --cont-frames 2
-    --max-window-bytes 16384
+    --prefix-frames "${PREFIX_FRAMES}" --cont-frames "${CONT_FRAMES}"
+    --max-window-bytes "${MAX_WINDOW_BYTES}"
+    --slice-layout "${SLICE_LAYOUT}"
 )
+if [[ "${EVAL_INTRA}" == "0" ]]; then
+    COMMON_TRAIN+=(--no-eval-intra)
+fi
 
 run() {  # name  out_root  extra-sampling-args...
     local name="$1" out_root="$2"; shift 2
@@ -65,12 +77,13 @@ run greedy_full_masked "${TRAIN_OUT}" --temperature 0.0 --mask-illegal-bytes --m
 
 echo
 echo "===================== train sweep summary ====================="
-python3 - "${TRAIN_OUT}" greedy greedy_residual_masked greedy_full_masked <<'PY'
+python3 - "${TRAIN_OUT}" "${SLICE_LAYOUT}" greedy greedy_residual_masked greedy_full_masked <<'PY'
 import json, sys
 from pathlib import Path
 
 root = sys.argv[1]
-names = sys.argv[2:]
+layout = sys.argv[2]
+names = sys.argv[3:]
 
 def rows(name):
     p = Path(root) / name / "metrics.jsonl"
@@ -95,6 +108,8 @@ for name in names:
         continue
     completed_frames = cont.get('completed_frames_mean')
     frames_ref = f"{completed_frames:.1f}/{cont.get('target_frames', 0)}" if completed_frames is not None else f"-/{cont.get('target_frames', 0)}"
+    gen_seconds = cont.get("generation_seconds_mean")
+    gen_rate = cont.get("generation_bytes_per_second_mean")
     print(
         f"{name:<14} {cont.get('success_rate', 0):>10.3f} "
         f"{frames_ref:>19} "
@@ -102,6 +117,12 @@ for name in names:
         f"{cont.get('target_bytes_mean', 0):>14.1f} "
         f"{cont.get('cont_psnr_mean') or 0:>8.2f}  {cont.get('desync_region_top')}"
     )
+    if gen_seconds is not None:
+        rate_text = f"{gen_rate:.2f}" if gen_rate is not None else "-"
+        print(
+            f"{'':<14} generation={gen_seconds:.2f}s/clip "
+            f"throughput={rate_text} bytes/s"
+        )
 print()
 for name in names:
     tf, _ = rows(name)
@@ -113,16 +134,20 @@ for name in names:
             f"cbp={elements.get('coded_block_pattern')}"
         )
 print()
-print("Historical phase 1 @ step-00031000 (the old residual-only mask):")
-print("  greedy                   full_cont=0.750  tf_byte_acc=0.99978")
-print("  greedy_residual_masked   full_cont=1.000  tf_byte_acc=0.99978")
-print("Read greedy_full_masked as the current constrained-decoding result.")
-print()
-print("Phase 1's val/train gap on residual coding (260712 - phase 1 result.md), the")
-print("thing 45k videos is meant to fix -- compare element_correct for coeff_token/CBP")
-print("above against these on a held-out (val) pass, not just this train pass:")
-print("  coeff_token: train 0.9916 -> val 0.7609")
-print("  CBP:         train 0.9896 -> val 0.9185")
+if layout == "macroblock":
+    print("Historical phase 1 @ step-00031000 (the old residual-only mask):")
+    print("  greedy                   full_cont=0.750  tf_byte_acc=0.99978")
+    print("  greedy_residual_masked   full_cont=1.000  tf_byte_acc=0.99978")
+    print("Read greedy_full_masked as the current constrained-decoding result.")
+    print()
+    print("Phase 1's val/train gap on residual coding (260712 - phase 1 result.md), the")
+    print("thing 45k videos is meant to fix -- compare element_correct for coeff_token/CBP")
+    print("above against these on a held-out (val) pass, not just this train pass:")
+    print("  coeff_token: train 0.9916 -> val 0.7609")
+    print("  CBP:         train 0.9896 -> val 0.9185")
+else:
+    print("BSCV frame-slice evaluation: no AVC-LM historical baseline is printed.")
+    print("Compare greedy and greedy_full_masked at the same checkpoint and clip set.")
 PY
 
 # Per-NAL termination diagnostics. Runs AFTER the summary and cannot abort it: under
@@ -132,6 +157,6 @@ NAL_TERM=scripts/byte/eval/analyze_nal_termination.py
 for name in greedy greedy_residual_masked greedy_full_masked; do
     echo
     echo "===================== [nal-termination/${name}] ====================="
-    python "${NAL_TERM}" "${TRAIN_OUT}/${name}" --slice-max-mbs 1 \
+    python "${NAL_TERM}" "${TRAIN_OUT}/${name}" --slice-layout "${SLICE_LAYOUT}" \
         || echo "[warn] nal_termination failed for ${name} (summary above is unaffected)"
 done

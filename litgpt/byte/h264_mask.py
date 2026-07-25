@@ -20,6 +20,9 @@ from litgpt.byte import h264_automaton as HA
 from litgpt.byte import h264_syntax as HS
 
 START_CODE = (0, 0, 1)
+SLICE_LAYOUT_MACROBLOCK = "macroblock"
+SLICE_LAYOUT_FRAME = "frame"
+SLICE_LAYOUTS = (SLICE_LAYOUT_MACROBLOCK, SLICE_LAYOUT_FRAME)
 _DEBUG_DEFAULT = False
 _DEBUG_STAGES_DEFAULT = False
 _RESIDUAL_TAGS = {
@@ -39,9 +42,23 @@ def configure_debug(enabled: bool = True, *, stages: bool = False) -> None:
     _DEBUG_STAGES_DEFAULT = stages
 
 
+def slice_max_mbs_for_layout(layout: str) -> int | None:
+    """Translate the public layout name to the automaton's slice extent.
+
+    ``frame`` means one complete progressive picture per slice, resolved from SPS.
+    The user-facing name stays simple while the codec-facing implementation uses
+    picture dimensions (a frame and picture coincide for the supported profile).
+    """
+    if layout == SLICE_LAYOUT_MACROBLOCK:
+        return 1
+    if layout == SLICE_LAYOUT_FRAME:
+        return None
+    raise ValueError(f"unknown slice layout {layout!r}; expected one of {SLICE_LAYOUTS}")
+
+
 @dataclass
 class PictureState:
-    """Cross-NAL state for the pinned one-macroblock-per-slice profile."""
+    """Cross-NAL picture state for fixed-MB and one-picture slice layouts."""
 
     active: bool = False
     picture_complete: bool = False
@@ -161,7 +178,10 @@ class MaskState:
     picture: PictureState = field(default_factory=PictureState)
     expect_nal_header: bool = False
     generation_started: bool = False
-    slice_max_mbs: int = 1
+    # Positive integer: fixed macroblocks per slice (the AVC-LM corpus uses 1).
+    # None: one complete progressive picture per slice; VclAutomaton resolves the
+    # concrete extent from the active SPS and requires first_mb_in_slice == 0.
+    slice_max_mbs: int | None = 1
     residual_only: bool = False
     fail_closed: bool = True
     debug: bool = field(default_factory=lambda: _DEBUG_DEFAULT)
@@ -172,6 +192,10 @@ class MaskState:
     strict_mask_calls: int = field(default=0, init=False)
     permissive_mask_calls: int = field(default=0, init=False)
     failure_reason: str | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.slice_max_mbs is not None and self.slice_max_mbs <= 0:
+            raise ValueError("slice_max_mbs must be positive or None")
 
     def last_two_raw(self) -> tuple[int, int] | None:
         if len(self.cur_nal_bytes) < 2:
@@ -444,6 +468,15 @@ def _sync_automaton(state: MaskState) -> None:
                 state.automaton_unknown = True
                 state.failure_reason = f"first_mb_out_of_range:{first_mb}/{picture_mbs}"
                 return
+            max_mbs = state.slice_max_mbs
+            if max_mbs is None:
+                if first_mb != 0:
+                    state.automaton_unknown = True
+                    state.failure_reason = (
+                        f"frame_slice_first_mb_not_zero:{first_mb}"
+                    )
+                    return
+                max_mbs = picture_mbs
             nal = _nal_info(state.cur_nal_bytes)
             header = HS.parse_slice_header(reader, record, nal, sps, pps)
             if header.slice_type not in (HS.SLICE_TYPE_P, HS.SLICE_TYPE_I):
@@ -482,7 +515,7 @@ def _sync_automaton(state: MaskState) -> None:
                 num_ref_idx_l0_active=header.num_ref_idx_l0_active,
                 first_mb_in_slice=header.first_mb_in_slice,
                 slice_data_start_bit=reader.pos,
-                max_mbs=state.slice_max_mbs,
+                max_mbs=max_mbs,
             )
         except HS.BitReaderError:
             return
@@ -630,13 +663,14 @@ def _close_nal(state: MaskState, nal_payload: bytes) -> None:
         isinstance(auto, HA.VclAutomaton)
         and auto.stage == "done"
         and auto.sps is not None
+        and auto.max_mbs is not None
     ):
         state.picture.observe(
             auto.header,
             nal_type=nals[0].nal_type,
             nal_ref_idc=nals[0].ref_idc,
             sps=auto.sps,
-            max_mbs=state.slice_max_mbs,
+            max_mbs=auto.max_mbs,
         )
     try:
         HS.parse_nal(buf, nals[0], state.sps_map, state.pps_map, parse_slice_data=False)

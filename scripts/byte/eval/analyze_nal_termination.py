@@ -99,7 +99,9 @@ def _snapshot(state) -> dict[str, Any]:
     }
 
 
-def _replay(stream: bytes, slice_max_mbs: int) -> dict[int, dict[str, Any]]:
+def _replay(
+    stream: bytes, slice_max_mbs: int | None
+) -> dict[int, dict[str, Any]]:
     """Feed the stream through MaskState/advance; snapshot at every NAL close.
 
     Returns {nal_open_offset: snapshot}. ``nal_open_offset`` is the offset of the NAL's
@@ -155,7 +157,7 @@ def analyze_stream(
     gt_stream: bytes,
     n_prefix: int,
     *,
-    slice_max_mbs: int = 1,
+    slice_max_mbs: int | None = 1,
     first_desync: int | None = None,
 ) -> dict[str, Any]:
     """Classify every generated-region NAL boundary in ``gen_stream``.
@@ -266,8 +268,24 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("results_dir", type=Path, help="dir with clip_details.jsonl + streams/")
     ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument(
+        "--slice-layout",
+        choices=HM.SLICE_LAYOUTS,
+        default=HM.SLICE_LAYOUT_MACROBLOCK,
+        help=(
+            "macroblock uses --slice-max-mbs; frame resolves one complete "
+            "progressive picture per slice from SPS."
+        ),
+    )
     ap.add_argument("--slice-max-mbs", type=int, default=1)
     args = ap.parse_args()
+    slice_max_mbs = (
+        HM.slice_max_mbs_for_layout(args.slice_layout)
+        if args.slice_layout == HM.SLICE_LAYOUT_FRAME
+        else args.slice_max_mbs
+    )
+    if slice_max_mbs is not None and slice_max_mbs <= 0:
+        raise SystemExit("--slice-max-mbs must be positive")
     out_dir = args.out_dir or args.results_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -290,7 +308,7 @@ def main() -> None:
         gt = Path(r["stream_gt_path"]).read_bytes()
         res = analyze_stream(
             gen, gt, r["n_prefix_bytes"],
-            slice_max_mbs=args.slice_max_mbs,
+            slice_max_mbs=slice_max_mbs,
             first_desync=r.get("first_desync"),
         )
         stop_reasons[r.get("stop_reason") or "unknown"] += 1
@@ -333,6 +351,7 @@ def main() -> None:
             fh.write(json.dumps(rec) + "\n")
     summary = {
         "n_clips": len(clip_records),
+        "slice_layout": args.slice_layout,
         "classification_hist": dict(totals),
         "stop_reason_hist": dict(stop_reasons),
         "premature_boundaries": totals.get(PREMATURE, 0),

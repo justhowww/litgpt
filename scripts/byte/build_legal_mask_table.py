@@ -128,11 +128,19 @@ import sys
 import time
 from array import array
 from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
 from pathlib import Path
 from typing import Iterator
 
 from litgpt.byte.data import load_manifest_rows
-from litgpt.byte.h264_mask import MaskState, advance, get_valid_byte_mask
+from litgpt.byte.h264_mask import (
+    SLICE_LAYOUT_MACROBLOCK,
+    SLICE_LAYOUTS,
+    MaskState,
+    advance,
+    get_valid_byte_mask,
+    slice_max_mbs_for_layout,
+)
 
 DEFAULT_MASK_TABLE_NAME = "legal_mask_table.sqlite"
 
@@ -146,7 +154,9 @@ def default_mask_table_path(manifest_path: Path) -> Path:
     return manifest_path.with_name(DEFAULT_MASK_TABLE_NAME)
 
 
-def iter_legal_masks(data: bytes) -> Iterator[list[bool]]:
+def iter_legal_masks(
+    data: bytes, slice_layout: str = SLICE_LAYOUT_MACROBLOCK
+) -> Iterator[list[bool]]:
     """Walk one raw H.264 file byte by byte and, for each position, report which
     of the 256 possible byte values could legally appear there, given only the
     real bytes that came before it. Returns exactly one 256-entry answer per
@@ -170,7 +180,7 @@ def iter_legal_masks(data: bytes) -> Iterator[list[bool]]:
     illegal. See the "What this mask does and does not guarantee" section at
     the top of this file for what that limitation means in practice.
     """
-    state = MaskState()
+    state = MaskState(slice_max_mbs=slice_max_mbs_for_layout(slice_layout))
     for offset, byte in enumerate(data):
         mask = get_valid_byte_mask(state)
         if len(mask) != 256:
@@ -200,7 +210,9 @@ def unpack_mask(packed: bytes) -> list[bool]:
     return [(value >> (255 - i)) & 1 == 1 for i in range(256)]
 
 
-def scan_file(path_string: str) -> tuple[str, int, int, array, list[bytes]]:
+def scan_file(
+    path_string: str, slice_layout: str = SLICE_LAYOUT_MACROBLOCK
+) -> tuple[str, int, int, array, list[bytes]]:
     """Compute per-byte legal masks for one file, deduplicated LOCALLY (per file).
 
     Global (cross-file) dedup happens in the writer, which is single-threaded
@@ -216,7 +228,7 @@ def scan_file(path_string: str) -> tuple[str, int, int, array, list[bytes]]:
     local_table: dict[bytes, int] = {}
     local_masks: list[bytes] = []
     local_mask_ids = array("I", [0]) * len(data)
-    for i, mask in enumerate(iter_legal_masks(data)):
+    for i, mask in enumerate(iter_legal_masks(data, slice_layout)):
         packed = pack_mask(mask)
         local_id = local_table.get(packed)
         if local_id is None:
@@ -341,7 +353,11 @@ def read_mask_ids(blob: bytes) -> array:
 
 
 def build_table(
-    manifest_path: Path, output_path: Path, workers: int, rebuild: bool
+    manifest_path: Path,
+    output_path: Path,
+    workers: int,
+    rebuild: bool,
+    slice_layout: str = SLICE_LAYOUT_MACROBLOCK,
 ) -> None:
     rows = load_manifest_rows(manifest_path, report_progress=True)
     paths = list(dict.fromkeys(str(Path(row["h264_path"])) for row in rows))
@@ -349,6 +365,28 @@ def build_table(
 
     with sqlite3.connect(output_path) as connection:
         initialize_database(connection, rebuild)
+        stored_layout = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'slice_layout'"
+        ).fetchone()
+        existing_count = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        if (
+            existing_count
+            and stored_layout is not None
+            and stored_layout[0] != slice_layout
+        ):
+            raise RuntimeError(
+                f"Legal-mask table was built with slice_layout={stored_layout[0]!r}; "
+                f"requested {slice_layout!r}. Use --rebuild or a different --output."
+            )
+        if (
+            existing_count
+            and stored_layout is None
+            and slice_layout != SLICE_LAYOUT_MACROBLOCK
+        ):
+            raise RuntimeError(
+                "Existing legal-mask table predates slice-layout metadata. "
+                "Use --rebuild before building frame-layout masks."
+            )
         existing_files = {
             path: (size, mtime_ns)
             for path, size, mtime_ns in connection.execute(
@@ -398,11 +436,13 @@ def build_table(
         )
 
         if workers == 1:
-            results = map(scan_file, pending_paths)
+            results = map(scan_file, pending_paths, repeat(slice_layout))
             executor = None
         else:
             executor = ProcessPoolExecutor(max_workers=workers)
-            results = executor.map(scan_file, pending_paths, chunksize=4)
+            results = executor.map(
+                scan_file, pending_paths, repeat(slice_layout), chunksize=4
+            )
 
         try:
             for result in results:
@@ -428,6 +468,7 @@ def build_table(
             "manifest_path": str(manifest_path.resolve()),
             "manifest_size": str(manifest_stat.st_size),
             "manifest_mtime_ns": str(manifest_stat.st_mtime_ns),
+            "slice_layout": slice_layout,
         }
         connection.executemany(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
@@ -450,6 +491,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1))
+    parser.add_argument(
+        "--slice-layout",
+        choices=SLICE_LAYOUTS,
+        default=SLICE_LAYOUT_MACROBLOCK,
+    )
     parser.add_argument("--rebuild", action="store_true")
     return parser.parse_args()
 
@@ -459,7 +505,13 @@ def main() -> None:
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
     output = args.output or default_mask_table_path(args.manifest)
-    build_table(args.manifest, output, args.workers, args.rebuild)
+    build_table(
+        args.manifest,
+        output,
+        args.workers,
+        args.rebuild,
+        slice_layout=args.slice_layout,
+    )
 
 
 if __name__ == "__main__":

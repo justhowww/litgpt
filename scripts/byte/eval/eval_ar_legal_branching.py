@@ -180,6 +180,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--slice-layout",
+        choices=HM.SLICE_LAYOUTS,
+        default=HM.SLICE_LAYOUT_MACROBLOCK,
+        help=(
+            "macroblock for AVC-LM's one-MB slices; frame for one complete "
+            "progressive picture per slice, resolved from SPS."
+        ),
+    )
+    p.add_argument(
         "--no-gt-control",
         dest="gt_control",
         action="store_false",
@@ -635,8 +644,12 @@ def _first_failure(parsed: HS.StreamParse, branch_byte: int) -> dict[str, Any] |
     return None
 
 
-def _mask_audit(prefix: bytes, generated: bytes) -> dict[str, Any]:
-    state = HM.MaskState()
+def _mask_audit(
+    prefix: bytes, generated: bytes, slice_layout: str
+) -> dict[str, Any]:
+    state = HM.MaskState(
+        slice_max_mbs=HM.slice_max_mbs_for_layout(slice_layout)
+    )
     try:
         for byte in prefix:
             HM.advance(state, byte)
@@ -738,6 +751,7 @@ def evaluate_probe(
         constrain=constrain,
         prefix_bytes=probe.analysis_prefix,
         trace=trace,
+        slice_layout=args.slice_layout,
     )
     stream = probe.analysis_prefix + generated
     parsed = HS.parse_stream(stream, parse_slice_data=True)
@@ -761,7 +775,7 @@ def evaluate_probe(
         if failure is not None
         else len(stream) - probe.branch_byte
     )
-    mask = _mask_audit(probe.analysis_prefix, generated)
+    mask = _mask_audit(probe.analysis_prefix, generated, args.slice_layout)
     ffmpeg_ok, ffmpeg_error = (
         _ffmpeg_accepts(stream, args) if verified else (None, "forced_value_not_verified")
     )
@@ -1188,6 +1202,7 @@ def main() -> None:
                 row["checkpoint"] = name
                 row["decoding_mode"] = decoding_mode
                 row["branch_kind"] = "legal_alternative"
+                row["slice_layout"] = args.slice_layout
                 _persist_stream(
                     row,
                     args.out_dir,
@@ -1204,6 +1219,7 @@ def main() -> None:
                     control["checkpoint"] = name
                     control["decoding_mode"] = decoding_mode
                     control["branch_kind"] = "gt_control"
+                    control["slice_layout"] = args.slice_layout
                     _persist_stream(
                         control,
                         args.out_dir,
@@ -1215,6 +1231,7 @@ def main() -> None:
                     details.append(control)
             details_by_checkpoint[name][decoding_mode] = details
             summary = summarize(name, decoding_mode, details)
+            summary["slice_layout"] = args.slice_layout
             summaries.append(summary)
             _append_jsonl(args.out_dir / "branch_details.jsonl", details)
             _append_jsonl(args.out_dir / "metrics.jsonl", [summary])
