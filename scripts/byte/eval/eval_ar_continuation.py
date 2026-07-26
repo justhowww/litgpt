@@ -412,16 +412,45 @@ def select_continuation_clips(
             break
     if args.clip_list is not None and len(clips) != len(candidate_rows):
         selected = {str(clip.h264_path) for clip in clips}
-        ineligible = [
-            str(row["h264_path"])
+        ineligible_rows = [
+            row
             for row in candidate_rows
             if str(Path(row["h264_path"])) not in selected
         ]
+        diagnostics = []
+        for row in ineligible_rows:
+            path = Path(row["h264_path"])
+            required = _first_qualifying_window(
+                path.read_bytes(),
+                path,
+                nal_index[str(path)],
+                needed,
+                None,
+                args.prefix_frames,
+            )
+            if required is None:
+                diagnostics.append(f"  {path}: no complete {needed}-frame window")
+                continue
+            nals = nal_index[str(path)]
+            prefix_bytes = sum(
+                nal.end - nal.start for nal in nals[: required.prefix_end_nal]
+            )
+            total_bytes = sum(
+                nal.end - nal.start for nal in nals[: required.cont_end_nal]
+            )
+            continuation_bytes = total_bytes - prefix_bytes
+            diagnostics.append(
+                f"  {path}: required={total_bytes} bytes "
+                f"(prefix={prefix_bytes}, continuation={continuation_bytes}), "
+                f"over_budget={total_bytes - args.max_window_bytes}"
+            )
         raise SystemExit(
             "Explicit clip set must not silently substitute or drop videos. "
-            f"{len(ineligible)} clip(s) cannot provide "
+            f"{len(ineligible_rows)} clip(s) cannot provide "
             f"{args.prefix_frames}+{args.cont_frames} frames within "
-            f"--max-window-bytes={args.max_window_bytes}: {ineligible[:5]}. "
+            f"--max-window-bytes={args.max_window_bytes}.\n"
+            + "\n".join(diagnostics)
+            + "\n"
             "Lower --prefix-frames/--cont-frames, or raise --max-window-bytes only "
             "if the checkpoint's model context is also large enough."
         )
@@ -539,7 +568,7 @@ def _first_qualifying_window(
     path: Path,
     nals: list[NALUnit],
     needed_frames: int,
-    max_bytes: int,
+    max_bytes: int | None,
     prefix_frames: int,
 ) -> ContinuationClip | None:
     """First IDR-anchored window holding >= needed_frames REAL frames -- not raw
@@ -566,9 +595,7 @@ def _first_qualifying_window(
         while end < n:
             nal = nals[end]
             nal_len = nal.end - nal.start
-            if total + nal_len > max_bytes:
-                break
-            total += nal_len
+            first_mb = None
             if nal.nal_type in VCL_NAL_TYPES:
                 nal_bytes = data[nal.start + nal.start_code_len : nal.end]
                 first_mb = HS.slice_first_mb(nal_bytes)
@@ -577,12 +604,19 @@ def _first_qualifying_window(
                     # window past it; try the next IDR candidate instead of guessing.
                     break
                 if first_mb == 0:
-                    frames += 1
-                    if frames == prefix_frames + 1 and prefix_end < 0:
-                        prefix_end = end  # exclude this (next-frame) NAL from prefix
-                    if frames == needed_frames + 1:
-                        cont_end = end  # exclude this (next-frame) NAL from cont
+                    # This NAL starts the frame after the requested continuation.
+                    # It establishes the exclusive boundary but is not part of the
+                    # evaluated window and must not consume the byte budget.
+                    if frames == needed_frames:
+                        cont_end = end
                         break
+                    if frames == prefix_frames and prefix_end < 0:
+                        prefix_end = end  # exclude this (next-frame) NAL from prefix
+            if max_bytes is not None and total + nal_len > max_bytes:
+                break
+            total += nal_len
+            if first_mb == 0:
+                frames += 1
             end += 1
         if cont_end > 0 and prefix_end > 0:
             return ContinuationClip(
