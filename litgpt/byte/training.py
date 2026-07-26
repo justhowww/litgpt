@@ -527,7 +527,7 @@ def get_model_inputs_and_targets(
         targets = batch["labels"][:, :max_seq_length].contiguous().long()
         model_inputs = {"idx": input_ids}
         if input_ids.dim() == 3:
-            # Patched-byte GPT uses these only inside its small causal decoder:
+            # The MEGABYTE local Transformer receives these shifted by one byte:
             # logits for byte i are produced before target byte i is embedded.
             model_inputs["patch_targets"] = targets
         if "region_ids" in batch:

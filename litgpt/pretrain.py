@@ -710,12 +710,25 @@ def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) 
 
     for mod in model.modules():
         if isinstance(mod, (nn.Embedding, nn.Linear)):
-            mod.reset_parameters = partial(init_weights, mod, std=math.sqrt(2.0 / 5 / n_embd))
+            module_width = getattr(mod, "_litgpt_init_n_embd", n_embd)
+            mod.reset_parameters = partial(
+                init_weights,
+                mod,
+                std=math.sqrt(2.0 / 5 / module_width),
+            )
 
     # need a separate loop because `mod.proj` below is a `nn.Linear` too
     for mod in model.modules():
         if isinstance(mod, (LLaMAMLP, CausalSelfAttention)):
-            mod.proj.reset_parameters = partial(init_weights, mod.proj, std=(1 / math.sqrt(n_embd) / n_layer))
+            mod.proj.reset_parameters = partial(
+                init_weights,
+                mod.proj,
+                std=(
+                    1
+                    / math.sqrt(mod.config.n_embd)
+                    / mod.config.n_layer
+                ),
+            )
 
     if not isinstance(fabric.strategy, FSDPStrategy):
         reset_parameters(model)

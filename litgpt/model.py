@@ -7,6 +7,7 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
 
 import math
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -35,31 +36,153 @@ class GPT(nn.Module):
         )
         # Byte-domain extension: optional learned embeddings describe the role
         # and original byte position of tokens in rearranged AR/FIM inputs.
-        if config.use_region_id:
+        if config.use_region_id and config.byte_patch_size == 1:
             self.transformer["region_wte"] = nn.Embedding(config.region_vocab_size, config.n_embd)
-        if config.use_offset_id:
+        if config.use_offset_id and config.byte_patch_size == 1:
             assert config.offset_vocab_size is not None
-            self.transformer["offset_wte"] = nn.Embedding(config.offset_vocab_size, config.n_embd)
+            self.transformer["offset_wte"] = nn.Embedding(
+                config.offset_vocab_size, config.n_embd
+            )
         if config.byte_patch_size > 1:
-            # Concatenation preserves the order of bytes inside a patch. A
-            # learned projection then produces the one embedding consumed by
-            # the expensive transformer stack.
-            self.patch_input_proj = nn.Linear(
-                config.byte_patch_size * config.n_embd, config.n_embd
+            patch_size = config.byte_patch_size
+            global_byte_dim = config.n_embd // patch_size
+            local_config = replace(
+                config,
+                name=f"{config.name}-megabyte-local",
+                block_size=patch_size,
+                n_layer=config.megabyte_local_n_layer,
+                n_embd=config.megabyte_local_n_embd,
+                n_head=config.megabyte_local_n_head,
+                head_size=None,
+                n_query_groups=None,
+                intermediate_size=4 * config.megabyte_local_n_embd,
+                byte_patch_size=1,
+                use_region_id=False,
+                use_offset_id=False,
+                offset_vocab_size=None,
+                sliding_window_size=None,
+                sliding_window_indices=None,
+                rope_adjustments=None,
+                rope_indices=None,
+                latent_attention=None,
+                n_expert=0,
+                n_shared_expert=None,
+                n_expert_groups=None,
+                n_topk_groups=None,
+                n_topk_scores_per_group=None,
+                n_expert_per_token=0,
+                first_k_dense_replace=None,
             )
-            # The transformer state predicts one patch. Bytes within that
-            # patch are decoded sequentially, conditioned on preceding GT bytes
-            # during teacher forcing. This is causal and avoids a 256**K head.
-            self.patch_decoder = nn.Linear(2 * config.n_embd, config.n_embd)
-            self.patch_norm = config.norm_class(
-                config.n_embd, eps=config.norm_eps
+            self.megabyte_local_config = local_config
+            self.megabyte_global_wte = nn.Embedding(
+                config.padded_vocab_size, global_byte_dim
             )
-            self.patch_bos = nn.Embedding(1, config.n_embd)
-            self.patch_pos_wte = nn.Embedding(
-                config.byte_patch_size, config.n_embd
+            if config.use_region_id:
+                self.megabyte_global_region_wte = nn.Embedding(
+                    config.region_vocab_size, global_byte_dim
+                )
+            if config.use_offset_id:
+                assert config.offset_vocab_size is not None
+                self.megabyte_global_offset_wte = nn.Embedding(
+                    config.offset_vocab_size, global_byte_dim
+                )
+            self.megabyte_global_to_local = nn.Linear(
+                global_byte_dim,
+                local_config.n_embd,
+                bias=False,
             )
+            self.megabyte_local = nn.ModuleDict(
+                dict(
+                    wte=nn.Embedding(
+                        config.padded_vocab_size, local_config.n_embd
+                    ),
+                    pos_wte=nn.Embedding(patch_size, local_config.n_embd),
+                    pad_wte=nn.Embedding(1, local_config.n_embd),
+                    h=nn.ModuleList(
+                        Block(local_config, block_idx)
+                        for block_idx in range(local_config.n_layer)
+                    ),
+                    ln_f=local_config.norm_class(
+                        local_config.n_embd, eps=local_config.norm_eps
+                    ),
+                )
+            )
+            local_cos, local_sin = build_rope_cache(
+                seq_len=patch_size,
+                n_elem=local_config.rope_n_elem,
+                base=local_config.rope_base,
+                condense_ratio=local_config.rope_condense_ratio,
+            )
+            self.register_buffer(
+                "megabyte_local_cos", local_cos, persistent=False
+            )
+            self.register_buffer(
+                "megabyte_local_sin", local_sin, persistent=False
+            )
+            self._set_megabyte_init_widths(global_byte_dim)
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
+
+    def _set_megabyte_init_widths(self, global_byte_dim: int) -> None:
+        """Tell the shared initializer which width each MEGABYTE module uses."""
+        for module in self.megabyte_local.modules():
+            module._litgpt_init_n_embd = self.megabyte_local_config.n_embd
+        self.megabyte_global_wte._litgpt_init_n_embd = global_byte_dim
+        self.megabyte_global_to_local._litgpt_init_n_embd = global_byte_dim
+        if self.config.use_region_id:
+            self.megabyte_global_region_wte._litgpt_init_n_embd = (
+                global_byte_dim
+            )
+        if self.config.use_offset_id:
+            self.megabyte_global_offset_wte._litgpt_init_n_embd = (
+                global_byte_dim
+            )
+
+    def _megabyte_global_embed(
+        self,
+        idx: torch.Tensor,
+        region_ids: torch.Tensor | None,
+        offset_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Losslessly concatenate the ordered byte embeddings in every patch."""
+        B, T, _ = idx.shape
+        x = self.megabyte_global_wte(idx)
+        if self.config.use_region_id:
+            if region_ids is None:
+                raise ValueError(
+                    "region_ids must be provided when config.use_region_id=True"
+                )
+            x = x + self.megabyte_global_region_wte(region_ids)
+        if self.config.use_offset_id:
+            if offset_ids is None:
+                raise ValueError(
+                    "offset_ids must be provided when config.use_offset_id=True"
+                )
+            x = x + self.megabyte_global_offset_wte(
+                offset_ids.clamp_max(self.config.offset_vocab_size - 1)
+            )
+        return x.reshape(B, T, self.config.n_embd)
+
+    def _megabyte_local_inputs(
+        self, global_output: torch.Tensor, patch_targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Build shifted local inputs; target byte p is unavailable at slot p."""
+        B, T, _ = global_output.shape
+        patch_size = self.config.byte_patch_size
+        global_byte_dim = self.config.n_embd // patch_size
+        global_condition = self.megabyte_global_to_local(
+            global_output.reshape(B, T, patch_size, global_byte_dim)
+        )
+        safe_targets = patch_targets.clamp_min(0)
+        previous_bytes = self.megabyte_local.wte(safe_targets[..., :-1])
+        local_pad = self.megabyte_local.pad_wte.weight[0].view(
+            1, 1, 1, -1
+        ).expand(B, T, 1, -1)
+        previous_bytes = torch.cat((local_pad, previous_bytes), dim=2)
+        local_positions = self.megabyte_local.pos_wte.weight.view(
+            1, 1, patch_size, -1
+        )
+        return global_condition + previous_bytes + local_positions
 
     @property
     def max_seq_length(self) -> int:
@@ -95,6 +218,15 @@ class GPT(nn.Module):
     def reset_parameters(self) -> None:
         # Trigger resetting the rope-cache
         self.cos, self.sin = self.rope_cache(device=self.cos.device)
+        if self.config.byte_patch_size > 1:
+            local_config = self.megabyte_local_config
+            self.megabyte_local_cos, self.megabyte_local_sin = build_rope_cache(
+                seq_len=self.config.byte_patch_size,
+                n_elem=local_config.rope_n_elem,
+                device=self.megabyte_local_cos.device,
+                base=local_config.rope_base,
+                condense_ratio=local_config.rope_condense_ratio,
+            )
 
     def _init_weights(self, module: nn.Module) -> None:
         """Meant to be used with `gpt.apply(gpt._init_weights)`."""
@@ -138,9 +270,9 @@ class GPT(nn.Module):
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
             patch_targets: Required when ``config.byte_patch_size > 1``.
-                Teacher-forced target ids with shape ``(B, T, K)``. Byte ``i``
-                within a patch is predicted using only the transformer state
-                and target bytes ``< i``.
+                Teacher-forced target ids with shape ``(B, T, P)``. The
+                MEGABYTE local Transformer receives a one-byte-shifted version,
+                so byte ``i`` can use target bytes ``< i`` but not itself.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
@@ -207,24 +339,38 @@ class GPT(nn.Module):
             mask = None  # defaults to causal mask
             input_pos_maxp1 = None
 
-        x = self.transformer.wte(idx)
-        # Byte-domain extension: add auxiliary structure embeddings before the
-        # unchanged transformer stack. Text models leave both options disabled.
-        if self.config.use_region_id:
-            if region_ids is None:
-                raise ValueError("region_ids must be provided when config.use_region_id=True")
-            x = x + self.transformer.region_wte(region_ids)
-        if self.config.use_offset_id:
-            if offset_ids is None:
-                raise ValueError("offset_ids must be provided when config.use_offset_id=True")
-            x = x + self.transformer.offset_wte(offset_ids.clamp_max(self.config.offset_vocab_size - 1))
         if patch_size > 1:
-            B = idx.size(0)
-            x = self.patch_input_proj(
-                x.reshape(B, T, patch_size * self.config.n_embd)
-            ) / math.sqrt(patch_size)
+            # MEGABYTE's patch embedder is lossless: P ordered embeddings of
+            # width DG are concatenated into the global width P*DG. There is no
+            # learned compression before global attention.
+            x = self._megabyte_global_embed(idx, region_ids, offset_ids)
+        else:
+            x = self.transformer.wte(idx)
+            # Byte-domain extension: add auxiliary structure embeddings before
+            # the unchanged Transformer stack. Text models leave both disabled.
+            if self.config.use_region_id:
+                if region_ids is None:
+                    raise ValueError(
+                        "region_ids must be provided when "
+                        "config.use_region_id=True"
+                    )
+                x = x + self.transformer.region_wte(region_ids)
+            if self.config.use_offset_id:
+                if offset_ids is None:
+                    raise ValueError(
+                        "offset_ids must be provided when "
+                        "config.use_offset_id=True"
+                    )
+                x = x + self.transformer.offset_wte(
+                    offset_ids.clamp_max(self.config.offset_vocab_size - 1)
+                )
         if self.config.scale_embeddings:
-            x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
+            embedding_dim = (
+                self.config.n_embd // patch_size
+                if patch_size > 1
+                else self.config.n_embd
+            )
+            x = x * torch.tensor(embedding_dim**0.5, dtype=x.dtype)
 
         for block_idx, block in enumerate(self.transformer.h):
             if self.config.rope_indices is not None:
@@ -247,26 +393,27 @@ class GPT(nn.Module):
         if patch_size > 1:
             assert patch_targets is not None
             B = x.size(0)
-            state = x
-            previous = self.patch_bos.weight[0].view(1, 1, -1).expand(B, T, -1)
-            safe_targets = patch_targets.clamp_min(0)
-            patch_logits = []
-            for byte_index in range(patch_size):
-                position = self.patch_pos_wte.weight[byte_index].view(1, 1, -1)
-                update = self.patch_decoder(
-                    torch.cat((state, previous + position), dim=-1)
-                ) / math.sqrt(2.0)
-                state = self.patch_norm(
-                    state + F.gelu(update)
+            local_x = self._megabyte_local_inputs(x, patch_targets)
+            local_x = local_x.reshape(
+                B * T, patch_size, self.megabyte_local_config.n_embd
+            )
+            local_cos = self.megabyte_local_cos.unsqueeze(0)
+            local_sin = self.megabyte_local_sin.unsqueeze(0)
+            for block in self.megabyte_local.h:
+                local_x = block(
+                    local_x,
+                    local_cos,
+                    local_sin,
+                    mask=None,
+                    input_pos=None,
+                    input_pos_maxp1=None,
                 )
-                patch_logits.append(clamp_head(self.lm_head(state)))
-                if byte_index + 1 < patch_size:
-                    # Teacher forcing happens only after this byte's logits are
-                    # produced, so future bytes cannot leak into earlier logits.
-                    previous = self.transformer.wte(
-                        safe_targets[..., byte_index]
-                    )
-            return torch.stack(patch_logits, dim=2)
+            local_x = self.megabyte_local.ln_f(local_x)
+            logits = F.linear(local_x, self.megabyte_local.wte.weight)
+            logits = logits.view(
+                B, T, patch_size, self.config.padded_vocab_size
+            )
+            return clamp_head(logits)
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
             return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]

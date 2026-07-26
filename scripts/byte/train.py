@@ -59,8 +59,27 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help=(
             "Consecutive byte/control ids per transformer position. Values above "
-            "one use a small causal inner decoder and require training from scratch."
+            "one use a MEGABYTE global/local Transformer and require training "
+            "from scratch."
         ),
+    )
+    parser.add_argument(
+        "--megabyte-local-layers",
+        type=int,
+        default=4,
+        help="Number of shared causal Transformer layers inside each byte patch.",
+    )
+    parser.add_argument(
+        "--megabyte-local-embd",
+        type=int,
+        default=512,
+        help="Embedding width of the MEGABYTE local Transformer.",
+    )
+    parser.add_argument(
+        "--megabyte-local-heads",
+        type=int,
+        default=8,
+        help="Attention heads in the MEGABYTE local Transformer.",
     )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--devices", type=int, default=1)
@@ -394,7 +413,15 @@ def main() -> None:
         padding_multiple=8,
         use_region_id=use_region_id,
         use_offset_id=use_offset_id,
+        offset_vocab_size=(
+            args.block_size * args.byte_patch_size
+            if use_offset_id and args.byte_patch_size > 1
+            else None
+        ),
         byte_patch_size=args.byte_patch_size,
+        megabyte_local_n_layer=args.megabyte_local_layers,
+        megabyte_local_n_embd=args.megabyte_local_embd,
+        megabyte_local_n_head=args.megabyte_local_heads,
     )
     data_config = ByteDataConfig(
         byte_patch_size=args.byte_patch_size,

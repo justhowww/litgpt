@@ -1525,8 +1525,9 @@ def patch_byte_sample(sample: dict[str, Any], patch_size: int) -> dict[str, Any]
       * lets the final prompt patch predict target patch 0;
       * uses each completed target patch as the next transformer input.
 
-    Bytes within a target patch remain causal in ``GPT``'s small inner decoder.
-    The construction supports window AR, slice AR, and trailing-target FIM.
+    Bytes within a target patch remain causal in ``GPT``'s shared MEGABYTE
+    local Transformer. The construction supports window AR, slice AR, and
+    trailing-target FIM.
     """
     if patch_size < 2:
         raise ValueError("patch_byte_sample requires patch_size >= 2")

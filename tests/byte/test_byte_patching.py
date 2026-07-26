@@ -88,9 +88,8 @@ def test_fim_prompt_ends_before_any_missing_byte_enters_patch_input():
     ]
 
 
-def test_patch_decoder_is_causal_within_each_transformer_position():
-    torch.manual_seed(7)
-    config = Config(
+def _patch_config(**kwargs) -> Config:
+    return Config(
         block_size=4,
         n_layer=1,
         n_embd=16,
@@ -98,7 +97,54 @@ def test_patch_decoder_is_causal_within_each_transformer_position():
         vocab_size=VOCAB_SIZE,
         padding_multiple=8,
         byte_patch_size=4,
+        megabyte_local_n_layer=1,
+        megabyte_local_n_embd=16,
+        megabyte_local_n_head=4,
+        **kwargs,
     )
+
+
+def test_megabyte_uses_lossless_global_patch_embedding():
+    torch.manual_seed(7)
+    model = GPT(_patch_config()).eval()
+    input_ids = torch.tensor([[[1, 2, 3, 4], [5, 6, 7, 8]]])
+
+    embedded = model.megabyte_global_wte(input_ids)
+    global_inputs = model._megabyte_global_embed(input_ids, None, None)
+
+    assert model.megabyte_global_wte.embedding_dim == 4
+    assert global_inputs.shape == (1, 2, 16)
+    assert torch.equal(global_inputs, embedded.reshape(1, 2, 16))
+    assert not hasattr(model, "patch_input_proj")
+
+
+def test_megabyte_patch_embedding_accepts_region_and_raw_byte_offsets():
+    torch.manual_seed(8)
+    model = GPT(
+        _patch_config(
+            use_region_id=True,
+            use_offset_id=True,
+            offset_vocab_size=16,
+        )
+    ).eval()
+    input_ids = torch.tensor([[[1, 2, 3, 4]]])
+    region_ids = torch.tensor([[[REGION_TARGET] * 4]])
+    offset_ids = torch.tensor([[[4, 5, 6, 7]]])
+    targets = torch.tensor([[[10, 11, 12, 13]]])
+
+    logits = model(
+        input_ids,
+        region_ids=region_ids,
+        offset_ids=offset_ids,
+        patch_targets=targets,
+    )
+
+    assert logits.shape == (1, 1, 4, model.config.padded_vocab_size)
+
+
+def test_megabyte_local_transformer_is_causal_within_each_patch():
+    torch.manual_seed(7)
+    config = _patch_config()
     model = GPT(config).eval()
     input_ids = torch.tensor([[[PAD_ID, PAD_ID, PAD_ID, SLICE_BOS_ID]]])
     targets_a = torch.tensor([[[10, 11, 12, 13]]])
@@ -113,6 +159,24 @@ def test_patch_decoder_is_causal_within_each_transformer_position():
     assert torch.equal(logits_a[..., :3, :], logits_b[..., :3, :])
     # It is allowed to alter byte 3, which causally consumes target byte 2.
     assert not torch.equal(logits_a[..., 3, :], logits_b[..., 3, :])
+
+
+def test_megabyte_global_and_local_towers_receive_gradients():
+    torch.manual_seed(11)
+    model = GPT(_patch_config()).train()
+    input_ids = torch.tensor(
+        [[[PAD_ID, PAD_ID, PAD_ID, SLICE_BOS_ID], [10, 11, 12, 13]]]
+    )
+    targets = torch.tensor([[[10, 11, 12, 13], [14, 15, 16, 17]]])
+
+    logits = model(input_ids, patch_targets=targets)
+    byte_training_loss(logits, targets).backward()
+
+    assert model.megabyte_global_wte.weight.grad is not None
+    assert model.transformer.h[0].attn.qkv.weight.grad is not None
+    assert model.megabyte_global_to_local.weight.grad is not None
+    assert model.megabyte_local.h[0].attn.qkv.weight.grad is not None
+    assert model.megabyte_local.wte.weight.grad is not None
 
 
 def test_byte_loss_accepts_patch_shaped_logits_and_targets():

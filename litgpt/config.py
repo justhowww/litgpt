@@ -39,11 +39,13 @@ class Config:
     region_vocab_size: int = 7
     use_offset_id: bool = False
     offset_vocab_size: int | None = None
-    # Byte-domain patching. A value greater than one means each transformer
-    # position represents this many consecutive byte/control ids. The model
-    # predicts those ids causally with a small shared inner decoder, so this
-    # reduces attention/KV positions without creating a 256**K vocabulary.
+    # MEGABYTE-style byte patching. A value greater than one means each global
+    # Transformer position represents this many consecutive byte/control ids.
+    # A smaller local Transformer predicts the bytes causally inside each patch.
     byte_patch_size: int = 1
+    megabyte_local_n_layer: int = 4
+    megabyte_local_n_embd: int = 512
+    megabyte_local_n_head: int = 8
     # Transformer block (structure, normalizations)
     norm_class_name: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
     norm_eps: float = 1e-5
@@ -129,6 +131,22 @@ class Config:
     def __post_init__(self):
         if self.byte_patch_size < 1:
             raise ValueError("byte_patch_size must be positive")
+        if self.byte_patch_size > 1:
+            if self.n_embd % self.byte_patch_size:
+                raise ValueError(
+                    "MEGABYTE global n_embd must be divisible by byte_patch_size"
+                )
+            if self.megabyte_local_n_layer < 1:
+                raise ValueError("megabyte_local_n_layer must be positive")
+            if self.megabyte_local_n_embd < 1:
+                raise ValueError("megabyte_local_n_embd must be positive")
+            if self.megabyte_local_n_head < 1:
+                raise ValueError("megabyte_local_n_head must be positive")
+            if self.megabyte_local_n_embd % self.megabyte_local_n_head:
+                raise ValueError(
+                    "megabyte_local_n_embd must be divisible by "
+                    "megabyte_local_n_head"
+                )
         if not self.name:
             self.name = self.hf_config.get("name", self.name)
 

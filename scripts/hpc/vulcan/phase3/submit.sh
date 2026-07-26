@@ -9,8 +9,9 @@
 #   budget -- the card's real ceiling, not a smooth continuation of the trend). 27L/341M
 #   measured 39.5GB, ~8.5GB of margin on TWO GPUs. On four (this run), FSDP shards
 #   weights/opt/grads across twice as many ranks, so per-GPU headroom is larger still.
-#   BYTE_PATCH_SIZE>1 adds a small patch encoder/decoder (about 10.5M parameters
-#   for K=8, d=1024) and must still be checked with the first logged peak-memory line.
+#   BYTE_PATCH_SIZE>1 replaces the byte embedding/head path with a shared
+#   MEGABYTE local Transformer. Its size is controlled independently below and
+#   must be checked with the first logged parameter-count and peak-memory lines.
 #
 #   Video count (45,000, rounding up from a ~42k estimate): phase 1's real anchor is
 #   1000 videos / 85M params; phase 3's own road-list spec is 150,000 videos / 300M-1B.
@@ -51,6 +52,9 @@ export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 # probes showed the failure mode is a hard ceiling, not a graceful degradation).
 export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 export BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE:-1}
+export MEGABYTE_LOCAL_LAYERS=${MEGABYTE_LOCAL_LAYERS:-4}
+export MEGABYTE_LOCAL_EMBD=${MEGABYTE_LOCAL_EMBD:-512}
+export MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS:-8}
 export VAL_FRACTION=${VAL_FRACTION:-0.01}
 export EVAL_INTERVAL=${EVAL_INTERVAL:-250}
 export SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
@@ -84,9 +88,9 @@ if [[ -z "${MODEL_TAG+x}" ]]; then
     if [[ "${BYTE_PATCH_SIZE}" == "1" ]]; then
         export MODEL_TAG=byte-phase3-45kv-341m
     else
-        # Never resume an incompatible one-byte checkpoint merely because the
-        # caller changed BYTE_PATCH_SIZE but forgot to choose a fresh run name.
-        export MODEL_TAG="byte-phase3-45kv-341m-patch${BYTE_PATCH_SIZE}"
+        # Keep MEGABYTE runs separate from both one-byte checkpoints and the
+        # earlier provisional patch decoder.
+        export MODEL_TAG="byte-phase3-45kv-341m-megabyte-patch${BYTE_PATCH_SIZE}"
     fi
 else
     export MODEL_TAG
@@ -104,7 +108,7 @@ sbatch_args=(--parsable --export=ALL
 # 1-12:00:00 wall-time cap rather than exiting 0, and afterok would never fire on that.
 [[ -n "${AFTER_JOBID:-}" ]] && sbatch_args+=(--dependency=afterany:"${AFTER_JOBID}")
 
-echo "[phase3/vulcan] ${MAX_ROWS} videos / ~341M base (${N_LAYER}/${N_EMBD}/${N_HEAD}) / ${DEVICES}x a6000 / p_fim=${P_FIM} / patch=${BYTE_PATCH_SIZE} / steps=${STEPS}"
+echo "[phase3/vulcan] ${MAX_ROWS} videos / ~341M global (${N_LAYER}/${N_EMBD}/${N_HEAD}) / local=${MEGABYTE_LOCAL_LAYERS}L/${MEGABYTE_LOCAL_EMBD}D/${MEGABYTE_LOCAL_HEADS}H / ${DEVICES}x a6000 / p_fim=${P_FIM} / patch=${BYTE_PATCH_SIZE} / steps=${STEPS}"
 echo "  OUT_DIR=${OUT_DIR}"
 [[ -n "${AFTER_JOBID:-}" ]] && echo "  chained after job ${AFTER_JOBID} (afterany)"
 job_id=$(sbatch "${sbatch_args[@]}" "${SCRIPT_DIR}/train.sbatch")

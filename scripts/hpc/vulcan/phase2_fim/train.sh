@@ -39,6 +39,9 @@ OUT_DIR=${OUT_DIR:?Set OUT_DIR to the run directory}
 NAL_INDEX=${NAL_INDEX:-"$(dirname "${MANIFEST}")/nal_index.sqlite"}
 BLOCK_SIZE=${BLOCK_SIZE:-16384}
 BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE:-1}
+MEGABYTE_LOCAL_LAYERS=${MEGABYTE_LOCAL_LAYERS:-4}
+MEGABYTE_LOCAL_EMBD=${MEGABYTE_LOCAL_EMBD:-512}
+MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS:-8}
 STEPS=${STEPS:-100000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
@@ -114,6 +117,9 @@ cmd=(
     --window-min-frames "${WINDOW_MIN_FRAMES}"
     --block-size "${BLOCK_SIZE}"
     --byte-patch-size "${BYTE_PATCH_SIZE}"
+    --megabyte-local-layers "${MEGABYTE_LOCAL_LAYERS}"
+    --megabyte-local-embd "${MEGABYTE_LOCAL_EMBD}"
+    --megabyte-local-heads "${MEGABYTE_LOCAL_HEADS}"
     --steps "${STEPS}"
     --warmup-steps "${WARMUP_STEPS}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
@@ -171,7 +177,7 @@ if [[ "${COMPILE}" == "1" ]]; then
     cmd+=(--compile)
 fi
 
-echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} patch=${BYTE_PATCH_SIZE} raw_byte_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE)) steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
+echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} patch=${BYTE_PATCH_SIZE} local=${MEGABYTE_LOCAL_LAYERS}L/${MEGABYTE_LOCAL_EMBD}D/${MEGABYTE_LOCAL_HEADS}H raw_byte_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE)) steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
 echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fim_format=${FIM_FORMAT} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
 
 flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {
