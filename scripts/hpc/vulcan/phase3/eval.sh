@@ -28,6 +28,7 @@ NUM_CLIPS=${NUM_CLIPS:-20}
 PREFIX_FRAMES=${PREFIX_FRAMES:-4}
 CONT_FRAMES=${CONT_FRAMES:-2}
 MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-16384}
+MAX_GEN_MULTIPLE=${MAX_GEN_MULTIPLE:-2}
 SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
 EVAL_INTRA=${EVAL_INTRA:-1}
 
@@ -49,6 +50,7 @@ COMMON_TRAIN=(
     --seed 42
     --prefix-frames "${PREFIX_FRAMES}" --cont-frames "${CONT_FRAMES}"
     --max-window-bytes "${MAX_WINDOW_BYTES}"
+    --max-gen-multiple "${MAX_GEN_MULTIPLE}"
     --slice-layout "${SLICE_LAYOUT}"
 )
 if [[ "${EVAL_INTRA}" == "0" ]]; then
