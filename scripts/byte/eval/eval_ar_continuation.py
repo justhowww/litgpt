@@ -422,7 +422,8 @@ def select_continuation_clips(
             f"{len(ineligible)} clip(s) cannot provide "
             f"{args.prefix_frames}+{args.cont_frames} frames within "
             f"--max-window-bytes={args.max_window_bytes}: {ineligible[:5]}. "
-            "Raise --max-window-bytes or choose a different fixed set."
+            "Lower --prefix-frames/--cont-frames, or raise --max-window-bytes only "
+            "if the checkpoint's model context is also large enough."
         )
     return clips
 
