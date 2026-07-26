@@ -80,6 +80,10 @@ def vocab_size_for_fim_format(fim_format: FIMFormat, use_eos: bool = False) -> i
 class ByteDataConfig:
     """Hyperparameters controlling byte-domain sample construction."""
 
+    # Consecutive byte/control ids represented by one transformer position.
+    # Dataset sample construction remains byte-native; collation converts the
+    # causal prompt/target boundary into patches without leaking target bytes.
+    byte_patch_size: int = 1
     p_fim: float = 0.0  # Probability of FIM sample; otherwise sample is AR.
     # Debug-only overfit mode. Normal training redraws a window-FIM hole on every
     # access. When true, seed+dataset-index selects one stable hole per train window
@@ -1442,8 +1446,16 @@ class ByteStreamWindowDataset(Dataset):
 
 
 def collate_byte_samples(
-    samples: list[dict[str, Any]], max_seq_length: int
+    samples: list[dict[str, Any]],
+    max_seq_length: int,
+    byte_patch_size: int = 1,
 ) -> dict[str, Tensor | dict[str, Tensor]]:
+    if byte_patch_size < 1:
+        raise ValueError("byte_patch_size must be positive")
+    if byte_patch_size > 1:
+        samples = [
+            patch_byte_sample(sample, byte_patch_size) for sample in samples
+        ]
     return {
         "input_ids": pad_and_truncate(
             [sample["input_ids"] for sample in samples], max_seq_length, PAD_ID
@@ -1457,6 +1469,17 @@ def collate_byte_samples(
         "offset_ids": pad_and_truncate(
             [sample["offset_ids"] for sample in samples], max_seq_length, 0
         ),
+        **(
+            {
+                "target_region_ids": pad_and_truncate(
+                    [sample["target_region_ids"] for sample in samples],
+                    max_seq_length,
+                    REGION_PAD,
+                )
+            }
+            if byte_patch_size > 1
+            else {}
+        ),
         "token_counts": {
             "raw": torch.tensor(
                 [sample["token_counts"]["raw"] for sample in samples], dtype=torch.int64
@@ -1468,6 +1491,124 @@ def collate_byte_samples(
                 ],
                 dtype=torch.int64,
             ).unsqueeze(1),
+            "transformer_positions": torch.tensor(
+                [sample["input_ids"].size(0) for sample in samples],
+                dtype=torch.int64,
+            ).unsqueeze(1),
+        },
+    }
+
+
+def _pad_patch_axis(
+    tensor: Tensor, patch_size: int, value: int, *, left: bool
+) -> Tensor:
+    """Pad a one-dimensional tensor to K and return shape ``(positions, K)``."""
+    pad = (-tensor.numel()) % patch_size
+    if pad:
+        fill = torch.full(
+            (pad,), value, dtype=tensor.dtype, device=tensor.device
+        )
+        tensor = torch.cat((fill, tensor)) if left else torch.cat((tensor, fill))
+    return tensor.view(-1, patch_size)
+
+
+def patch_byte_sample(sample: dict[str, Any], patch_size: int) -> dict[str, Any]:
+    """Convert a shifted byte-LM sample into causal next-patch supervision.
+
+    The existing byte datasets use ``input[s] -> label[s]`` at the first
+    supervised position and then teacher-force with
+    ``input[s+1:] == label[s:-1]``. Merely reshaping those tensors would expose
+    target bytes 0..K-2 while predicting them. Instead, this function:
+
+      * left-pads and patches the complete known prompt ending at ``input[s]``;
+      * right-pads the supervised target into patches;
+      * lets the final prompt patch predict target patch 0;
+      * uses each completed target patch as the next transformer input.
+
+    Bytes within a target patch remain causal in ``GPT``'s small inner decoder.
+    The construction supports window AR, slice AR, and trailing-target FIM.
+    """
+    if patch_size < 2:
+        raise ValueError("patch_byte_sample requires patch_size >= 2")
+    input_ids = sample["input_ids"]
+    labels = sample["labels"]
+    region_ids = sample["region_ids"]
+    offset_ids = sample["offset_ids"]
+    supervised = (labels != IGNORE_INDEX).nonzero(as_tuple=False).flatten()
+    if supervised.numel() == 0:
+        raise ValueError("byte sample has no supervised target")
+    first = int(supervised[0])
+    last = int(supervised[-1])
+    expected = torch.arange(first, last + 1, device=supervised.device)
+    if not torch.equal(supervised, expected):
+        raise ValueError("patched-byte training requires one contiguous target tail")
+    if last != labels.numel() - 1:
+        raise ValueError("patched-byte training requires supervision through sample end")
+    if last > first and not torch.equal(
+        input_ids[first + 1 : last + 1], labels[first:last]
+    ):
+        raise ValueError("byte sample teacher-forcing shift is inconsistent")
+
+    prompt_end = first + 1
+    prompt_ids = _pad_patch_axis(
+        input_ids[:prompt_end], patch_size, PAD_ID, left=True
+    )
+    prompt_regions = _pad_patch_axis(
+        region_ids[:prompt_end], patch_size, REGION_PAD, left=True
+    )
+    prompt_offsets = _pad_patch_axis(
+        offset_ids[:prompt_end], patch_size, 0, left=True
+    )
+
+    target_labels = _pad_patch_axis(
+        labels[first:], patch_size, IGNORE_INDEX, left=False
+    )
+    target_regions = _pad_patch_axis(
+        region_ids[first:], patch_size, REGION_PAD, left=False
+    )
+    target_inputs = target_labels.clamp_min(0)
+
+    # A completed target byte later becomes an input byte. Its input-side
+    # auxiliary ids therefore come from the *next* position in the original
+    # shifted sample, not from the position whose label predicted it.
+    num_reused_target_bytes = (target_labels.size(0) - 1) * patch_size
+    reused_regions = region_ids[
+        first + 1 : first + 1 + num_reused_target_bytes
+    ].view(-1, patch_size)
+    reused_offsets = offset_ids[
+        first + 1 : first + 1 + num_reused_target_bytes
+    ].view(-1, patch_size)
+
+    input_patches = torch.cat((prompt_ids, target_inputs[:-1]), dim=0)
+    input_regions = torch.cat((prompt_regions, reused_regions), dim=0)
+    input_offsets = torch.cat((prompt_offsets, reused_offsets), dim=0)
+    ignored_prompt = torch.full(
+        (prompt_ids.size(0) - 1, patch_size),
+        IGNORE_INDEX,
+        dtype=labels.dtype,
+        device=labels.device,
+    )
+    ignored_regions = torch.full(
+        (prompt_ids.size(0) - 1, patch_size),
+        REGION_PAD,
+        dtype=region_ids.dtype,
+        device=region_ids.device,
+    )
+    output_labels = torch.cat((ignored_prompt, target_labels), dim=0)
+    output_regions = torch.cat((ignored_regions, target_regions), dim=0)
+
+    if input_patches.shape != output_labels.shape:
+        raise RuntimeError("patched input/target position counts disagree")
+    return {
+        **sample,
+        "input_ids": input_patches,
+        "labels": output_labels,
+        "region_ids": input_regions,
+        "offset_ids": input_offsets,
+        "target_region_ids": output_regions,
+        "token_counts": {
+            **sample["token_counts"],
+            "transformer_positions": int(input_patches.size(0)),
         },
     }
 
@@ -1497,6 +1638,8 @@ class ByteDataModule(DataModule):
     def __post_init__(self) -> None:
         super().__init__()
         self.manifest_path = Path(self.manifest_path)
+        if self.config.byte_patch_size < 1:
+            raise ValueError("byte_patch_size must be positive")
         if self.nal_index_path is not None:
             self.nal_index_path = Path(self.nal_index_path)
 
@@ -1527,11 +1670,20 @@ class ByteDataModule(DataModule):
         if self.nal_index_path is not None and nal_index is None:
             raise FileNotFoundError(f"NAL index does not exist: {index_path}")
 
+        # ``self.max_seq_length`` is measured in transformer positions. Leave
+        # one raw-byte slot of headroom because a conditioned AR/FIM sample has
+        # a separately rounded prompt and target patch boundary.
+        byte_max_seq_length = (
+            self.max_seq_length
+            if self.config.byte_patch_size == 1
+            else self.max_seq_length * self.config.byte_patch_size - 1
+        )
+
         def _build_dataset(rows_subset: list[dict[str, Any]]) -> Dataset:
             if self.config.dataset_mode == "window":
                 return ByteStreamWindowDataset(
                     rows_subset,
-                    max_seq_length=self.max_seq_length,
+                    max_seq_length=byte_max_seq_length,
                     min_frames=self.config.window_min_frames,
                     p_fim=self.config.p_fim,
                     fim_format=self.config.fim_format,
@@ -1544,7 +1696,7 @@ class ByteDataModule(DataModule):
                 )
             return ByteSliceDataset(
                 rows_subset,
-                max_seq_length=self.max_seq_length,
+                max_seq_length=byte_max_seq_length,
                 p_fim=self.config.p_fim,
                 fim_format=self.config.fim_format,
                 use_eos=self.config.use_eos,
@@ -1662,6 +1814,13 @@ class ByteDataModule(DataModule):
         payload = {
             "manifest": str(self.manifest_path),
             "max_manifest_rows": self.max_manifest_rows,
+            "byte_patch_size": self.config.byte_patch_size,
+            "transformer_block_size": self.max_seq_length,
+            "raw_byte_budget": (
+                self.max_seq_length
+                if self.config.byte_patch_size == 1
+                else self.max_seq_length * self.config.byte_patch_size - 1
+            ),
             "split_by_video": self.config.split_by_video,
             "val_fraction": self.config.val_fraction,
             "seed": self.config.seed,
@@ -1708,4 +1867,8 @@ class ByteDataModule(DataModule):
     def _collate_fn(
         self, samples: list[dict[str, Any]]
     ) -> dict[str, Tensor | dict[str, Tensor]]:
-        return collate_byte_samples(samples, max_seq_length=self.max_seq_length)
+        return collate_byte_samples(
+            samples,
+            max_seq_length=self.max_seq_length,
+            byte_patch_size=self.config.byte_patch_size,
+        )

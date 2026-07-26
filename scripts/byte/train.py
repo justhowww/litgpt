@@ -47,9 +47,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16384,
         help=(
-            "Model context length. The preliminary 5,940-sample scan retained "
-            "full metadata+reference+target context for 93.42%% of samples and "
-            "excluded 0%% of targets at 16K."
+            "Transformer context length in positions. With --byte-patch-size K, "
+            "one position represents K byte/control ids and the raw-byte window "
+            "budget is approximately block_size*K."
+        ),
+    )
+    parser.add_argument(
+        "--byte-patch-size",
+        type=int,
+        choices=(1, 4, 8),
+        default=1,
+        help=(
+            "Consecutive byte/control ids per transformer position. Values above "
+            "one use a small causal inner decoder and require training from scratch."
         ),
     )
     parser.add_argument("--steps", type=int, default=100)
@@ -313,6 +323,20 @@ def main() -> None:
         )
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
+    if args.byte_patch_size > 1 and args.free_run_eval_interval > 0:
+        raise ValueError(
+            "In-training free-run evaluation is not yet ported to byte patches; "
+            "set --free-run-eval-interval 0"
+        )
+    if args.byte_patch_size > 1 and args.reconstruction_eval_interval > 0:
+        raise ValueError(
+            "Reconstruction evaluation is not yet ported to byte patches; "
+            "set --reconstruction-eval-interval 0"
+        )
+    if args.byte_patch_size > 1 and args.mrt_interval > 0:
+        raise ValueError(
+            "MRT generation is not yet ported to byte patches; set --mrt-interval 0"
+        )
     if (
         args.mrt_interval > 0
         and not args.use_eos
@@ -370,8 +394,10 @@ def main() -> None:
         padding_multiple=8,
         use_region_id=use_region_id,
         use_offset_id=use_offset_id,
+        byte_patch_size=args.byte_patch_size,
     )
     data_config = ByteDataConfig(
+        byte_patch_size=args.byte_patch_size,
         p_fim=args.p_fim,
         fixed_fim_holes=args.fixed_fim_holes,
         fim_format=args.fim_format,

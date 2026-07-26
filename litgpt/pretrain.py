@@ -340,6 +340,7 @@ def main(
     )
 
     total_tokens = state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size
+    patch_size = model.config.byte_patch_size
 
     elapsed_train_time = time.perf_counter() - train_time
 
@@ -347,7 +348,12 @@ def main(
     separator = "-" * 40
     fabric.print(separator)
     fabric.print("| Performance")
-    fabric.print(f"| - Total tokens  : {total_tokens:,}")
+    fabric.print(f"| - Transformer positions: {total_tokens:,}")
+    if patch_size > 1:
+        fabric.print(
+            f"| - Represented byte slots: {total_tokens * patch_size:,} "
+            f"(patch_size={patch_size})"
+        )
     fabric.print(f"| - Training Time : {elapsed_train_time:.2f} s")
     fabric.print(f"| - Tok/sec       : {total_tokens / elapsed_train_time:.2f} tok/s")
     fabric.print("| " + "-" * 40)
@@ -389,14 +395,24 @@ def fit(
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
-        x = torch.randint(0, 1, (train.micro_batch_size, meta_model.max_seq_length))
+        input_shape = (train.micro_batch_size, meta_model.max_seq_length)
+        if meta_model.config.byte_patch_size > 1:
+            input_shape += (meta_model.config.byte_patch_size,)
+        x = torch.randint(0, 1, input_shape)
         # Byte-domain extension: FLOP measurement must follow the same optional
         # region/offset input signature as real training forwards.
         model_kwargs = {}
+        if meta_model.config.byte_patch_size > 1:
+            model_kwargs["patch_targets"] = x
         if meta_model.config.use_region_id:
             model_kwargs["region_ids"] = torch.zeros_like(x)
         if meta_model.config.use_offset_id:
-            model_kwargs["offset_ids"] = torch.arange(meta_model.max_seq_length).expand_as(x)
+            offsets = torch.arange(meta_model.max_seq_length)
+            if meta_model.config.byte_patch_size > 1:
+                offsets = offsets.view(1, -1, 1).expand_as(x)
+            else:
+                offsets = offsets.expand_as(x)
+            model_kwargs["offset_ids"] = offsets
         model_fwd = lambda: meta_model(x, **model_kwargs)  # noqa: F821
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)  # noqa: F821
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)

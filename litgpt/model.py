@@ -40,6 +40,24 @@ class GPT(nn.Module):
         if config.use_offset_id:
             assert config.offset_vocab_size is not None
             self.transformer["offset_wte"] = nn.Embedding(config.offset_vocab_size, config.n_embd)
+        if config.byte_patch_size > 1:
+            # Concatenation preserves the order of bytes inside a patch. A
+            # learned projection then produces the one embedding consumed by
+            # the expensive transformer stack.
+            self.patch_input_proj = nn.Linear(
+                config.byte_patch_size * config.n_embd, config.n_embd
+            )
+            # The transformer state predicts one patch. Bytes within that
+            # patch are decoded sequentially, conditioned on preceding GT bytes
+            # during teacher forcing. This is causal and avoids a 256**K head.
+            self.patch_decoder = nn.Linear(2 * config.n_embd, config.n_embd)
+            self.patch_norm = config.norm_class(
+                config.n_embd, eps=config.norm_eps
+            )
+            self.patch_bos = nn.Embedding(1, config.n_embd)
+            self.patch_pos_wte = nn.Embedding(
+                config.byte_patch_size, config.n_embd
+            )
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
 
@@ -97,6 +115,7 @@ class GPT(nn.Module):
         lm_head_chunk_size: int = 0,
         region_ids: torch.Tensor | None = None,
         offset_ids: torch.Tensor | None = None,
+        patch_targets: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -118,14 +137,41 @@ class GPT(nn.Module):
             input_pos_maxp1: Optional. See above.
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
+            patch_targets: Required when ``config.byte_patch_size > 1``.
+                Teacher-forced target ids with shape ``(B, T, K)``. Byte ``i``
+                within a patch is predicted using only the transformer state
+                and target bytes ``< i``.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
             `lm_head_chunk_size > 0`, this is a list of chunks of shape
             `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
-            entry can be shorter.
+            entry can be shorter. With byte patches, the shape is
+            `(B, T, config.byte_patch_size, config.padded_vocab_size)`.
 
         """
+        patch_size = self.config.byte_patch_size
+        if patch_size == 1:
+            if idx.dim() != 2:
+                raise ValueError(
+                    f"byte_patch_size=1 requires idx shape (B,T), got {tuple(idx.shape)}"
+                )
+        else:
+            if idx.dim() != 3 or idx.size(-1) != patch_size:
+                raise ValueError(
+                    f"byte_patch_size={patch_size} requires idx shape (B,T,{patch_size}), "
+                    f"got {tuple(idx.shape)}"
+                )
+            if patch_targets is None or patch_targets.shape != idx.shape:
+                raise ValueError(
+                    "patch_targets must be provided with the same shape as idx "
+                    "for patched-byte training"
+                )
+            if lm_head_chunk_size > 0:
+                raise ValueError(
+                    "lm_head_chunk_size is not supported with byte patches"
+                )
+
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -161,7 +207,7 @@ class GPT(nn.Module):
             mask = None  # defaults to causal mask
             input_pos_maxp1 = None
 
-        x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
+        x = self.transformer.wte(idx)
         # Byte-domain extension: add auxiliary structure embeddings before the
         # unchanged transformer stack. Text models leave both options disabled.
         if self.config.use_region_id:
@@ -172,6 +218,11 @@ class GPT(nn.Module):
             if offset_ids is None:
                 raise ValueError("offset_ids must be provided when config.use_offset_id=True")
             x = x + self.transformer.offset_wte(offset_ids.clamp_max(self.config.offset_vocab_size - 1))
+        if patch_size > 1:
+            B = idx.size(0)
+            x = self.patch_input_proj(
+                x.reshape(B, T, patch_size * self.config.n_embd)
+            ) / math.sqrt(patch_size)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
@@ -193,6 +244,29 @@ class GPT(nn.Module):
             if self.config.final_logit_softcapping is not None
             else nn.Identity()
         )
+        if patch_size > 1:
+            assert patch_targets is not None
+            B = x.size(0)
+            state = x
+            previous = self.patch_bos.weight[0].view(1, 1, -1).expand(B, T, -1)
+            safe_targets = patch_targets.clamp_min(0)
+            patch_logits = []
+            for byte_index in range(patch_size):
+                position = self.patch_pos_wte.weight[byte_index].view(1, 1, -1)
+                update = self.patch_decoder(
+                    torch.cat((state, previous + position), dim=-1)
+                ) / math.sqrt(2.0)
+                state = self.patch_norm(
+                    state + F.gelu(update)
+                )
+                patch_logits.append(clamp_head(self.lm_head(state)))
+                if byte_index + 1 < patch_size:
+                    # Teacher forcing happens only after this byte's logits are
+                    # produced, so future bytes cannot leak into earlier logits.
+                    previous = self.transformer.wte(
+                        safe_targets[..., byte_index]
+                    )
+            return torch.stack(patch_logits, dim=2)
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
             return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]

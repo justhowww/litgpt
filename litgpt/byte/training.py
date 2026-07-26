@@ -526,6 +526,10 @@ def get_model_inputs_and_targets(
         input_ids = batch["input_ids"][:, :max_seq_length].contiguous().long()
         targets = batch["labels"][:, :max_seq_length].contiguous().long()
         model_inputs = {"idx": input_ids}
+        if input_ids.dim() == 3:
+            # Patched-byte GPT uses these only inside its small causal decoder:
+            # logits for byte i are produced before target byte i is embedded.
+            model_inputs["patch_targets"] = targets
         if "region_ids" in batch:
             model_inputs["region_ids"] = (
                 batch["region_ids"][:, :max_seq_length].contiguous().long()
@@ -694,7 +698,15 @@ def validate(
         logits = model(**model_inputs)
         losses.append(chunked_cross_entropy(logits, targets))
 
-        region_ids = model_inputs.get("region_ids")
+        region_ids = (
+            batch.get("target_region_ids")
+            if isinstance(batch, dict)
+            else None
+        )
+        if region_ids is None:
+            region_ids = model_inputs.get("region_ids")
+        elif isinstance(region_ids, torch.Tensor):
+            region_ids = region_ids[:, : model.max_seq_length]
         if region_ids is None:
             continue
         for name, region in task_regions.items():

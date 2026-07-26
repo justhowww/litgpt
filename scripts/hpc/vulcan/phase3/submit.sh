@@ -3,12 +3,14 @@
 # Same objective as phase 2 (P_FIM=0.5, FIM_FORMAT=psm, USE_EOS=1); the change here is
 # scale: model and corpus both grow, sized from two empirical results, not guesses:
 #
-#   Model size (27 layers / 1024 embd / 16 head, ~341M params): chosen by bisecting
+#   Base model size (27 layers / 1024 embd / 16 head, ~341M params): chosen by bisecting
 #   peak GPU memory at block_size=16384, micro_batch=1, 2x a6000 FSDP -- 16L/202M used
 #   21.4GB, 24L/303M used 37.1GB (safe), 30L/378M and 32L/404M both hit ~48-50GB (over
 #   budget -- the card's real ceiling, not a smooth continuation of the trend). 27L/341M
 #   measured 39.5GB, ~8.5GB of margin on TWO GPUs. On four (this run), FSDP shards
 #   weights/opt/grads across twice as many ranks, so per-GPU headroom is larger still.
+#   BYTE_PATCH_SIZE>1 adds a small patch encoder/decoder (about 10.5M parameters
+#   for K=8, d=1024) and must still be checked with the first logged peak-memory line.
 #
 #   Video count (45,000, rounding up from a ~42k estimate): phase 1's real anchor is
 #   1000 videos / 85M params; phase 3's own road-list spec is 150,000 videos / 300M-1B.
@@ -48,10 +50,21 @@ export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 # 39.5GB on 2 GPUs at micro=1; do not raise this without re-probing -- the 30L/32L
 # probes showed the failure mode is a hard ceiling, not a graceful degradation).
 export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+export BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE:-1}
 export VAL_FRACTION=${VAL_FRACTION:-0.01}
 export EVAL_INTERVAL=${EVAL_INTERVAL:-250}
 export SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
-export FREE_RUN_INTERVAL=${FREE_RUN_INTERVAL:-1000}
+if [[ -z "${FREE_RUN_INTERVAL+x}" ]]; then
+    if [[ "${BYTE_PATCH_SIZE}" == "1" ]]; then
+        export FREE_RUN_INTERVAL=1000
+    else
+        # Patch generation is deliberately a later step; fail-safe training
+        # defaults to no byte-by-byte free-run probe until it is ported.
+        export FREE_RUN_INTERVAL=0
+    fi
+else
+    export FREE_RUN_INTERVAL
+fi
 export FREE_RUN_TEMP=${FREE_RUN_TEMP:-0.0}
 export FREE_RUN_CLIPS=${FREE_RUN_CLIPS:-8}
 # REAL frames (first_mb_in_slice == 0), not macroblocks -- see phase2_fim/submit.sh's
@@ -67,7 +80,17 @@ export FIM_MIN_GAP=${FIM_MIN_GAP:-64}
 export FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
 export SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
 
-export MODEL_TAG=${MODEL_TAG:-byte-phase3-45kv-341m}
+if [[ -z "${MODEL_TAG+x}" ]]; then
+    if [[ "${BYTE_PATCH_SIZE}" == "1" ]]; then
+        export MODEL_TAG=byte-phase3-45kv-341m
+    else
+        # Never resume an incompatible one-byte checkpoint merely because the
+        # caller changed BYTE_PATCH_SIZE but forgot to choose a fresh run name.
+        export MODEL_TAG="byte-phase3-45kv-341m-patch${BYTE_PATCH_SIZE}"
+    fi
+else
+    export MODEL_TAG
+fi
 export OUT_DIR=${OUT_DIR:-"${STAGED_CORPUS}/runs/${MODEL_TAG}"}
 MANIFEST="${STAGED_CORPUS}/manifest.jsonl"
 mkdir -p "${OUT_DIR}/logs"
@@ -81,7 +104,7 @@ sbatch_args=(--parsable --export=ALL
 # 1-12:00:00 wall-time cap rather than exiting 0, and afterok would never fire on that.
 [[ -n "${AFTER_JOBID:-}" ]] && sbatch_args+=(--dependency=afterany:"${AFTER_JOBID}")
 
-echo "[phase3/vulcan] ${MAX_ROWS} videos / ~341M (${N_LAYER}/${N_EMBD}/${N_HEAD}) / ${DEVICES}x a6000 / p_fim=${P_FIM} / steps=${STEPS}"
+echo "[phase3/vulcan] ${MAX_ROWS} videos / ~341M base (${N_LAYER}/${N_EMBD}/${N_HEAD}) / ${DEVICES}x a6000 / p_fim=${P_FIM} / patch=${BYTE_PATCH_SIZE} / steps=${STEPS}"
 echo "  OUT_DIR=${OUT_DIR}"
 [[ -n "${AFTER_JOBID:-}" ]] && echo "  chained after job ${AFTER_JOBID} (afterany)"
 job_id=$(sbatch "${sbatch_args[@]}" "${SCRIPT_DIR}/train.sbatch")

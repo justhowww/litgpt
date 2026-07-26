@@ -39,6 +39,11 @@ class Config:
     region_vocab_size: int = 7
     use_offset_id: bool = False
     offset_vocab_size: int | None = None
+    # Byte-domain patching. A value greater than one means each transformer
+    # position represents this many consecutive byte/control ids. The model
+    # predicts those ids causally with a small shared inner decoder, so this
+    # reduces attention/KV positions without creating a 256**K vocabulary.
+    byte_patch_size: int = 1
     # Transformer block (structure, normalizations)
     norm_class_name: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
     norm_eps: float = 1e-5
@@ -122,6 +127,8 @@ class Config:
     rope_indices: list[int] | None = None
 
     def __post_init__(self):
+        if self.byte_patch_size < 1:
+            raise ValueError("byte_patch_size must be positive")
         if not self.name:
             self.name = self.hf_config.get("name", self.name)
 

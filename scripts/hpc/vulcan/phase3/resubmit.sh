@@ -12,7 +12,8 @@
 # Usage:
 #   scripts/hpc/vulcan/phase3/resubmit.sh <AFTER_JOBID>
 #
-# IMPORTANT: run with the SAME env var overrides (OUT_DIR, MODEL_TAG, arch, etc.) as
+# IMPORTANT: run with the SAME env var overrides (OUT_DIR, MODEL_TAG,
+# BYTE_PATCH_SIZE, arch, etc.) as
 # the original submission, or defaults must match it -- otherwise this resolves to a
 # DIFFERENT OUT_DIR and starts a fresh run instead of continuing. Simplest: don't
 # override MODEL_TAG/OUT_DIR at all; submit.sh's defaults then match automatically.
