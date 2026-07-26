@@ -1,0 +1,23 @@
+# The 20 ordered continuation videos used by the Phase 2 1000-video/85M
+# AR mask ablation at step-00006000 (seed 42). Paths are relative to the
+# corpus's h264/ directory so the same source content maps to AVC-LM or BSCV.
+part1/mixkit_beach_mixkit-foamy-waves-on-the-shore-of-a-beach-44506_003.h264
+part1/mixkit_beach_mixkit-landscape-in-an-aerial-view-of-a-sunny-estuary-50211_003.h264
+part1/mixkit_beach_mixkit-aerial-shot-of-a-peninsula-and-the-sea-44369_011.h264
+part1/mixkit_beach_mixkit-aerial-shot-of-a-peninsula-and-the-sea-44369_008.h264
+part1/mixkit_beach_mixkit-sunrise-on-the-ocean-1086_003.h264
+part1/mixkit_beach_mixkit-palm-tree-in-front-of-the-sun-1191_007.h264
+part1/mixkit_beach_mixkit-landscape-on-a-coast-with-many-boats-50164_003.h264
+part1/mixkit_beach_mixkit-sunny-coast-with-a-beach-and-a-peninsula-44390_008.h264
+part1/mixkit_beach_mixkit-couple-walking-along-a-beach-at-sunset-44474_003.h264
+part1/mixkit_beach_mixkit-flying-over-the-sea-during-sunset-44370_000.h264
+part1/mixkit_beach_mixkit-boardwalk-with-umbrellas-1165_003.h264
+part1/mixkit_beach_mixkit-sunny-coast-with-a-beach-and-a-peninsula-44390_007.h264
+part1/mixkit_beach_mixkit-peninsula-in-the-sea-in-a-view-from-the-heights-50194_011.h264
+part1/mixkit_beach_mixkit-sea-coast-near-a-highway-4436_000.h264
+part1/mixkit_beach_mixkit-flying-over-the-sea-through-an-archipelago-44395_002.h264
+part1/mixkit_beach_mixkit-aerial-shot-of-a-sunny-coast-with-a-little-paddle-50248_001.h264
+part1/mixkit_beach_mixkit-aerial-view-of-a-tropical-beach-with-green-palms-1573_007.h264
+part1/mixkit_beach_mixkit-sea-and-the-horizon-seen-from-a-rocky-beach-50240_000.h264
+part1/mixkit_beach_mixkit-crystal-clear-water-flowing-on-a-paradisiacal-beach-50235_003.h264
+part1/mixkit_beach_mixkit-panoramic-landscape-to-a-sunny-and-paradise-beach-50144_002.h264

@@ -31,6 +31,13 @@ MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-16384}
 MAX_GEN_MULTIPLE=${MAX_GEN_MULTIPLE:-2}
 SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
 EVAL_INTRA=${EVAL_INTRA:-1}
+CLIP_LIST=${CLIP_LIST:-}
+EVAL_SET_NAME=${EVAL_SET_NAME:-}
+
+if [[ -n "${EVAL_SET_NAME}" && ! "${EVAL_SET_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "EVAL_SET_NAME may contain only letters, numbers, dot, underscore, and dash" >&2
+    exit 1
+fi
 
 CKPT=${CKPT:-$(basename "$(ls -d "${OUT_DIR}"/step-* 2>/dev/null | sort | tail -1)")}
 if [[ -z "${CKPT}" ]]; then
@@ -56,6 +63,9 @@ COMMON_TRAIN=(
 if [[ "${EVAL_INTRA}" == "0" ]]; then
     COMMON_TRAIN+=(--no-eval-intra)
 fi
+if [[ -n "${CLIP_LIST}" ]]; then
+    COMMON_TRAIN+=(--clip-list "${CLIP_LIST}")
+fi
 
 run() {  # name  out_root  extra-sampling-args...
     local name="$1" out_root="$2"; shift 2
@@ -72,6 +82,9 @@ run() {  # name  out_root  extra-sampling-args...
 }
 
 TRAIN_OUT="${OUT_DIR}/eval_decode/train/${CKPT}"
+if [[ -n "${EVAL_SET_NAME}" ]]; then
+    TRAIN_OUT="${TRAIN_OUT}/${EVAL_SET_NAME}"
+fi
 run greedy        "${TRAIN_OUT}" --temperature 0.0
 # run greedy_residual_masked "${TRAIN_OUT}" \
 #     --temperature 0.0 --mask-illegal-bytes --mask-residual-only --mask-debug

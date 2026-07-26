@@ -78,6 +78,10 @@ from scripts.byte.eval.helpers.checkpoint_eval_helpers import (
 from scripts.byte.eval.helpers.comparison_video import (  # noqa: E402
     save_comparison_video,
 )
+from scripts.byte.eval.helpers.clip_set import (  # noqa: E402
+    load_clip_identifiers,
+    match_manifest_rows,
+)
 
 PSNR_PERFECT_CAP = 100.0
 START_CODE = (0, 0, 1)
@@ -103,6 +107,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-manifest-rows", type=int, default=0)
     parser.add_argument("--num-clips", type=int, default=20)
+    parser.add_argument(
+        "--clip-list",
+        type=Path,
+        default=None,
+        help=(
+            "Replay an explicit ordered video set instead of random selection. "
+            "Accepts text/JSON paths or a prior clip_details.jsonl. Paths are "
+            "matched by their suffix below h264/, so the same source clips can "
+            "be evaluated across differently encoded corpus roots."
+        ),
+    )
     parser.add_argument("--num-visualizations", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -269,6 +284,23 @@ def main() -> None:
                 "No manifest rows matched the train split -- check --manifest / "
                 "--max-manifest-rows match the training run."
             )
+    if args.clip_list is not None:
+        try:
+            identifiers = load_clip_identifiers(args.clip_list)
+            rows = match_manifest_rows(rows, identifiers)
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"Explicit clip-set selection failed: {exc}") from exc
+        if len(rows) < args.num_clips:
+            raise SystemExit(
+                f"Clip list matched {len(rows)} videos but --num-clips requests "
+                f"{args.num_clips}. Lower --num-clips or provide more clips."
+            )
+        rows = rows[: args.num_clips]
+        print(
+            f"explicit clip-set filter: selected {len(rows)} ordered videos from "
+            f"{args.clip_list}",
+            flush=True,
+        )
     index_path = args.nal_index_path or default_nal_index_path(args.manifest)
     nal_index = load_nal_index(
         index_path, args.manifest, rows
@@ -333,7 +365,8 @@ def select_continuation_clips(
 
     rng = random.Random(args.seed)
     candidate_rows = list(rows)
-    rng.shuffle(candidate_rows)
+    if args.clip_list is None:
+        rng.shuffle(candidate_rows)
     needed = args.prefix_frames + args.cont_frames
     clips: list[ContinuationClip] = []
     for row in candidate_rows:
@@ -347,6 +380,20 @@ def select_continuation_clips(
             clips.append(clip)
         if len(clips) >= args.num_clips:
             break
+    if args.clip_list is not None and len(clips) != len(candidate_rows):
+        selected = {str(clip.h264_path) for clip in clips}
+        ineligible = [
+            str(row["h264_path"])
+            for row in candidate_rows
+            if str(Path(row["h264_path"])) not in selected
+        ]
+        raise SystemExit(
+            "Explicit clip set must not silently substitute or drop videos. "
+            f"{len(ineligible)} clip(s) cannot provide "
+            f"{args.prefix_frames}+{args.cont_frames} frames within "
+            f"--max-window-bytes={args.max_window_bytes}: {ineligible[:5]}. "
+            "Raise --max-window-bytes or choose a different fixed set."
+        )
     return clips
 
 
