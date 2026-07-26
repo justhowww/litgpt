@@ -33,9 +33,14 @@ SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
 EVAL_INTRA=${EVAL_INTRA:-1}
 CLIP_LIST=${CLIP_LIST:-}
 EVAL_SET_NAME=${EVAL_SET_NAME:-}
+EVAL_SPLIT=${EVAL_SPLIT:-train}
 
 if [[ -n "${EVAL_SET_NAME}" && ! "${EVAL_SET_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "EVAL_SET_NAME may contain only letters, numbers, dot, underscore, and dash" >&2
+    exit 1
+fi
+if [[ "${EVAL_SPLIT}" != "train" && "${EVAL_SPLIT}" != "all" ]]; then
+    echo "EVAL_SPLIT must be train or all" >&2
     exit 1
 fi
 
@@ -62,6 +67,9 @@ COMMON_TRAIN=(
 )
 if [[ "${EVAL_INTRA}" == "0" ]]; then
     COMMON_TRAIN+=(--no-eval-intra)
+fi
+if [[ "${EVAL_SPLIT}" == "all" ]]; then
+    COMMON_TRAIN+=(--no-train-split-filter)
 fi
 if [[ -n "${CLIP_LIST}" ]]; then
     COMMON_TRAIN+=(--clip-list "${CLIP_LIST}")
@@ -137,6 +145,12 @@ for name in names:
         print(
             f"{'':<14} generation={gen_seconds:.2f}s/clip "
             f"throughput={rate_text} bytes/s"
+        )
+    membership_total = cont.get("train_split_membership_total", 0)
+    if membership_total:
+        print(
+            f"{'':<14} train_membership="
+            f"{cont.get('train_split_membership_count', 0)}/{membership_total}"
         )
 print()
 for name in names:

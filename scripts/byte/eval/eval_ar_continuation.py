@@ -94,6 +94,7 @@ class ContinuationClip:
     cont_end_nal: int  # exclusive: NALs [0:cont_end_nal] are the GT prefix+continuation
     prefix_frames: int
     cont_frames: int
+    in_train_split: bool | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,6 +240,16 @@ def parse_args() -> argparse.Namespace:
         "training-set eval. Use the same --manifest/--max-manifest-rows as training.",
     )
     parser.add_argument(
+        "--no-train-split-filter",
+        dest="train_split_filter",
+        action="store_false",
+        default=True,
+        help=(
+            "With --train-split-file, annotate train membership without dropping "
+            "held-out videos. Intended for replaying an explicit cross-run clip set."
+        ),
+    )
+    parser.add_argument(
         "--exclude-param-sets",
         action="store_true",
         help="Feed the model a window that STARTS at the first VCL NAL (IDR), dropping the "
@@ -272,10 +283,17 @@ def main() -> None:
     if args.train_split_file is not None:
         split = json.loads(Path(args.train_split_file).read_text(encoding="utf-8"))
         train_videos = {str(Path(v)) for v in split.get("videos", [])}
+        rows = [
+            {**row, "_in_train_split": str(Path(row["h264_path"])) in train_videos}
+            for row in rows
+        ]
         before = len(rows)
-        rows = [r for r in rows if str(Path(r["h264_path"])) in train_videos]
+        if args.train_split_filter:
+            rows = [row for row in rows if row["_in_train_split"]]
         print(
-            f"train-split filter: {len(rows)}/{before} rows kept "
+            f"train-split {'filter' if args.train_split_filter else 'annotation'}: "
+            f"{sum(bool(row['_in_train_split']) for row in rows)}/{before} rows "
+            f"{'kept' if args.train_split_filter else 'marked as trained'} "
             f"({split.get('n_train_videos')} train videos from {args.train_split_file})",
             flush=True,
         )
@@ -296,9 +314,20 @@ def main() -> None:
                 f"{args.num_clips}. Lower --num-clips or provide more clips."
             )
         rows = rows[: args.num_clips]
+        known_membership = [
+            bool(row["_in_train_split"])
+            for row in rows
+            if "_in_train_split" in row
+        ]
         print(
             f"explicit clip-set filter: selected {len(rows)} ordered videos from "
-            f"{args.clip_list}",
+            f"{args.clip_list}"
+            + (
+                f"; {sum(known_membership)}/{len(known_membership)} are in the "
+                "checkpoint's recorded train split"
+                if known_membership
+                else ""
+            ),
             flush=True,
         )
     index_path = args.nal_index_path or default_nal_index_path(args.manifest)
@@ -377,6 +406,7 @@ def select_continuation_clips(
             data, path, nals, needed, args.max_window_bytes, args.prefix_frames
         )
         if clip is not None:
+            clip.in_train_split = row.get("_in_train_split")
             clips.append(clip)
         if len(clips) >= args.num_clips:
             break
@@ -599,6 +629,7 @@ def select_intra_clips(
                 cont_end_nal=idr + 1,
                 prefix_frames=0,
                 cont_frames=1,
+                in_train_split=row.get("_in_train_split"),
             )
         )
         if len(clips) >= args.num_clips:
@@ -811,6 +842,7 @@ def evaluate_checkpoint(
                     "mode": mode,
                     "clip_index": clip_idx,
                     "h264_path": str(clip.h264_path),
+                    "in_train_split": clip.in_train_split,
                     "completed_bytes": survival,
                     "valid_cont_slices": sr.valid_cont,
                     "start_codes_emitted": gen_frames_emitted,
@@ -864,6 +896,7 @@ def evaluate_checkpoint(
                 "mode": mode,
                 "clip_index": clip_idx,
                 "h264_path": str(clip.h264_path),
+                "in_train_split": clip.in_train_split,
                 "status": model_status,
                 "completed_frames": produced,
                 "target_frames": m,
@@ -897,6 +930,12 @@ def evaluate_checkpoint(
         "num_clips": attempted,
         "num_skipped_no_budget": skipped_no_budget,
         "num_skipped_gt_decode_short": skipped_gt_decode_short,
+        "train_split_membership_count": sum(
+            clip.in_train_split is True for clip in clips
+        ),
+        "train_split_membership_total": sum(
+            clip.in_train_split is not None for clip in clips
+        ),
         "success_rate": full_count / attempted if attempted else 0.0,
         "completed_frames_mean": mean(frames_made),
         "completed_frames_total": sum(frames_made),
@@ -1455,6 +1494,7 @@ def evaluate_teacher_forced(
                 "checkpoint": checkpoint_name,
                 "clip_index": clip_idx,
                 "h264_path": str(clip.h264_path),
+                "in_train_split": clip.in_train_split,
                 "cont_bytes": total_len - prefix_len,
                 "tf_byte_acc": acc,
                 "tf_ce_nats": ce,
@@ -1470,6 +1510,12 @@ def evaluate_teacher_forced(
         "mode": "teacher_forced",
         "num_clips": attempted,
         "num_skipped_too_long": skipped,
+        "train_split_membership_count": sum(
+            clip.in_train_split is True for clip in clips
+        ),
+        "train_split_membership_total": sum(
+            clip.in_train_split is not None for clip in clips
+        ),
         "tf_byte_acc_mean": mean(byte_accs),
         "tf_ce_nats_mean": mean(ces),
         # Unigram/chance floor: accuracy of always guessing the bucket's most common byte.
