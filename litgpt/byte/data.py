@@ -1068,6 +1068,9 @@ class ByteStreamWindowDataset(Dataset):
         """Non-overlapping windows, each beginning at an IDR boundary and packed
         forward by whole NALs until the byte budget is hit."""
         windows: list[WindowSample] = []
+        # Window AR predicts one extra SEQ_EOS token when enabled. Reserve its
+        # position here so collate never truncates that final supervised label.
+        window_byte_budget = self.max_seq_length - (1 if self.use_eos else 0)
         n = len(nals)
         idr_positions = [k for k, nal in enumerate(nals) if nal.nal_type == 5]
         used_until = 0  # next window must start at or after this NAL index
@@ -1089,7 +1092,7 @@ class ByteStreamWindowDataset(Dataset):
             end = start
             while end < n:
                 nal_len = nals[end].end - nals[end].start
-                if total + nal_len > self.max_seq_length:
+                if total + nal_len > window_byte_budget:
                     break
                 total += nal_len
                 if nals[end].nal_type in VCL_NAL_TYPES:
@@ -1316,14 +1319,25 @@ class ByteStreamWindowDataset(Dataset):
     ) -> dict[str, Any]:
         # Teacher forcing across the whole window. SLICE_BOS is reused as the
         # stream-start marker (this dataset never emits a slice-level BOS), so the
-        # AR vocabulary is unchanged.
+        # AR vocabulary is unchanged. With EOS the final input is the last raw byte
+        # and its target is SEQ_EOS; without EOS this reduces to the original
+        # [BOS, window[:-1]] -> window construction.
         bos = torch.tensor([SLICE_BOS_ID], dtype=torch.long)
-        input_ids = torch.cat((bos, window[:-1]))
-        labels = window.clone()
+        target_tail = self._with_eos(window)
+        input_ids = torch.cat((bos, target_tail[:-1]))
+        labels = target_tail
         region_ids = torch.cat(
-            (torch.tensor([REGION_TARGET], dtype=torch.long), raw_region[:-1])
+            (
+                torch.tensor([REGION_TARGET], dtype=torch.long),
+                raw_region if self.use_eos else raw_region[:-1],
+            )
         )
-        offset_ids = torch.cat((torch.tensor([0], dtype=torch.long), raw_offset[:-1]))
+        offset_ids = torch.cat(
+            (
+                torch.tensor([0], dtype=torch.long),
+                raw_offset if self.use_eos else raw_offset[:-1],
+            )
+        )
         return self._pack_item(input_ids, labels, region_ids, offset_ids, sample, "ar")
 
     def _build_fim_item(

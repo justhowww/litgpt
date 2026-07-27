@@ -9,12 +9,18 @@ from litgpt.byte.data import (
     REGION_BRIDGE,
     REGION_PAD,
     REGION_TARGET,
+    SEQ_EOS_ID,
     SLICE_BOS_ID,
     VOCAB_SIZE,
     patch_byte_sample,
 )
 from litgpt.byte.training import byte_training_loss
 from litgpt.byte.training import get_model_inputs_and_targets
+from litgpt.byte.megabyte_inference import (
+    MegabyteInference,
+    megabyte_max_new_bytes,
+    megabyte_prompt_patches,
+)
 from litgpt.config import Config
 from litgpt.model import GPT
 
@@ -64,6 +70,23 @@ def test_ar_patch_layout_predicts_next_patch_without_byte_leakage():
     assert patched["offset_ids"].tolist() == [
         [0, 0, 0, 0],
         [1, 2, 3, 4],
+    ]
+
+
+def test_ar_patch_layout_preserves_eos_as_final_local_target():
+    sample = _sample(
+        [SLICE_BOS_ID, 10, 11, 12, 13, 14, 15, 16],
+        [10, 11, 12, 13, 14, 15, 16, SEQ_EOS_ID],
+        REGION_TARGET,
+    )
+
+    patched = patch_byte_sample(sample, patch_size=8)
+
+    assert patched["input_ids"].tolist() == [
+        [PAD_ID, PAD_ID, PAD_ID, PAD_ID, PAD_ID, PAD_ID, PAD_ID, SLICE_BOS_ID],
+    ]
+    assert patched["labels"].tolist() == [
+        [10, 11, 12, 13, 14, 15, 16, SEQ_EOS_ID],
     ]
 
 
@@ -159,6 +182,98 @@ def test_megabyte_local_transformer_is_causal_within_each_patch():
     assert torch.equal(logits_a[..., :3, :], logits_b[..., :3, :])
     # It is allowed to alter byte 3, which causally consumes target byte 2.
     assert not torch.equal(logits_a[..., 3, :], logits_b[..., 3, :])
+
+
+def test_megabyte_incremental_local_logits_match_teacher_forcing():
+    torch.manual_seed(9)
+    model = GPT(_patch_config()).eval()
+    input_ids = torch.tensor([[[PAD_ID, PAD_ID, PAD_ID, SLICE_BOS_ID]]])
+    targets = torch.tensor([[[10, 11, 12, 13]]])
+
+    teacher_logits = model(input_ids, patch_targets=targets)
+    global_output = model.megabyte_global_forward(input_ids)[:, 0]
+    incremental = [
+        model.megabyte_local_next_logits(
+            global_output, targets[:, 0, :byte_index]
+        )
+        for byte_index in range(4)
+    ]
+
+    assert torch.allclose(
+        torch.stack(incremental, dim=1),
+        teacher_logits[:, 0],
+        atol=1e-6,
+        rtol=1e-5,
+    )
+
+
+def test_megabyte_inference_feeds_completed_patch_to_global_cache():
+    torch.manual_seed(10)
+    model = GPT(_patch_config()).eval()
+    prompt = torch.tensor([[SLICE_BOS_ID, 1, 2, 3, 4]])
+    regions = torch.full_like(prompt, REGION_TARGET)
+    offsets = torch.arange(prompt.size(1)).unsqueeze(0)
+    patched_prompt, _, _ = megabyte_prompt_patches(
+        prompt, regions, offsets, patch_size=4
+    )
+    generated_patch = [10, 11, 12, 13]
+
+    model.set_kv_cache(batch_size=1, max_seq_length=model.max_seq_length)
+    try:
+        model.megabyte_global_forward(
+            patched_prompt,
+            input_pos=torch.arange(patched_prompt.size(1)),
+            input_pos_maxp1=patched_prompt.size(1),
+        )
+        expected_next_global = model.megabyte_global_forward(
+            torch.tensor([[generated_patch]]),
+            input_pos=torch.tensor([patched_prompt.size(1)]),
+            input_pos_maxp1=patched_prompt.size(1) + 1,
+        )[:, -1]
+        expected_logits = model.megabyte_local_next_logits(
+            expected_next_global, torch.empty((1, 0), dtype=torch.long)
+        )
+    finally:
+        model.clear_kv_cache()
+
+    with MegabyteInference(model, prompt, regions, offsets, torch.device("cpu")) as state:
+        for byte_index, token in enumerate(generated_patch):
+            state.next_logits()
+            state.append(token, REGION_TARGET, byte_index)
+        actual_logits = state.next_logits()
+
+    assert torch.allclose(actual_logits, expected_logits, atol=1e-6, rtol=1e-5)
+    assert megabyte_max_new_bytes(model, prompt.size(1)) == 12
+
+
+def test_megabyte_start_code_metadata_can_cross_patch_boundary():
+    torch.manual_seed(12)
+    model = GPT(
+        _patch_config(
+            use_region_id=True,
+            use_offset_id=True,
+            offset_vocab_size=32,
+        )
+    ).eval()
+    prompt = torch.tensor([[SLICE_BOS_ID]])
+    regions = torch.full_like(prompt, REGION_TARGET)
+    offsets = torch.zeros_like(prompt)
+
+    with MegabyteInference(model, prompt, regions, offsets, torch.device("cpu")) as state:
+        for byte_index, token in enumerate((9, 0, 0, 0)):
+            state.next_logits()
+            state.append(token, REGION_TARGET, byte_index)
+        state.next_logits()  # commits the first generated patch
+        state.append(1, REGION_TARGET, 4)
+        state.rewrite_recent_metadata(
+            4,
+            region_ids=[REGION_TARGET] * 4,
+            offset_ids=[0, 1, 2, 3],
+        )
+        state.next_logits()  # refreshes the corrected prior-patch KV entry
+
+        assert state._completed[-1].offset_ids == [0, 0, 1, 2]
+        assert state._current_offsets == [3]
 
 
 def test_megabyte_global_and_local_towers_receive_gradients():

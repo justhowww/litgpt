@@ -70,6 +70,10 @@ from litgpt.byte.free_run_eval import (
     _survival_and_validity,
     free_run_rollout,
 )  # noqa: E402
+from litgpt.byte.megabyte_inference import (  # noqa: E402
+    megabyte_max_new_bytes,
+    megabyte_teacher_forced_sample,
+)
 from litgpt.byte.reconstruction import image_psnr, image_ssim, parse_ppm  # noqa: E402
 from scripts.byte.eval.helpers.checkpoint_eval_helpers import (
     jsonable,
@@ -1447,8 +1451,13 @@ def evaluate_teacher_forced(
         fed_bytes = gt_bytes[ps_len:]
         fed_prefix_len = prefix_len - ps_len
         fed_total_len = total_len - ps_len
-        # One BOS + all fed bytes must fit the context window.
-        if fed_total_len + 1 > max_seq:
+        patch_size = int(raw.config.byte_patch_size)
+        required_positions = (
+            (fed_total_len + patch_size - 1) // patch_size
+            if patch_size > 1
+            else fed_total_len + 1
+        )
+        if required_positions > max_seq:
             skipped += 1
             details.append(
                 {
@@ -1464,38 +1473,74 @@ def evaluate_teacher_forced(
         prompt_ids, region_ids, offset_ids = _prompt_tensors(
             fed_bytes, nals, clip.cont_end_nal, start_nal=vcl_start
         )
-        prompt_ids = prompt_ids.to(device).unsqueeze(0)
-        region_ids = region_ids.to(device).unsqueeze(0)
-        offset_ids = offset_ids.to(device).unsqueeze(0)
-        seq_len = prompt_ids.size(1)  # BOS + total_len
-
-        cache_dtype = (
-            torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
-        )
-        raw.set_kv_cache(
-            batch_size=1, max_seq_length=seq_len, device=device, dtype=cache_dtype
-        )
-        try:
+        if patch_size > 1:
+            # input[j] predicts fed byte j. The final GT byte is therefore a
+            # label, not a global input byte.
+            teacher_input = prompt_ids[:-1]
+            teacher_labels = bytes_to_ids(fed_bytes)
+            teacher_labels[:fed_prefix_len] = -100
+            patched = megabyte_teacher_forced_sample(
+                teacher_input,
+                teacher_labels,
+                region_ids[:-1],
+                offset_ids[:-1],
+                patch_size,
+            )
+            model_idx = patched["input_ids"].to(device)
+            model_regions = patched["region_ids"].to(device)
+            model_offsets = patched["offset_ids"].to(device)
+            model_targets = patched["labels"].to(device)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=device.type == "cuda",
             ):
                 logits = raw(
-                    prompt_ids,
-                    input_pos=torch.arange(seq_len, device=device),
-                    input_pos_maxp1=seq_len,
-                    region_ids=region_ids,
-                    offset_ids=offset_ids,
+                    model_idx,
+                    region_ids=model_regions,
+                    offset_ids=model_offsets,
+                    patch_targets=model_targets,
                 )
-        finally:
-            raw.clear_kv_cache()
-
-        # token = [BOS, gt_0, ..., gt_{L-1}]; logits[:, j] predicts token[j+1] = gt_j.
-        # Continuation bytes are gt_j for j in [prefix_len, total_len-1].
-        gt_ids = bytes_to_ids(fed_bytes).to(device)
-        cont_logits = logits[0, fed_prefix_len:fed_total_len, :BYTE_VOCAB_SIZE].float()
-        cont_targets = gt_ids[fed_prefix_len:fed_total_len]
+            supervised = model_targets != -100
+            cont_logits = logits[supervised][:, :BYTE_VOCAB_SIZE].float()
+            cont_targets = model_targets[supervised]
+        else:
+            prompt_ids = prompt_ids.to(device).unsqueeze(0)
+            region_ids = region_ids.to(device).unsqueeze(0)
+            offset_ids = offset_ids.to(device).unsqueeze(0)
+            seq_len = prompt_ids.size(1)  # BOS + total_len
+            cache_dtype = (
+                torch.bfloat16
+                if device.type == "cuda"
+                else next(raw.parameters()).dtype
+            )
+            raw.set_kv_cache(
+                batch_size=1,
+                max_seq_length=seq_len,
+                device=device,
+                dtype=cache_dtype,
+            )
+            try:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=device.type == "cuda",
+                ):
+                    logits = raw(
+                        prompt_ids,
+                        input_pos=torch.arange(seq_len, device=device),
+                        input_pos_maxp1=seq_len,
+                        region_ids=region_ids,
+                        offset_ids=offset_ids,
+                    )
+            finally:
+                raw.clear_kv_cache()
+            # token=[BOS,gt_0,...]; logits[j] predicts gt_j.
+            gt_ids = bytes_to_ids(fed_bytes).to(device)
+            cont_logits = logits[
+                0, fed_prefix_len:fed_total_len, :BYTE_VOCAB_SIZE
+            ].float()
+            cont_targets = gt_ids[fed_prefix_len:fed_total_len]
         pred_ids = cont_logits.argmax(dim=-1)
         acc = float((pred_ids == cont_targets).float().mean())
         ce = float(torch.nn.functional.cross_entropy(cont_logits, cont_targets))
@@ -1600,7 +1645,9 @@ def evaluate_teacher_forced(
 
 def model_max_gen(model: torch.nn.Module, prefix_bytes: bytes) -> int:
     raw = model.module if hasattr(model, "module") else model
-    return max(0, int(raw.max_seq_length) - len(prefix_bytes) - 1)
+    # The model prompt is [BOS, prefix bytes...]. The final MEGABYTE prompt
+    # patch immediately predicts the first output patch.
+    return megabyte_max_new_bytes(raw, len(prefix_bytes) + 1)
 
 
 @torch.inference_mode()

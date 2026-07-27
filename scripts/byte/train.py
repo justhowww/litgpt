@@ -342,11 +342,6 @@ def main() -> None:
         )
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
-    if args.byte_patch_size > 1 and args.free_run_eval_interval > 0:
-        raise ValueError(
-            "In-training free-run evaluation is not yet ported to byte patches; "
-            "set --free-run-eval-interval 0"
-        )
     if args.byte_patch_size > 1 and args.reconstruction_eval_interval > 0:
         raise ValueError(
             "Reconstruction evaluation is not yet ported to byte patches; "

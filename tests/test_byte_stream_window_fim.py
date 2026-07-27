@@ -184,6 +184,17 @@ def test_use_eos_appends_terminator_to_the_span(tmp_path):
     assert len(item["input_ids"]) == _meta(item)["frame_hi"] + 3
 
 
+def test_use_eos_appends_terminator_to_window_ar(tmp_path):
+    ds, data = _dataset(tmp_path, p_fim=0.0, use_eos=True)
+    item = ds[0]
+
+    assert _meta(item)["task"] == "ar"
+    assert item["labels"][-1].item() == SEQ_EOS_ID
+    assert item["labels"][:-1].tolist() == list(data)
+    assert item["input_ids"][1:].tolist() == list(data)
+    assert len(item["input_ids"]) == len(item["labels"]) == len(data) + 1
+
+
 def test_fim_overhead_matches_the_realized_sample_length(tmp_path):
     # Pins the arithmetic _fim_candidates budgets against. If these disagree, the
     # budget check is wrong and oversized samples get truncated from the right.
@@ -337,6 +348,33 @@ def test_free_run_probe_survives_p_fim(tmp_path, monkeypatch):
     cfg = FR.FreeRunEvalConfig(interval=1, num_clips=4, prefix_frames=1, cont_frames=1)
     samples = FR.prepare_free_run_samples(ds, cfg)  # must not raise
     assert len(samples) == 1
+
+
+def test_free_run_probe_strips_window_ar_eos(tmp_path, monkeypatch):
+    import types
+
+    from litgpt.byte import free_run_eval as FR
+
+    class _OK:
+        status = FR.HS.ParseStatus.OK
+
+    monkeypatch.setattr(
+        FR.HS,
+        "parse_stream",
+        lambda *a, **k: types.SimpleNamespace(nals=[_OK()]),
+    )
+    ds, _ = _dataset(tmp_path, p_fim=0.5, use_eos=True, resample_fim=True)
+    cfg = FR.FreeRunEvalConfig(
+        interval=1,
+        num_clips=1,
+        prefix_frames=1,
+        cont_frames=1,
+    )
+
+    samples = FR.prepare_free_run_samples(ds, cfg)
+
+    assert len(samples) == 1
+    assert all(0 <= token < 256 for token in samples[0].prompt_ids[1:].tolist())
 
 
 def test_hole_spans_many_nals_on_a_per_mb_corpus(tmp_path):

@@ -62,6 +62,11 @@ from litgpt.byte.data import (  # noqa: E402
     load_manifest_rows,
     load_nal_index,
 )
+from litgpt.byte.megabyte_inference import (  # noqa: E402
+    MegabyteInference,
+    megabyte_max_new_bytes,
+    megabyte_teacher_forced_sample,
+)
 from litgpt.byte.reconstruction import _unwrap_model  # noqa: E402
 from scripts.byte.eval.helpers.checkpoint_eval_helpers import (  # noqa: E402
     jsonable,
@@ -430,7 +435,14 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                 )
             _verify_fixed_hole_replay(expected, meta, target_ids, window_key)
             verified_fixed_holes += 1
-        window_bytes = bytes(dataset.ar_item(idx)["labels"].tolist())
+        ar_labels = dataset.ar_item(idx)["labels"]
+        if dataset.use_eos:
+            if int(ar_labels[-1]) != SEQ_EOS_ID:
+                raise RuntimeError(
+                    "window AR item is missing its configured SEQ_EOS"
+                )
+            ar_labels = ar_labels[:-1]
+        window_bytes = bytes(ar_labels.tolist())
         selected.append(
             WindowFimSample(
                 sample_index=idx,
@@ -554,14 +566,17 @@ def generate_span(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
     prompt_len = prompt.size(1)
-    if prompt_len >= raw.max_seq_length:
+    model_max_new = megabyte_max_new_bytes(raw, prompt_len)
+    if model_max_new <= 0:
         return None
     if stop_mode == "oracle_len":
+        if sample.target_length > model_max_new:
+            return None
         max_new = sample.target_length
     elif stop_mode in ("learned_eos", "parser_reconnect"):
         max_new = min(
             max_gen_bytes,
-            raw.max_seq_length - prompt_len + 1,
+            model_max_new,
         )
     else:
         raise ValueError(f"unknown stop_mode: {stop_mode}")
@@ -572,15 +587,23 @@ def generate_span(
     if mask_illegal_bytes or stop_mode == "parser_reconnect":
         parser_state = _seed_parser_state(sample, slice_max_mbs=slice_max_mbs)
 
-    cache_dtype = (
-        torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
-    )
-    raw.set_kv_cache(
-        batch_size=1,
-        max_seq_length=raw.max_seq_length,
-        device=device,
-        dtype=cache_dtype,
-    )
+    megabyte = None
+    if int(raw.config.byte_patch_size) > 1:
+        megabyte = MegabyteInference(
+            raw, prompt, region_ids, offset_ids, device
+        )
+    else:
+        cache_dtype = (
+            torch.bfloat16
+            if device.type == "cuda"
+            else next(raw.parameters()).dtype
+        )
+        raw.set_kv_cache(
+            batch_size=1,
+            max_seq_length=raw.max_seq_length,
+            device=device,
+            dtype=cache_dtype,
+        )
     generated: list[int] = []
     eos_stopped = False
     stop_reason = "budget"
@@ -593,20 +616,27 @@ def generate_span(
     parser_reconnect_checks = 0
     parser_reconnect_found = False
     try:
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        ):
-            logits = raw(
-                prompt,
-                input_pos=torch.arange(prompt_len, device=device, dtype=torch.long),
-                input_pos_maxp1=prompt_len,
-                region_ids=region_ids,
-                offset_ids=offset_ids,
-            )
+        if megabyte is None:
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                logits = raw(
+                    prompt,
+                    input_pos=torch.arange(
+                        prompt_len, device=device, dtype=torch.long
+                    ),
+                    input_pos_maxp1=prompt_len,
+                    region_ids=region_ids,
+                    offset_ids=offset_ids,
+                )
         for generated_idx in range(max_new):
-            next_logits = logits[0, -1]
+            next_logits = (
+                megabyte.next_logits()[0]
+                if megabyte is not None
+                else logits[0, -1]
+            )
             byte_logits = next_logits[:BYTE_VOCAB_SIZE].clone()
             if mask_illegal_bytes:
                 assert parser_state is not None
@@ -711,6 +741,9 @@ def generate_span(
                 stop_reason = "oracle_len" if stop_mode == "oracle_len" else "budget"
                 break
 
+            if megabyte is not None:
+                megabyte.append(token, REGION_BRIDGE, generated_idx + 1)
+                continue
             position = prompt_len + generated_idx
             with torch.autocast(
                 device_type=device.type,
@@ -729,7 +762,10 @@ def generate_span(
                     ),
                 )
     finally:
-        raw.clear_kv_cache()
+        if megabyte is not None:
+            megabyte.close()
+        else:
+            raw.clear_kv_cache()
     return GenerationResult(
         bytes(generated),
         eos_stopped,
@@ -776,16 +812,39 @@ def teacher_forced_span_metrics(
     """Teacher-forced accuracy on the exact same FIM target span used for generation."""
     raw = _unwrap_model(model)
     raw.eval()
-    if sample.teacher_input_ids.numel() > raw.max_seq_length:
-        return None
-    idx = sample.teacher_input_ids.to(device).unsqueeze(0)
-    labels = sample.teacher_labels.to(device).unsqueeze(0)
-    region_ids = sample.teacher_region_ids.to(device).unsqueeze(0)
-    offset_ids = sample.teacher_offset_ids.to(device).unsqueeze(0)
+    patch_size = int(raw.config.byte_patch_size)
+    if patch_size > 1:
+        patched = megabyte_teacher_forced_sample(
+            sample.teacher_input_ids,
+            sample.teacher_labels,
+            sample.teacher_region_ids,
+            sample.teacher_offset_ids,
+            patch_size,
+        )
+        if patched["input_ids"].size(1) > raw.max_seq_length:
+            return None
+        idx = patched["input_ids"].to(device)
+        labels = patched["labels"].to(device)
+        region_ids = patched["region_ids"].to(device)
+        offset_ids = patched["offset_ids"].to(device)
+        model_kwargs = {"patch_targets": labels}
+    else:
+        if sample.teacher_input_ids.numel() > raw.max_seq_length:
+            return None
+        idx = sample.teacher_input_ids.to(device).unsqueeze(0)
+        labels = sample.teacher_labels.to(device).unsqueeze(0)
+        region_ids = sample.teacher_region_ids.to(device).unsqueeze(0)
+        offset_ids = sample.teacher_offset_ids.to(device).unsqueeze(0)
+        model_kwargs = {}
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda",
     ):
-        logits = raw(idx, region_ids=region_ids, offset_ids=offset_ids)
+        logits = raw(
+            idx,
+            region_ids=region_ids,
+            offset_ids=offset_ids,
+            **model_kwargs,
+        )
     supervised = labels != IGNORE_INDEX
     supervised_labels = labels[supervised]
     if supervised_labels.numel() == 0:

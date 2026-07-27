@@ -37,8 +37,10 @@ from litgpt.byte.data import (
     PARAMETER_SET_NAL_TYPES,
     REGION_META,
     REGION_TARGET,
+    SEQ_EOS_ID,
     VCL_NAL_TYPES,
 )
+from litgpt.byte.megabyte_inference import MegabyteInference, megabyte_max_new_bytes
 from litgpt.byte.reconstruction import _unwrap_model
 
 START_CODE = (0, 0, 1)
@@ -165,7 +167,12 @@ def prepare_free_run_samples(
         # window's raw bytes. Under p_fim > 0 base[idx] may return a FIM item whose
         # labels are IGNORE_INDEX outside the span, which is not a byte string.
         item = base.ar_item(idx)
-        window_bytes = bytes(item["labels"].tolist())
+        window_labels = item["labels"]
+        if base.use_eos:
+            if int(window_labels[-1]) != SEQ_EOS_ID:
+                raise RuntimeError("window AR item is missing its configured SEQ_EOS")
+            window_labels = window_labels[:-1]
+        window_bytes = bytes(window_labels.tolist())
         prefix_bytes = window_bytes[:prefix_bytes_len]
         # Confirm the prefix actually parses clean before trusting the metric.
         parsed_prefix = HS.parse_stream(prefix_bytes, parse_slice_data=True)
@@ -302,6 +309,10 @@ def free_run_rollout(
         if trace is not None:
             trace["stop_reason"] = reason
 
+    max_gen = min(
+        max_gen,
+        megabyte_max_new_bytes(raw, prompt_ids.size(1)),
+    )
     if max_gen <= 0:
         _stop("no_budget")
         return b"", 0
@@ -318,15 +329,24 @@ def free_run_rollout(
             HM.advance(mask_state, b)
         mask_state.generation_started = True
     prompt_len = prompt_ids.size(1)
-    cache_dtype = (
-        torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
-    )
-    raw.set_kv_cache(
-        batch_size=1,
-        max_seq_length=raw.max_seq_length,
-        device=device,
-        dtype=cache_dtype,
-    )
+    patched = int(raw.config.byte_patch_size) > 1
+    megabyte = None
+    if patched:
+        megabyte = MegabyteInference(
+            raw, prompt_ids, region_ids, offset_ids, device
+        )
+    else:
+        cache_dtype = (
+            torch.bfloat16
+            if device.type == "cuda"
+            else next(raw.parameters()).dtype
+        )
+        raw.set_kv_cache(
+            batch_size=1,
+            max_seq_length=raw.max_seq_length,
+            device=device,
+            dtype=cache_dtype,
+        )
     generated: list[int] = []
     start_codes = 0
     gen_offset = (
@@ -346,18 +366,25 @@ def free_run_rollout(
     mask_probability_mass_count = 0
     first_mask_intervention = None
     try:
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-        ):
-            logits = raw(
-                prompt_ids,
-                input_pos=torch.arange(prompt_len, device=device),
-                input_pos_maxp1=prompt_len,
-                region_ids=region_ids,
-                offset_ids=offset_ids,
-            )
+        if megabyte is None:
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                logits = raw(
+                    prompt_ids,
+                    input_pos=torch.arange(prompt_len, device=device),
+                    input_pos_maxp1=prompt_len,
+                    region_ids=region_ids,
+                    offset_ids=offset_ids,
+                )
         for step in range(max_gen):
-            next_logits = logits[:, -1, :BYTE_VOCAB_SIZE]
+            next_logits = (
+                megabyte.next_logits()[:, :BYTE_VOCAB_SIZE]
+                if megabyte is not None
+                else logits[:, -1, :BYTE_VOCAB_SIZE]
+            )
             model_next_logits = next_logits
             forcing_this_byte = False
             if forced_used < len(forced):
@@ -486,6 +513,17 @@ def free_run_rollout(
                     if (len(generated) >= 4 and tuple(generated[-4:]) == (0, 0, 0, 1))
                     else 3
                 )
+                if megabyte is not None:
+                    megabyte.append(token, REGION_TARGET, sc_len - 1)
+                    megabyte.rewrite_recent_metadata(
+                        sc_len,
+                        region_ids=[REGION_TARGET] * sc_len,
+                        offset_ids=list(range(sc_len)),
+                    )
+                    gen_offset = sc_len
+                    current_region = REGION_TARGET
+                    pending_header = True
+                    continue
                 base_pos = position - (sc_len - 1)
                 for j in range(sc_len):
                     tok_j = generated[len(generated) - sc_len + j]
@@ -523,6 +561,9 @@ def free_run_rollout(
                 pending_header = False
             token_offset = gen_offset
             gen_offset = token_offset + 1
+            if megabyte is not None:
+                megabyte.append(token, current_region, token_offset)
+                continue
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -540,7 +581,10 @@ def free_run_rollout(
                     ),
                 )
     finally:
-        raw.clear_kv_cache()
+        if megabyte is not None:
+            megabyte.close()
+        else:
+            raw.clear_kv_cache()
     if trace is not None and mask_state is not None:
         trace["slice_layout"] = slice_layout
         trace["mask_calls"] = mask_state.mask_calls
@@ -572,7 +616,7 @@ def _generate(
     offset = sample.prompt_offset_ids.to(device).unsqueeze(0)
     max_gen = min(
         int(sample.gt_cont_bytes * config.max_gen_multiple) + 512,
-        int(raw.max_seq_length) - len(sample.prefix_bytes) - 1,
+        megabyte_max_new_bytes(raw, sample.prompt_ids.numel()),
     )
     generated, _start_codes = free_run_rollout(
         raw,

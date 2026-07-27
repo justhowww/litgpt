@@ -62,8 +62,8 @@ if [[ -z "${FREE_RUN_INTERVAL+x}" ]]; then
     if [[ "${BYTE_PATCH_SIZE}" == "1" ]]; then
         export FREE_RUN_INTERVAL=1000
     else
-        # Patch generation is deliberately a later step; fail-safe training
-        # defaults to no byte-by-byte free-run probe until it is ported.
+        # Offline MEGABYTE inference is supported. Keep the in-training probe
+        # disabled by default because it unwraps the multi-GPU FSDP model.
         export FREE_RUN_INTERVAL=0
     fi
 else

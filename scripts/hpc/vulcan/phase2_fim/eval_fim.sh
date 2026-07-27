@@ -18,10 +18,14 @@ DATA=${DATA:-/fs/nexus-projects/time-control-videogen/OpenVid-1M_Data/data-avclm
 OUT_DIR=${OUT_DIR:-${DATA}/runs/byte-phase2-fim-1000v-85m}
 CKPT=${CKPT:-step-00006000}
 NUM_CLIPS=${NUM_CLIPS:-20}  # Match the existing AR eval.sh by default.
+MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-1000}
 SEED=${SEED:-42}
 DEVICE=${DEVICE:-cuda}
 PYTHON_BIN=${PYTHON_BIN:-python}
 MAX_GEN_BYTES=${MAX_GEN_BYTES:-4096}
+MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-16384}
+SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
+SLICE_MAX_MBS=${SLICE_MAX_MBS:-1}
 
 CHECKPOINT_DIR="${OUT_DIR}/${CKPT}"
 if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
@@ -39,19 +43,19 @@ COMMON=(
     --train-split-file "${OUT_DIR}/train_split.json"
     --eval-split train
     --device "${DEVICE}"
-    --max-manifest-rows 1000
+    --max-manifest-rows "${MAX_MANIFEST_ROWS}"
     --num-clips "${NUM_CLIPS}"
     --num-visualizations 8
     --viz-fps 6
     --seed "${SEED}"
-    --max-window-bytes 16384
+    --max-window-bytes "${MAX_WINDOW_BYTES}"
     --window-min-frames 2
     --fim-format psm
     --use-eos
     --fim-min-gap 64
     --fim-max-gap 1400
     --slice-header-guard-bytes 64
-    --slice-max-mbs 1
+    --slice-layout "${SLICE_LAYOUT}"
     --stop-modes learned_eos parser_reconnect
     --temperature 0
     --top-k 0
@@ -61,6 +65,9 @@ COMMON=(
     --timeout-sec 60
     --save-streams
 )
+if [[ "${SLICE_LAYOUT}" == "macroblock" ]]; then
+    COMMON+=(--slice-max-mbs "${SLICE_MAX_MBS}")
+fi
 
 EVAL_ROOT="${OUT_DIR}/eval_fim/train/${CKPT}"
 
