@@ -118,6 +118,22 @@ def test_psm_layout_and_labels_only_on_missing_span(tmp_path):
     assert torch.equal(ids[end.item() + 1 :], labels[-gap:][:-1])
 
 
+def test_full_loss_scope_supervises_the_reordered_sequence(tmp_path):
+    ds, _ = _dataset(tmp_path, fim_loss_scope="full", use_eos=True)
+    item = ds[0]
+    ids, labels = item["input_ids"], item["labels"]
+
+    assert (labels != IGNORE_INDEX).all()
+    assert torch.equal(labels[:-1], ids[1:])
+    assert labels[-1].item() == SEQ_EOS_ID
+    assert _meta(item)["fim_loss_scope"] == "full"
+
+
+def test_invalid_fim_loss_scope_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="fim_loss_scope"):
+        _dataset(tmp_path, fim_loss_scope="unsupported")
+
+
 def test_missing_span_is_excised_from_the_hole_frame(tmp_path):
     ds, data = _dataset(tmp_path)
     item = ds[0]
@@ -295,6 +311,7 @@ def test_data_module_propagates_fixed_hole_mode(
 
     payload = json.loads(split_path.read_text(encoding="utf-8"))
     assert payload["fixed_fim_holes_enabled"] is fixed_fim_holes
+    assert payload["fim_loss_scope"] == "span"
     if not fixed_fim_holes:
         assert payload["fixed_fim_holes"] == []
         return

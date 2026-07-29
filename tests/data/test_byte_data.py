@@ -17,6 +17,7 @@ from litgpt.data.byte_data import (
     REGION_PREFIX,
     REGION_REF,
     REGION_TARGET,
+    SEQ_EOS_ID,
     SLICE_BOS_ID,
     SPAN_BOS_ID,
     VOCAB_SIZE,
@@ -291,6 +292,28 @@ def test_fim_sample_supervises_only_missing_span(tmp_path):
     assert torch.all(
         labels[~supervised] == IGNORE_INDEX
     )  # Conditioning tokens are excluded from loss.
+
+
+def test_fim_full_loss_scope_supervises_reordered_next_tokens(tmp_path):
+    ds = make_dataset(
+        tmp_path,
+        p_fim=1.0,
+        fim_format="psm",
+        fim_loss_scope="full",
+        use_eos=True,
+        num_ref_slices=1,
+        fim_min_gap=4,
+        fim_max_gap=4,
+        slice_header_guard_bytes=2,
+    )
+    sample = ds[0]
+    input_ids = sample["input_ids"]
+    labels = sample["labels"]
+
+    assert (labels != IGNORE_INDEX).all()
+    assert torch.equal(labels[:-1], input_ids[1:])
+    assert labels[-1].item() == SEQ_EOS_ID
+    assert sample["sample_meta"]["fim_loss_scope"] == "full"
 
 
 def test_psm_fim_layout_uses_explicit_prefix_suffix_middle_markers(tmp_path):

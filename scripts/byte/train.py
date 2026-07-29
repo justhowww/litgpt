@@ -17,6 +17,7 @@ from litgpt.config import Config
 from litgpt.byte.data import (
     DATASET_MODES,
     FIM_FORMATS,
+    FIM_LOSS_SCOPES,
     REFERENCE_MODES,
     ByteDataConfig,
     ByteDataModule,
@@ -198,6 +199,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="bridge")
+    parser.add_argument(
+        "--fim-loss-scope",
+        choices=FIM_LOSS_SCOPES,
+        default="span",
+        help=(
+            "FIM supervision scope: 'span' trains only the missing span and EOS; "
+            "'full' trains next-token prediction across the complete reordered "
+            "FIM sequence."
+        ),
+    )
     parser.add_argument(
         "--use-eos",
         action="store_true",
@@ -423,6 +434,7 @@ def main() -> None:
         p_fim=args.p_fim,
         fixed_fim_holes=args.fixed_fim_holes,
         fim_format=args.fim_format,
+        fim_loss_scope=args.fim_loss_scope,
         use_eos=args.use_eos,
         num_ref_slices=args.num_ref_slices,
         reference_mode=args.reference_mode,

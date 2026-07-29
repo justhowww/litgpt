@@ -67,6 +67,9 @@ SPLIT_BY_VIDEO=${SPLIT_BY_VIDEO:-0}
 P_FIM=${P_FIM:-0.5}
 FIXED_FIM_HOLES=${FIXED_FIM_HOLES:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
+# span = repair-only target (legacy); full = causal next-token loss across the
+# complete reordered FIM sequence, matching standard FIM pretraining.
+FIM_LOSS_SCOPE=${FIM_LOSS_SCOPE:-span}
 # On by default: train a terminator (SEQ_EOS after f_middle) rather than relying on
 # an oracle-supplied span length, which is a training-time convenience a real
 # deployment wouldn't have. Lifts the vocab (vocab_size_for_fim_format); phase 1
@@ -111,6 +114,7 @@ cmd=(
     --dataset-mode window
     --p-fim "${P_FIM}"
     --fim-format "${FIM_FORMAT}"
+    --fim-loss-scope "${FIM_LOSS_SCOPE}"
     --fim-min-gap "${FIM_MIN_GAP}"
     --fim-max-gap "${FIM_MAX_GAP}"
     --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"
@@ -178,7 +182,7 @@ if [[ "${COMPILE}" == "1" ]]; then
 fi
 
 echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} patch=${BYTE_PATCH_SIZE} local=${MEGABYTE_LOCAL_LAYERS}L/${MEGABYTE_LOCAL_EMBD}D/${MEGABYTE_LOCAL_HEADS}H raw_byte_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE)) steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
-echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fim_format=${FIM_FORMAT} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
+echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fim_format=${FIM_FORMAT} fim_loss_scope=${FIM_LOSS_SCOPE} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
 
 flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2

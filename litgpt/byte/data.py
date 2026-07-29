@@ -62,6 +62,8 @@ REFERENCE_MODES = ("normal", "no_ref", "zero_ref", "shuffled_ref")
 ReferenceMode = Literal["normal", "no_ref", "zero_ref", "shuffled_ref"]
 FIM_FORMATS = ("bridge", "psm")
 FIMFormat = Literal["bridge", "psm"]
+FIM_LOSS_SCOPES = ("span", "full")
+FIMLossScope = Literal["span", "full"]
 DATASET_MODES = ("slice", "window")
 DatasetMode = Literal["slice", "window"]
 
@@ -92,6 +94,10 @@ class ByteDataConfig:
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
+    # "span" supervises only the missing bytes and their optional EOS (the
+    # original repair objective). "full" applies next-token loss across the
+    # reordered FIM sequence, matching causal-FIM pretraining practice.
+    fim_loss_scope: FIMLossScope = "span"
     # When True, append SEQ_EOS after each AR target / FIM span so the model
     # learns to terminate. Default False keeps the oracle-length convention
     # where generation length is supplied externally.
@@ -412,6 +418,31 @@ def pad_and_truncate(tensors: list[Tensor], max_seq_length: int, value: int) -> 
     )
 
 
+def _fim_training_labels(
+    input_ids: Tensor,
+    missing_tail: Tensor,
+    *,
+    loss_scope: FIMLossScope,
+    ignore_index: int,
+) -> Tensor:
+    """Build aligned next-token targets for a reordered FIM sequence.
+
+    ``input_ids`` is the complete serialized sequence with its final target token
+    omitted. In span mode, only ``FIM_END -> missing -> EOS`` contributes loss. In
+    full mode, every serialized transition contributes loss; the first serialized
+    token remains context because there is no preceding BOS in the FIM prompt.
+    """
+    if loss_scope == "span":
+        labels = torch.full_like(input_ids, ignore_index)
+        labels[-missing_tail.numel() :] = missing_tail
+        return labels
+    if loss_scope != "full":
+        raise ValueError(f"loss_scope must be one of {FIM_LOSS_SCOPES}")
+    if input_ids.numel() == 0 or missing_tail.numel() == 0:
+        raise ValueError("full-sequence FIM supervision requires a non-empty sequence")
+    return torch.cat((input_ids[1:], missing_tail[-1:]))
+
+
 class ByteSliceDataset(Dataset):
     """Reference-conditioned AR/FIM dataset over H.264 frame/slice NALs.
 
@@ -426,7 +457,8 @@ class ByteSliceDataset(Dataset):
         bridge    = [B_meta, B_ref, B_pre, B_orph, SPAN_BOS, B_miss[:-1]]
         psm       = [B_meta, B_ref, FIM_BEGIN, B_pre, FIM_HOLE, B_orph,
                      FIM_END, B_miss[:-1]]
-        labels    = [-100 ..., B_miss]
+        span labels = [-100 ..., B_miss]
+        full labels = the next token at every position in the reordered sequence
     """
 
     def __init__(
@@ -435,6 +467,7 @@ class ByteSliceDataset(Dataset):
         max_seq_length: int,
         p_fim: float = 0.0,
         fim_format: FIMFormat = "bridge",
+        fim_loss_scope: FIMLossScope = "span",
         use_eos: bool = False,
         num_ref_slices: int = 1,
         target_nal_types: tuple[int, ...] = (1,),
@@ -453,6 +486,8 @@ class ByteSliceDataset(Dataset):
             raise ValueError("p_fim must be in [0, 1]")
         if fim_format not in FIM_FORMATS:
             raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
+        if fim_loss_scope not in FIM_LOSS_SCOPES:
+            raise ValueError(f"fim_loss_scope must be one of {FIM_LOSS_SCOPES}")
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
         if num_ref_slices < 0:
@@ -468,6 +503,7 @@ class ByteSliceDataset(Dataset):
         self.max_seq_length = max_seq_length
         self.p_fim = p_fim
         self.fim_format = fim_format
+        self.fim_loss_scope = fim_loss_scope
         self.use_eos = use_eos
         self.num_ref_slices = num_ref_slices
         self.target_nal_types = set(target_nal_types)
@@ -839,8 +875,12 @@ class ByteSliceDataset(Dataset):
                     ),
                 )
             )
-        labels = torch.full_like(input_ids, self.ignore_index)
-        labels[-missing_tail.numel() :] = missing_tail
+        labels = _fim_training_labels(
+            input_ids,
+            missing_tail,
+            loss_scope=self.fim_loss_scope,
+            ignore_index=self.ignore_index,
+        )
         return self._pack_item(
             input_ids,
             labels,
@@ -900,6 +940,7 @@ class ByteSliceDataset(Dataset):
             "sample_meta": {
                 "task": task,
                 "fim_format": self.fim_format,
+                "fim_loss_scope": self.fim_loss_scope,
                 "h264_path": str(sample.h264_path),
                 "target_index": sample.target_index,
                 "num_ref_slices": len(sample.ref_indices),
@@ -954,10 +995,11 @@ class ByteStreamWindowDataset(Dataset):
         orphan    = window[split+gap:frame_hi] # f's received bytes after the hole
         input_ids = context, FIM_BEGIN, prefix, FIM_HOLE, orphan, FIM_END,
                     missing_tail[:-1]
-        labels    = ignore everywhere except the trailing missing_tail
+        span labels = ignore everywhere except the trailing missing_tail
+        full labels = the next token at every position in the reordered sequence
 
     This mirrors ``ByteSliceDataset._build_fim_item`` (same markers, same
-    prefix/missing/orphan decomposition, same labels-on-the-span convention); the
+    prefix/missing/orphan decomposition and configurable loss scope); the
     differences are that the multi-frame window replaces the single reference slice
     as context, and the hole is placed within a real frame rather than within a
     single NAL. "Multi-frame" describes the CONTEXT, not the objective -- AR is the
@@ -993,6 +1035,7 @@ class ByteStreamWindowDataset(Dataset):
         min_frames: int = 2,
         p_fim: float = 0.0,
         fim_format: FIMFormat = "psm",
+        fim_loss_scope: FIMLossScope = "span",
         use_eos: bool = False,
         fim_min_gap: int = 64,
         fim_max_gap: int = 1400,
@@ -1010,6 +1053,8 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError("p_fim must be in [0, 1]")
         if fim_format not in FIM_FORMATS:
             raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
+        if fim_loss_scope not in FIM_LOSS_SCOPES:
+            raise ValueError(f"fim_loss_scope must be one of {FIM_LOSS_SCOPES}")
         if fim_min_gap < 1 or fim_max_gap < fim_min_gap:
             raise ValueError("require 1 <= fim_min_gap <= fim_max_gap")
         if frame_guard_bytes < 0:
@@ -1019,6 +1064,7 @@ class ByteStreamWindowDataset(Dataset):
         self.min_frames = min_frames
         self.p_fim = p_fim
         self.fim_format = fim_format
+        self.fim_loss_scope = fim_loss_scope
         self.use_eos = use_eos
         self.fim_min_gap = fim_min_gap
         self.fim_max_gap = fim_max_gap
@@ -1408,8 +1454,12 @@ class ByteStreamWindowDataset(Dataset):
                 torch.arange(middle_in.numel(), dtype=torch.long),
             )
         )
-        labels = torch.full_like(input_ids, self.ignore_index)
-        labels[-missing_tail.numel() :] = missing_tail
+        labels = _fim_training_labels(
+            input_ids,
+            missing_tail,
+            loss_scope=self.fim_loss_scope,
+            ignore_index=self.ignore_index,
+        )
         return self._pack_item(
             input_ids,
             labels,
@@ -1450,6 +1500,7 @@ class ByteStreamWindowDataset(Dataset):
             "sample_meta": {
                 "task": task,
                 "fim_format": self.fim_format if task == "fim" else "stream",
+                "fim_loss_scope": self.fim_loss_scope,
                 "h264_path": str(sample.h264_path),
                 "start_nal": sample.start_nal,
                 "end_nal": sample.end_nal,
@@ -1702,6 +1753,7 @@ class ByteDataModule(DataModule):
                     min_frames=self.config.window_min_frames,
                     p_fim=self.config.p_fim,
                     fim_format=self.config.fim_format,
+                    fim_loss_scope=self.config.fim_loss_scope,
                     use_eos=self.config.use_eos,
                     fim_min_gap=self.config.fim_min_gap,
                     fim_max_gap=self.config.fim_max_gap,
@@ -1714,6 +1766,7 @@ class ByteDataModule(DataModule):
                 max_seq_length=byte_max_seq_length,
                 p_fim=self.config.p_fim,
                 fim_format=self.config.fim_format,
+                fim_loss_scope=self.config.fim_loss_scope,
                 use_eos=self.config.use_eos,
                 num_ref_slices=self.config.num_ref_slices,
                 target_nal_types=self.config.target_nal_types,
@@ -1806,10 +1859,12 @@ class ByteDataModule(DataModule):
                         "use p_fim=1.0"
                     )
                 labels = item["labels"]
-                supervised = labels[labels != IGNORE_INDEX]
+                gap = int(meta["fim_gap"])
+                eos_tokens = 1 if self.config.use_eos else 0
+                missing_targets = labels[-(gap + eos_tokens) :]
                 target = bytes(
                     int(token)
-                    for token in supervised.tolist()
+                    for token in missing_targets.tolist()
                     if 0 <= int(token) < BYTE_VOCAB_SIZE
                 )
                 fixed_holes.append(
@@ -1840,6 +1895,10 @@ class ByteDataModule(DataModule):
             "val_fraction": self.config.val_fraction,
             "seed": self.config.seed,
             "dataset_mode": self.config.dataset_mode,
+            "p_fim": self.config.p_fim,
+            "fim_format": self.config.fim_format,
+            "fim_loss_scope": self.config.fim_loss_scope,
+            "use_eos": self.config.use_eos,
             "fixed_fim_holes_enabled": self.config.fixed_fim_holes,
             "n_train_videos": len(videos),
             "n_train_windows": len(windows),
