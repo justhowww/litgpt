@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-REPO_ROOT=${REPO_ROOT           :-"${SLURM_SUBMIT_DIR}"}
+REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 export REPO_ROOT
 
 # GPU-visibility sanity check -- fails fast (seconds) instead of a 30-minute NCCL
