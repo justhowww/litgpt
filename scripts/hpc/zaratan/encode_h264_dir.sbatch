@@ -29,9 +29,23 @@ command -v ffprobe >/dev/null
 : "${PART_NAME:?Set PART_NAME to the staged source directory name}"
 
 CONFIG=${CONFIG:-"${REPO_ROOT}/preprocessing/h264_preprocess_config.json"}
-# Encode this many videos concurrently (one single-threaded ffmpeg each).
-# Defaults to the allocation's cpus-per-task so cores are not left idle.
-ENCODE_WORKERS=${ENCODE_WORKERS:-${SLURM_CPUS_PER_TASK:-16}}
+FFMPEG_THREADS=$(python -c \
+    'import json, sys; value = json.load(open(sys.argv[1]))["ffmpeg"].get("threads"); print(0 if value is None else int(value))' \
+    "${CONFIG}")
+ALLOCATED_CPUS=${SLURM_CPUS_PER_TASK:-16}
+if (( FFMPEG_THREADS == 0 )); then
+    ENCODE_WORKERS=${ENCODE_WORKERS:-1}
+else
+    ENCODE_WORKERS=${ENCODE_WORKERS:-$((ALLOCATED_CPUS / FFMPEG_THREADS))}
+fi
+if (( ENCODE_WORKERS < 1 )); then
+    echo "Not enough CPUs: ffmpeg requests ${FFMPEG_THREADS} threads but Slurm allocated ${ALLOCATED_CPUS}" >&2
+    exit 1
+fi
+if (( FFMPEG_THREADS > 0 && ENCODE_WORKERS * FFMPEG_THREADS > ALLOCATED_CPUS )); then
+    echo "Refusing CPU oversubscription: ${ENCODE_WORKERS} encoders x ${FFMPEG_THREADS} threads > ${ALLOCATED_CPUS} allocated CPUs" >&2
+    exit 1
+fi
 PART_MANIFEST="${SCRATCH_CORPUS}/.manifest-${PART_NAME}.jsonl"
 
 if [[ ! -d "${STAGED_SOURCE_ROOT}/${PART_NAME}" ]]; then
@@ -50,6 +64,7 @@ srun python preprocessing/parse_mp4_to_h264.py \
     "${SCRATCH_CORPUS}" \
     --config "${CONFIG}" \
     --manifest "${PART_MANIFEST}" \
+    --scan-subdir "${PART_NAME}" \
     --skip-existing \
     --fast-skip-existing \
     --workers "${ENCODE_WORKERS}"

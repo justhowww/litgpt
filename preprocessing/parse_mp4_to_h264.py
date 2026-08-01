@@ -473,7 +473,19 @@ def preprocess_videos(
     fast_skip_existing: bool,
     limit: int | None,
     workers: int = 1,
+    scan_subdir: Path | None = None,
 ) -> None:
+    if scan_subdir is None:
+        discovery_dir = input_dir
+    else:
+        if scan_subdir.is_absolute() or any(
+            part in {"", ".", ".."} for part in scan_subdir.parts
+        ):
+            raise ValueError(f"scan_subdir must be a relative child path: {scan_subdir}")
+        discovery_dir = input_dir / scan_subdir
+        if not discovery_dir.is_dir():
+            raise FileNotFoundError(f"scan_subdir does not exist: {discovery_dir}")
+
     h264_dir = output_dir / "h264"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -487,7 +499,9 @@ def preprocess_videos(
     pending: list[tuple] = []
     manifest_parent = manifest_path.parent
     with manifest_path.open("a", encoding="utf-8") as manifest:
-        for input_path in discover_videos(input_dir, config.video_extensions):
+        # Scan only the selected shard while retaining paths relative to the
+        # corpus root, so part names survive in h264/partN/...
+        for input_path in discover_videos(discovery_dir, config.video_extensions):
             if limit is not None and count >= limit:
                 break
 
@@ -725,8 +739,19 @@ def parse_args() -> argparse.Namespace:
         "--workers",
         type=int,
         default=1,
-        help="Encode this many videos concurrently (one single-threaded ffmpeg "
-        "each). Set to the job's cpus-per-task. 1 = sequential.",
+        help=(
+            "Encode this many videos concurrently. CPU demand is workers times "
+            "ffmpeg.threads from the config. 1 = sequential."
+        ),
+    )
+    parser.add_argument(
+        "--scan-subdir",
+        type=Path,
+        default=None,
+        help=(
+            "Scan only this relative child of input_dir while preserving that "
+            "child in output paths. Intended for one-shard-per-job execution."
+        ),
     )
     return parser.parse_args()
 
@@ -744,6 +769,7 @@ def main() -> None:
         fast_skip_existing=args.fast_skip_existing,
         limit=args.limit,
         workers=args.workers,
+        scan_subdir=args.scan_subdir,
     )
 
 

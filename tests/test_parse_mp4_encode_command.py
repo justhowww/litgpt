@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import sys
+import tempfile
 from pathlib import Path
 
 _PREPROC_DIR = Path(__file__).resolve().parents[1] / "preprocessing"
@@ -159,3 +160,42 @@ def test_bscv_config_matches_recovered_x264_settings():
     settings = P.output_settings_to_manifest(cfg)
     assert settings["codec"] == "h264_high_cabac"
     assert settings["keyint_min"] == 1
+
+
+def test_scan_subdir_limits_discovery_and_preserves_shard_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "source"
+        output = root / "output"
+        (source / "part1").mkdir(parents=True)
+        (source / "part2").mkdir()
+        selected = source / "part1" / "selected.mp4"
+        unselected = source / "part2" / "unselected.mp4"
+        selected.touch()
+        unselected.touch()
+
+        # Pre-create outputs so this test exercises shard selection and path
+        # mapping without invoking FFmpeg.
+        selected_output = output / "h264/part1/selected.h264"
+        unselected_output = output / "h264/part2/unselected.h264"
+        selected_output.parent.mkdir(parents=True)
+        unselected_output.parent.mkdir(parents=True)
+        selected_output.write_bytes(b"selected")
+        unselected_output.write_bytes(b"unselected")
+
+        manifest = output / ".manifest-part1.jsonl"
+        P.preprocess_videos(
+            input_dir=source,
+            output_dir=output,
+            manifest_path=manifest,
+            config=P.load_config(_DEFAULT_CONFIG),
+            skip_existing=True,
+            fast_skip_existing=True,
+            limit=None,
+            workers=1,
+            scan_subdir=Path("part1"),
+        )
+        rows = [__import__("json").loads(line) for line in manifest.read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["id"] == "part1/selected"
+        assert rows[0]["h264_path"] == "h264/part1/selected.h264"
