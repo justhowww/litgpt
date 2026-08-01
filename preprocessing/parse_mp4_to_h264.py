@@ -59,6 +59,7 @@ class PreprocessConfig:
     qp: int
     crf: int | None
     gop: int
+    keyint_min: int
     preset: str
     video_extensions: tuple[str, ...]
     ffmpeg: FFmpegConfig
@@ -113,6 +114,9 @@ def load_config(path: Path) -> PreprocessConfig:
         qp=raw["qp"],
         crf=raw.get("crf"),
         gop=raw["gop"],
+        # Historical configs used a fixed GOP, so keep their old behavior when
+        # the new independent minimum-keyframe interval is absent.
+        keyint_min=raw.get("keyint_min", raw["gop"]),
         preset=raw["preset"],
         video_extensions=tuple(ext.lower() for ext in raw["video_extensions"]),
         ffmpeg=ffmpeg,
@@ -134,6 +138,7 @@ def override_config(
         "qp": args.qp if args.qp is not None else config.qp,
         "crf": config.crf,
         "gop": args.gop if args.gop is not None else config.gop,
+        "keyint_min": config.keyint_min,
         "preset": args.preset if args.preset is not None else config.preset,
     }
     return PreprocessConfig(
@@ -295,7 +300,7 @@ def build_encode_command(
             "-g",
             str(config.gop),
             "-keyint_min",
-            str(config.gop),
+            str(config.keyint_min),
             "-sc_threshold",
             str(config.ffmpeg.scene_cut_threshold),
             *rate_control_args,
@@ -368,17 +373,19 @@ def probe_to_manifest(probe: VideoProbe | None) -> dict[str, Any] | None:
 
 
 def output_settings_to_manifest(config: PreprocessConfig) -> dict[str, Any]:
+    cabac = int(config.ffmpeg.x264_params.get("cabac", 1))
     return {
         "width": config.width,
         "height": config.height,
         "resize_mode": config.resize_mode,
         "fps": config.fps,
         "clip_duration_sec": config.clip_duration_sec,
-        "codec": "h264_baseline_cavlc",
+        "codec": f"h264_{config.ffmpeg.profile}_{'cabac' if cabac else 'cavlc'}",
         "rate_control": config.rate_control,
         "qp": config.qp,
         "crf": config.crf,
         "gop": config.gop,
+        "keyint_min": config.keyint_min,
         "preset": config.preset,
         "ffmpeg_codec": config.ffmpeg.codec,
         "profile": config.ffmpeg.profile,
@@ -639,6 +646,7 @@ def write_corpus_metadata(path: Path, config: PreprocessConfig) -> None:
             "qp": config.qp,
             "crf": config.crf,
             "gop": config.gop,
+            "keyint_min": config.keyint_min,
             "preset": config.preset,
             "video_extensions": list(config.video_extensions),
             "ffmpeg": {

@@ -31,6 +31,7 @@ P = _load_module("parse_mp4_to_h264")
 
 _DEFAULT_CONFIG = _PREPROC_DIR / "h264_preprocess_config.json"
 _AVCLM_CONFIG = _PREPROC_DIR / "h264_preprocess_config_avclm.json"
+_BSCV_CONFIG = _PREPROC_DIR / "h264_preprocess_config_bscv.json"
 
 
 def _cmd(config_path: Path) -> list[str]:
@@ -44,6 +45,7 @@ def test_default_config_backward_compatible():
     assert cfg.clip_duration_sec is None
     assert cfg.ffmpeg.disable_subtitles is False
     assert cfg.ffmpeg.bitstream_filter is None
+    assert cfg.keyint_min == cfg.gop == 16
 
     cmd = _cmd(_DEFAULT_CONFIG)
     joined = " ".join(cmd)
@@ -118,3 +120,42 @@ def test_bitstream_filter_emitted_when_set():
     assert cmd[cmd.index("-bsf:v") + 1] == "h264_mp4toannexb"
     # Emitted before the output muxer selection.
     assert cmd.index("-bsf:v") < cmd.index("-f")
+
+
+def test_bscv_config_matches_recovered_x264_settings():
+    """The BSCV preset pins settings recovered from two embedded x264 SEIs."""
+    cfg = P.load_config(_BSCV_CONFIG)
+    assert cfg.fps == 30
+    assert cfg.rate_control == "qp" and cfg.qp == 1
+    assert cfg.gop == 16 and cfg.keyint_min == 1
+    assert cfg.ffmpeg.profile == "high"
+    assert cfg.ffmpeg.refs == 3
+    assert cfg.ffmpeg.scene_cut_threshold == 40
+    assert cfg.ffmpeg.threads == 22
+
+    cmd = _cmd(_BSCV_CONFIG)
+    assert cmd[cmd.index("-g") + 1] == "16"
+    assert cmd[cmd.index("-keyint_min") + 1] == "1"
+    assert cmd[cmd.index("-refs") + 1] == "3"
+    assert cmd[cmd.index("-sc_threshold") + 1] == "40"
+    assert "-crf" not in cmd
+
+    x264 = cmd[cmd.index("-x264-params") + 1]
+    assert "slices=" not in x264
+    for token in [
+        "cabac=1",
+        "bframes=3",
+        "b-pyramid=2",
+        "b-adapt=1",
+        "8x8dct=1",
+        "me=hex",
+        "subme=7",
+        "mbtree=0",
+        "aq-mode=0",
+        "qp=1",
+    ]:
+        assert token in x264, token
+
+    settings = P.output_settings_to_manifest(cfg)
+    assert settings["codec"] == "h264_high_cabac"
+    assert settings["keyint_min"] == 1
