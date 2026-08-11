@@ -254,11 +254,20 @@ def _megabyte_generate_batch(
     patched_regions_b = patched_regions.expand(b, -1, -1).contiguous()
     patched_offsets_b = patched_offsets.expand(b, -1, -1).contiguous()
 
-    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
-    raw_model.set_kv_cache(
-        batch_size=b, max_seq_length=raw_model.max_seq_length, device=device, dtype=cache_dtype
+    # Size the KV cache to what this generation actually needs (prompt patches
+    # plus the patches the target span will occupy), not the model's full
+    # max_seq_length. At batch_size=1 (sequential mode) the gap between "needed"
+    # and "full" is harmless; multiplied by a batch dimension of G it is not --
+    # this is what made G=16 borderline and G=32/64 OOM.
+    needed_patches = min(
+        int(raw_model.max_seq_length),
+        prompt_patches + -(-sample.target_length // patch_size),
     )
+    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
     try:
+        raw_model.set_kv_cache(
+            batch_size=b, max_seq_length=needed_patches, device=device, dtype=cache_dtype
+        )
         with _autocast():
             global_output = raw_model.megabyte_global_forward(
                 patched_ids_b,
