@@ -37,7 +37,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from litgpt.byte.data import BYTE_VOCAB_SIZE  # noqa: E402
-from litgpt.byte.megabyte_inference import MegabyteInference  # noqa: E402
+from litgpt.byte.megabyte_inference import (  # noqa: E402
+    MegabyteInference,
+    megabyte_max_new_bytes,
+    megabyte_prompt_patches,
+)
 from litgpt.byte.reconstruction import (  # noqa: E402
     _unwrap_model,
     decode_frame,
@@ -89,6 +93,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--megabyte-mode",
+        choices=("sequential", "batched"),
+        default="sequential",
+        help=(
+            "Only applies to byte_patch_size>1 checkpoints. 'sequential' runs G "
+            "independent single-sample rollouts (matches production MegabyteInference "
+            "today). 'batched' is an experimental path that batches all G candidates "
+            "into one loop -- only valid for fixed-schedule reconstruction samples, "
+            "not free-run generation."
+        ),
+    )
     parser.add_argument(
         "--decode-workers",
         type=int,
@@ -192,6 +208,110 @@ def _megabyte_generate_one(
     return bytes(generated)
 
 
+@torch.inference_mode()
+def _megabyte_generate_batch(
+    raw_model: Any,
+    sample: Any,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> list[bytes] | None:
+    """Generate a full group of candidates in one batched megabyte loop.
+
+    Only valid because reconstruction-sample generation has a *deterministic*
+    region/offset schedule (fixed by sample.generation_region_id and
+    sample.generation_offset_start + step index) -- it does not depend on
+    which bytes get sampled, unlike free_run_rollout's start-code-tracking
+    schedule. That means all G candidates share identical patch metadata and
+    can run through the same global-decoder forward passes together; only the
+    sampled byte content differs per batch row. This does NOT generalize to
+    free-run generation as-is.
+    """
+    patch_size = int(raw_model.config.byte_patch_size)
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
+        prompt, region_ids, offset_ids, patch_size
+    )
+    prompt_patches = patched_ids.size(1)
+    if prompt_patches > int(raw_model.max_seq_length):
+        return None
+    if sample.target_length > megabyte_max_new_bytes(raw_model, prompt.size(1)):
+        return None
+
+    def _autocast():
+        return torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        )
+
+    b = batch_size
+    patched_ids_b = patched_ids.expand(b, -1, -1).contiguous()
+    patched_regions_b = patched_regions.expand(b, -1, -1).contiguous()
+    patched_offsets_b = patched_offsets.expand(b, -1, -1).contiguous()
+
+    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
+    raw_model.set_kv_cache(
+        batch_size=b, max_seq_length=raw_model.max_seq_length, device=device, dtype=cache_dtype
+    )
+    try:
+        with _autocast():
+            global_output = raw_model.megabyte_global_forward(
+                patched_ids_b,
+                input_pos=torch.arange(prompt_patches, device=device, dtype=torch.long),
+                input_pos_maxp1=prompt_patches,
+                region_ids=patched_regions_b,
+                offset_ids=patched_offsets_b,
+            )
+        global_output = global_output[:, -1]  # (B, n_embd)
+
+        generated: list[list[int]] = [[] for _ in range(b)]
+        current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+        current_region_ids: list[int] = []
+        current_offset_ids: list[int] = []
+        position = prompt_patches
+        for step in range(sample.target_length):
+            if current_tokens.size(1) == patch_size:
+                # Commit the just-completed patch: one batched global-forward step.
+                patch_regions = torch.tensor(
+                    current_region_ids, device=device, dtype=torch.long
+                ).view(1, 1, patch_size).expand(b, -1, -1)
+                patch_offsets = torch.tensor(
+                    current_offset_ids, device=device, dtype=torch.long
+                ).view(1, 1, patch_size).expand(b, -1, -1)
+                with _autocast():
+                    out = raw_model.megabyte_global_forward(
+                        current_tokens.view(b, 1, patch_size),
+                        input_pos=torch.tensor([position], device=device, dtype=torch.long),
+                        input_pos_maxp1=position + 1,
+                        region_ids=patch_regions,
+                        offset_ids=patch_offsets,
+                    )
+                global_output = out[:, -1]
+                position += 1
+                current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+                current_region_ids = []
+                current_offset_ids = []
+
+            with _autocast():
+                logits = raw_model.megabyte_local_next_logits(
+                    global_output, current_tokens
+                )[:, :BYTE_VOCAB_SIZE]
+            tokens = sample_tokens(logits, temperature, top_k, top_p)  # (B,)
+            for row, token in enumerate(tokens.tolist()):
+                generated[row].append(token)
+            current_tokens = torch.cat([current_tokens, tokens.unsqueeze(1)], dim=1)
+            current_region_ids.append(sample.generation_region_id)
+            current_offset_ids.append(sample.generation_offset_start + step)
+    finally:
+        raw_model.clear_kv_cache()
+    return [bytes(row) for row in generated]
+
+
 def generate_group(
     model: Any,
     sample: Any,
@@ -201,13 +321,17 @@ def generate_group(
     temperature: float,
     top_k: int,
     top_p: float,
+    megabyte_mode: str = "sequential",
 ) -> tuple[list[bytes], str]:
-    """Dispatch to the flat batched sampler or the sequential megabyte sampler.
+    """Dispatch to the flat batched sampler or one of the megabyte samplers.
 
-    Returns (candidates, generation_mode) where generation_mode is "batched"
-    (one forward pass covers all G candidates) or "megabyte_sequential" (G
-    separate single-sample rollouts -- the real per-step cost until batched
-    MEGABYTE inference exists).
+    Returns (candidates, generation_mode):
+      "batched"             -- patch_size==1, one forward pass covers all G.
+      "megabyte_sequential" -- patch_size>1, G separate single-sample rollouts
+                                (the current real per-step cost).
+      "megabyte_batched"    -- patch_size>1, experimental: one batched loop
+                                over all G, exploiting the fixed metadata
+                                schedule of reconstruction samples.
     """
     raw_model = _unwrap_model(model)
     patch_size = int(raw_model.config.byte_patch_size)
@@ -225,6 +349,11 @@ def generate_group(
             ),
             "batched",
         )
+    if megabyte_mode == "batched":
+        candidates = _megabyte_generate_batch(
+            raw_model, sample, device, group_size, temperature, top_k, top_p
+        )
+        return (candidates or [], "megabyte_batched")
     candidates = []
     for _ in range(group_size):
         candidate = _megabyte_generate_one(
@@ -269,6 +398,7 @@ def main() -> None:
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
+                    megabyte_mode=args.megabyte_mode,
                 )
                 if device.type == "cuda":
                     torch.cuda.synchronize()
