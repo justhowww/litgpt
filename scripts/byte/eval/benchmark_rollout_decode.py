@@ -24,6 +24,7 @@ import argparse
 import csv
 import json
 import statistics
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,8 +32,12 @@ from typing import Any
 
 import torch
 
-from litgpt.byte.reconstruction import decode_frame, replace_target_nal
-from scripts.byte.eval.helpers.checkpoint_eval_helpers import (
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from litgpt.byte.reconstruction import decode_frame, replace_target_nal  # noqa: E402
+from scripts.byte.eval.helpers.checkpoint_eval_helpers import (  # noqa: E402
     build_eval_samples,
     generate_bytes,
     load_model,
