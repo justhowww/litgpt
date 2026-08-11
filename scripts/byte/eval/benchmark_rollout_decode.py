@@ -36,11 +36,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from litgpt.byte.reconstruction import decode_frame, replace_target_nal  # noqa: E402
+from litgpt.byte.data import BYTE_VOCAB_SIZE  # noqa: E402
+from litgpt.byte.megabyte_inference import MegabyteInference  # noqa: E402
+from litgpt.byte.reconstruction import (  # noqa: E402
+    _unwrap_model,
+    decode_frame,
+    replace_target_nal,
+)
 from scripts.byte.eval.helpers.checkpoint_eval_helpers import (  # noqa: E402
     build_eval_samples,
     generate_bytes,
     load_model,
+    sample_tokens,
 )
 
 
@@ -148,6 +155,87 @@ def time_decode_group(
     return elapsed, sum(results)
 
 
+@torch.inference_mode()
+def _megabyte_generate_one(
+    raw_model: Any,
+    sample: Any,
+    device: torch.device,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> bytes | None:
+    """Generate one candidate for a byte_patch_size>1 checkpoint.
+
+    MegabyteInference is single-sample only (its global-decoder KV cache is
+    batch_size=1 by construction), so unlike the flat-vocab path there is no
+    batched-candidates shortcut here -- this is called once per candidate.
+    """
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    mi = MegabyteInference(raw_model, prompt, region_ids, offset_ids, device)
+    generated: list[int] = []
+    try:
+        if sample.target_length > mi.max_new_bytes:
+            return None
+        for generated_idx in range(sample.target_length):
+            logits = mi.next_logits()[:, :BYTE_VOCAB_SIZE]
+            token = int(sample_tokens(logits, temperature, top_k, top_p).item())
+            generated.append(token)
+            mi.append(
+                token,
+                sample.generation_region_id,
+                sample.generation_offset_start + generated_idx,
+            )
+    finally:
+        mi.close()
+    return bytes(generated)
+
+
+def generate_group(
+    model: Any,
+    sample: Any,
+    device: torch.device,
+    *,
+    group_size: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> tuple[list[bytes], str]:
+    """Dispatch to the flat batched sampler or the sequential megabyte sampler.
+
+    Returns (candidates, generation_mode) where generation_mode is "batched"
+    (one forward pass covers all G candidates) or "megabyte_sequential" (G
+    separate single-sample rollouts -- the real per-step cost until batched
+    MEGABYTE inference exists).
+    """
+    raw_model = _unwrap_model(model)
+    patch_size = int(raw_model.config.byte_patch_size)
+    if patch_size <= 1:
+        return (
+            generate_bytes(
+                model,
+                sample,
+                device,
+                strategy="sample",
+                num_candidates=group_size,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            ),
+            "batched",
+        )
+    candidates = []
+    for _ in range(group_size):
+        candidate = _megabyte_generate_one(
+            raw_model, sample, device, temperature, top_k, top_p
+        )
+        if candidate is None:
+            return [], "megabyte_sequential"
+        candidates.append(candidate)
+    return candidates, "megabyte_sequential"
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -173,12 +261,11 @@ def main() -> None:
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 gen_start = time.perf_counter()
-                candidates = generate_bytes(
+                candidates, generation_mode = generate_group(
                     model,
                     sample,
                     device,
-                    strategy="sample",
-                    num_candidates=group_size,
+                    group_size=group_size,
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
@@ -208,6 +295,7 @@ def main() -> None:
                     "target_length": sample.target_length,
                     "group_size": group_size,
                     "repeat": repeat,
+                    "generation_mode": generation_mode,
                     "gen_time_sec": gen_time,
                     "gen_time_per_sample_sec": gen_time / group_size,
                     "decode_time_sec": decode_time,
@@ -218,7 +306,7 @@ def main() -> None:
                 }
                 rows.append(row)
                 print(
-                    f"  G={group_size} repeat={repeat}: gen={gen_time:.3f}s "
+                    f"  G={group_size} repeat={repeat} [{generation_mode}]: gen={gen_time:.3f}s "
                     f"decode={decode_time:.3f}s ({decode_time / group_size * 1000:.1f}ms/sample, "
                     f"{num_ok}/{group_size} ok) total={gen_time + decode_time:.3f}s",
                     flush=True,
