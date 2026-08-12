@@ -54,6 +54,7 @@ from litgpt.byte import h264_mask as HM  # noqa: E402
 from litgpt.byte.data import (  # noqa: E402
     BYTE_VOCAB_SIZE,
     FIM_FORMATS,
+    FIM_LOSS_SCOPES,
     IGNORE_INDEX,
     REGION_BRIDGE,
     SEQ_EOS_ID,
@@ -178,6 +179,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-by-video", action="store_true")
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="psm")
     parser.add_argument(
+        "--fim-loss-scope",
+        choices=("auto", *FIM_LOSS_SCOPES),
+        default="auto",
+        help=(
+            "MEGABYTE teacher-forcing layout used during training. 'auto' reads "
+            "fim_loss_scope from --train-split-file and falls back to span for "
+            "older split files. Full-sequence checkpoints must be evaluated with "
+            "full alignment; repatching only the missing span changes its patch phase."
+        ),
+    )
+    parser.add_argument(
         "--use-eos",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -280,6 +292,27 @@ def _load_train_split(
     return windows, videos, fixed_holes
 
 
+def _resolve_fim_loss_scope(args: argparse.Namespace) -> str:
+    """Resolve the training loss layout before constructing evaluation samples."""
+    requested = args.fim_loss_scope
+    if requested != "auto":
+        return str(requested)
+    if args.train_split_file is not None:
+        split = json.loads(args.train_split_file.read_text(encoding="utf-8"))
+        recorded = split.get("fim_loss_scope")
+        if recorded in FIM_LOSS_SCOPES:
+            print(
+                f"FIM loss scope: {recorded} (from {args.train_split_file})",
+                flush=True,
+            )
+            return str(recorded)
+    print(
+        "FIM loss scope: span (auto fallback; split file has no recorded scope)",
+        flush=True,
+    )
+    return "span"
+
+
 def _verify_fixed_hole_replay(
     expected: dict[str, Any],
     meta: dict[str, Any],
@@ -340,6 +373,7 @@ def _split_indices(
 
 
 def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
+    args.fim_loss_scope = _resolve_fim_loss_scope(args)
     rows = load_manifest_rows(
         args.manifest, max_rows=args.max_manifest_rows or None, report_progress=True,
     )
@@ -358,6 +392,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         min_frames=args.window_min_frames,
         p_fim=1.0,
         fim_format=args.fim_format,
+        fim_loss_scope=args.fim_loss_scope,
         use_eos=args.use_eos,
         fim_min_gap=args.fim_min_gap,
         fim_max_gap=args.fim_max_gap,
@@ -407,20 +442,43 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         if item["sample_meta"].get("task") != "fim":
             continue
         labels: Tensor = item["labels"]
-        supervised = labels != IGNORE_INDEX
-        if not bool(supervised.any()):
+        if not bool((labels != IGNORE_INDEX).any()):
             continue
-        target_ids = labels[supervised].tolist()
-        if args.use_eos:
-            if not target_ids or target_ids[-1] != SEQ_EOS_ID:
-                continue
-            target_ids = target_ids[:-1]
-        if not target_ids or any(t < 0 or t >= BYTE_VOCAB_SIZE for t in target_ids):
+        meta = item["sample_meta"]
+        gap = int(meta["fim_gap"])
+        split = int(meta["fim_split"])
+        ar_labels = dataset.ar_item(idx)["labels"]
+        if dataset.use_eos:
+            if int(ar_labels[-1]) != SEQ_EOS_ID:
+                raise RuntimeError(
+                    "window AR item is missing its configured SEQ_EOS"
+                )
+            ar_labels = ar_labels[:-1]
+        window_bytes = bytes(ar_labels.tolist())
+        target_ids = list(window_bytes[split : split + gap])
+        if len(target_ids) != gap or any(
+            t < 0 or t >= BYTE_VOCAB_SIZE for t in target_ids
+        ):
             continue
 
-        first_supervised = int(supervised.nonzero()[0])
-        prompt_end = first_supervised + 1
-        meta = item["sample_meta"]
+        # Generation always starts immediately after FIM_END. In span-loss mode
+        # this is the first supervised position. In full-loss mode supervision
+        # starts at serialized position zero, so deriving the prompt from the first
+        # supervised label would incorrectly reduce it to one token.
+        target_token_count = gap + int(args.use_eos)
+        prompt_end = item["input_ids"].numel() - target_token_count + 1
+        if prompt_end <= 0:
+            raise RuntimeError("invalid FIM prompt/target boundary")
+        native_tail = labels[-target_token_count:]
+        expected_tail = torch.tensor(
+            target_ids + ([SEQ_EOS_ID] if args.use_eos else []),
+            dtype=labels.dtype,
+        )
+        if not torch.equal(native_tail, expected_tail):
+            raise RuntimeError(
+                "FIM training labels do not end in the expected missing span; "
+                "evaluation cannot preserve the training patch alignment"
+            )
         window_key = (
             str(Path(meta["h264_path"])),
             int(meta["start_nal"]),
@@ -435,14 +493,6 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                 )
             _verify_fixed_hole_replay(expected, meta, target_ids, window_key)
             verified_fixed_holes += 1
-        ar_labels = dataset.ar_item(idx)["labels"]
-        if dataset.use_eos:
-            if int(ar_labels[-1]) != SEQ_EOS_ID:
-                raise RuntimeError(
-                    "window AR item is missing its configured SEQ_EOS"
-                )
-            ar_labels = ar_labels[:-1]
-        window_bytes = bytes(ar_labels.tolist())
         selected.append(
             WindowFimSample(
                 sample_index=idx,
@@ -805,11 +855,26 @@ def generate_span(
     )
 
 
+def _teacher_forced_span_mask(labels: Tensor, target_length: int) -> Tensor | None:
+    """Select the missing bytes and optional EOS from native patched labels."""
+    supervised_positions = (labels != IGNORE_INDEX).nonzero(as_tuple=False)
+    if not bool(supervised_positions.numel()):
+        return None
+    last_label = int(labels[tuple(supervised_positions[-1].tolist())])
+    span_token_count = target_length + int(last_label == SEQ_EOS_ID)
+    if supervised_positions.size(0) < span_token_count or span_token_count <= 0:
+        return None
+    metric_positions = supervised_positions[-span_token_count:]
+    metric_mask = torch.zeros_like(labels, dtype=torch.bool)
+    metric_mask[tuple(metric_positions.T)] = True
+    return metric_mask
+
+
 @torch.inference_mode()
 def teacher_forced_span_metrics(
     model: nn.Module, sample: WindowFimSample, device: torch.device,
 ) -> dict[str, Any] | None:
-    """Teacher-forced accuracy on the exact same FIM target span used for generation."""
+    """Score the FIM span without changing its training-time patch alignment."""
     raw = _unwrap_model(model)
     raw.eval()
     patch_size = int(raw.config.byte_patch_size)
@@ -845,11 +910,17 @@ def teacher_forced_span_metrics(
             offset_ids=offset_ids,
             **model_kwargs,
         )
-    supervised = labels != IGNORE_INDEX
-    supervised_labels = labels[supervised]
-    if supervised_labels.numel() == 0:
+    metric_mask = _teacher_forced_span_mask(labels, sample.target_length)
+    if metric_mask is None:
         return None
-    pred = logits.argmax(dim=-1)[supervised]
+    native_mask = labels != IGNORE_INDEX
+    native_labels = labels[native_mask]
+    # Full-sequence FIM training supervises every serialized transition, but the
+    # reported metric is intentionally hole-only. Select the final missing+EOS
+    # positions from the *training-aligned* forward pass instead of rebuilding a
+    # span-only sample (which resets the MEGABYTE patch phase).
+    supervised_labels = labels[metric_mask]
+    pred = logits.argmax(dim=-1)[metric_mask]
     byte_mask = supervised_labels < BYTE_VOCAB_SIZE
     eos_mask = supervised_labels == SEQ_EOS_ID
     byte_total = int(byte_mask.sum())
@@ -860,9 +931,8 @@ def teacher_forced_span_metrics(
         else 0
     )
     eos_correct = int((pred[eos_mask] == SEQ_EOS_ID).sum()) if eos_total else 0
-    loss = F.cross_entropy(
-        logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=IGNORE_INDEX,
-    )
+    loss = F.cross_entropy(logits[metric_mask], supervised_labels)
+    native_loss = F.cross_entropy(logits[native_mask], native_labels)
     element_correct: dict[str, list[int]] = {}
     element_legal: dict[str, list[int]] = {}
     element_illegal_different: dict[str, list[int]] = {}
@@ -890,6 +960,8 @@ def teacher_forced_span_metrics(
             pass
     return {
         "tf_ce_nats": float(loss),
+        "tf_native_ce_nats": float(native_loss),
+        "tf_native_target_tokens": int(native_labels.numel()),
         "tf_target_tokens": int(supervised_labels.numel()),
         "tf_byte_total": byte_total,
         "tf_byte_correct": byte_correct,
@@ -1219,6 +1291,9 @@ def summarize(
         ),
         "tf_byte_acc_mean": AR.mean([float(r["tf_byte_acc"]) for r in tf_rows]),
         "tf_ce_nats_mean": AR.mean([float(r["tf_ce_nats"]) for r in tf_rows]),
+        "tf_native_ce_nats_mean": AR.mean(
+            [float(r["tf_native_ce_nats"]) for r in tf_rows]
+        ),
         "tf_eos_acc_mean": AR.mean(
             [float(r["tf_eos_acc"]) for r in tf_rows if r.get("tf_eos_acc") is not None]
         ),

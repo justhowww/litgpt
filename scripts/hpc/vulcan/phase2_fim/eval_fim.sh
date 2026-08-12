@@ -26,6 +26,7 @@ MAX_GEN_BYTES=${MAX_GEN_BYTES:-4096}
 MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-16384}
 SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
 SLICE_MAX_MBS=${SLICE_MAX_MBS:-1}
+FIM_LOSS_SCOPE=${FIM_LOSS_SCOPE:-auto}
 
 CHECKPOINT_DIR="${OUT_DIR}/${CKPT}"
 if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
@@ -51,6 +52,7 @@ COMMON=(
     --max-window-bytes "${MAX_WINDOW_BYTES}"
     --window-min-frames 2
     --fim-format psm
+    --fim-loss-scope "${FIM_LOSS_SCOPE}"
     --use-eos
     --fim-min-gap 64
     --fim-max-gap 1400
@@ -102,7 +104,8 @@ names = sys.argv[2:]
 header = (
     f"{'variant':<20} {'stop':<16} {'n':>4} {'end2end':>8} "
     f"{'terminate':>9} {'decode':>8} {'frames':>11} {'bytes':>17} "
-    f"{'tf_acc':>9} {'psnr':>8} {'desync_top':<18}"
+    f"{'tf_acc':>9} {'span_ce':>9} {'native_ce':>10} {'psnr':>8} "
+    f"{'desync_top':<18}"
 )
 print(header)
 print("-" * len(header))
@@ -122,6 +125,10 @@ for name in names:
         decode_text = "-" if decode is None else f"{decode:.3f}"
         tf_acc = row.get("tf_byte_acc_mean")
         tf_text = "-" if tf_acc is None else f"{tf_acc:.4f}"
+        span_ce = row.get("tf_ce_nats_mean")
+        span_ce_text = "-" if span_ce is None else f"{span_ce:.3f}"
+        native_ce = row.get("tf_native_ce_nats_mean")
+        native_ce_text = "-" if native_ce is None else f"{native_ce:.3f}"
         psnr = row.get("cont_psnr_mean")
         psnr_text = "-" if psnr is None else f"{psnr:.2f}"
         frames = f"{row.get('completed_frames_total', 0)}/{row.get('target_frames_total', 0)}"
@@ -129,7 +136,8 @@ for name in names:
         print(
             f"{name:<20} {row.get('stop_mode', '-'):<16} {row.get('num_clips', 0):>4} "
             f"{success_text:>8} {termination_text:>9} {decode_text:>8} "
-            f"{frames:>11} {byte_counts:>17} {tf_text:>9} {psnr_text:>8} "
+            f"{frames:>11} {byte_counts:>17} {tf_text:>9} "
+            f"{span_ce_text:>9} {native_ce_text:>10} {psnr_text:>8} "
             f"{str(row.get('desync_region_top') or '-'): <18}"
         )
 
