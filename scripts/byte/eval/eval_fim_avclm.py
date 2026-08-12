@@ -616,7 +616,21 @@ def generate_span(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
     prompt_len = prompt.size(1)
-    model_max_new = megabyte_max_new_bytes(raw, prompt_len)
+    supervised = (sample.teacher_labels != IGNORE_INDEX).nonzero(
+        as_tuple=False
+    ).flatten()
+    if not bool(supervised.numel()):
+        return None
+    supervision_start = int(supervised[0])
+    if supervision_start >= prompt_len:
+        raise RuntimeError("FIM supervision starts after the generation prompt")
+    model_max_new = megabyte_max_new_bytes(
+        raw,
+        prompt_len,
+        supervision_start=(
+            supervision_start if int(raw.config.byte_patch_size) > 1 else None
+        ),
+    )
     if model_max_new <= 0:
         return None
     if stop_mode == "oracle_len":
@@ -640,7 +654,12 @@ def generate_span(
     megabyte = None
     if int(raw.config.byte_patch_size) > 1:
         megabyte = MegabyteInference(
-            raw, prompt, region_ids, offset_ids, device
+            raw,
+            prompt,
+            region_ids,
+            offset_ids,
+            device,
+            supervision_start=supervision_start,
         )
     else:
         cache_dtype = (

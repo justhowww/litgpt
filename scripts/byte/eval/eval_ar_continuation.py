@@ -1645,9 +1645,15 @@ def evaluate_teacher_forced(
 
 def model_max_gen(model: torch.nn.Module, prefix_bytes: bytes) -> int:
     raw = model.module if hasattr(model, "module") else model
-    # The model prompt is [BOS, prefix bytes...]. The final MEGABYTE prompt
-    # patch immediately predicts the first output patch.
-    return megabyte_max_new_bytes(raw, len(prefix_bytes) + 1)
+    # Window AR is supervised from position zero. Preserve that patch phase:
+    # prefix bytes are completed/partial target patches after the BOS seed.
+    return megabyte_max_new_bytes(
+        raw,
+        len(prefix_bytes) + 1,
+        supervision_start=(
+            0 if int(raw.config.byte_patch_size) > 1 else None
+        ),
+    )
 
 
 @torch.inference_mode()

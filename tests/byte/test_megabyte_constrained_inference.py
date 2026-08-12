@@ -80,6 +80,15 @@ def _sample(target: bytes) -> FIM.WindowFimSample:
     prompt = torch.tensor([SLICE_BOS_ID, 7], dtype=torch.long)
     regions = torch.full_like(prompt, REGION_BRIDGE)
     offsets = torch.arange(prompt.numel())
+    teacher_input = torch.tensor(
+        [*prompt.tolist(), *list(target[:-1])], dtype=torch.long
+    )
+    teacher_labels = torch.full_like(teacher_input, -100)
+    teacher_labels[prompt.numel() - 1 :] = torch.tensor(
+        list(target), dtype=torch.long
+    )
+    teacher_regions = torch.full_like(teacher_input, REGION_BRIDGE)
+    teacher_offsets = torch.arange(teacher_input.numel())
     return FIM.WindowFimSample(
         sample_index=0,
         h264_path=Path("synthetic.h264"),
@@ -92,10 +101,10 @@ def _sample(target: bytes) -> FIM.WindowFimSample:
         prompt_ids=prompt,
         prompt_region_ids=regions,
         prompt_offset_ids=offsets,
-        teacher_input_ids=prompt,
-        teacher_region_ids=regions,
-        teacher_offset_ids=offsets,
-        teacher_labels=torch.full_like(prompt, -100),
+        teacher_input_ids=teacher_input,
+        teacher_region_ids=teacher_regions,
+        teacher_offset_ids=teacher_offsets,
+        teacher_labels=teacher_labels,
         target_bytes=target,
         window_bytes=target,
     )

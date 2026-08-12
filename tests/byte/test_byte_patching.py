@@ -207,6 +207,54 @@ def test_megabyte_incremental_local_logits_match_teacher_forcing():
     )
 
 
+def test_megabyte_full_sequence_cached_logits_match_teacher_forcing():
+    """A partial target patch must retain its training-time local position."""
+    torch.manual_seed(13)
+    model = GPT(_patch_config()).eval()
+    input_ids = torch.tensor(
+        [FIM_END_ID - 2, 90, FIM_END_ID, 50, 51], dtype=torch.long
+    )
+    labels = torch.tensor(
+        [90, FIM_END_ID, 50, 51, SEQ_EOS_ID], dtype=torch.long
+    )
+    regions = torch.full_like(input_ids, REGION_BRIDGE)
+    offsets = torch.arange(input_ids.numel())
+    sample = _sample(input_ids.tolist(), labels.tolist(), REGION_BRIDGE)
+    sample["offset_ids"] = offsets
+    patched = patch_byte_sample(sample, patch_size=4)
+    teacher_logits = model(
+        patched["input_ids"].unsqueeze(0),
+        region_ids=patched["region_ids"].unsqueeze(0),
+        offset_ids=patched["offset_ids"].unsqueeze(0),
+        patch_targets=patched["labels"].unsqueeze(0),
+    )
+    supervised = patched["labels"] != IGNORE_INDEX
+    expected = teacher_logits[0][supervised][-3:]
+
+    # Generation begins after FIM_END. Full-sequence supervision began at raw
+    # position zero, so [90, FIM_END] are the first two known target bytes in
+    # the current local patch rather than a fresh left-padded prompt.
+    prompt_end = 3
+    with MegabyteInference(
+        model,
+        input_ids[:prompt_end].unsqueeze(0),
+        regions[:prompt_end].unsqueeze(0),
+        offsets[:prompt_end].unsqueeze(0),
+        torch.device("cpu"),
+        supervision_start=0,
+    ) as state:
+        for index, token in enumerate((50, 51, SEQ_EOS_ID)):
+            actual = state.next_logits()[0]
+            assert torch.allclose(actual, expected[index], atol=2e-6, rtol=2e-5)
+            if token != SEQ_EOS_ID:
+                raw_position = prompt_end + index
+                state.append(
+                    token,
+                    int(regions[raw_position]),
+                    int(offsets[raw_position]),
+                )
+
+
 def test_megabyte_inference_feeds_completed_patch_to_global_cache():
     torch.manual_seed(10)
     model = GPT(_patch_config()).eval()

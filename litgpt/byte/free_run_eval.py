@@ -311,7 +311,13 @@ def free_run_rollout(
 
     max_gen = min(
         max_gen,
-        megabyte_max_new_bytes(raw, prompt_ids.size(1)),
+        megabyte_max_new_bytes(
+            raw,
+            prompt_ids.size(1),
+            supervision_start=(
+                0 if int(raw.config.byte_patch_size) > 1 else None
+            ),
+        ),
     )
     if max_gen <= 0:
         _stop("no_budget")
@@ -333,7 +339,12 @@ def free_run_rollout(
     megabyte = None
     if patched:
         megabyte = MegabyteInference(
-            raw, prompt_ids, region_ids, offset_ids, device
+            raw,
+            prompt_ids,
+            region_ids,
+            offset_ids,
+            device,
+            supervision_start=0,
         )
     else:
         cache_dtype = (
@@ -616,7 +627,13 @@ def _generate(
     offset = sample.prompt_offset_ids.to(device).unsqueeze(0)
     max_gen = min(
         int(sample.gt_cont_bytes * config.max_gen_multiple) + 512,
-        megabyte_max_new_bytes(raw, sample.prompt_ids.numel()),
+        megabyte_max_new_bytes(
+            raw,
+            sample.prompt_ids.numel(),
+            supervision_start=(
+                0 if int(raw.config.byte_patch_size) > 1 else None
+            ),
+        ),
     )
     generated, _start_codes = free_run_rollout(
         raw,

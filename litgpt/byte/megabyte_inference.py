@@ -22,6 +22,7 @@ class _GeneratedPatch:
     tokens: list[int]
     region_ids: list[int]
     offset_ids: list[int]
+    generated: list[bool]
     global_position: int
 
 
@@ -60,14 +61,33 @@ def megabyte_prompt_patches(
     )
 
 
-def megabyte_max_new_bytes(raw: nn.Module, prompt_token_count: int) -> int:
-    """Maximum local bytes reachable without exceeding the global KV cache."""
+def megabyte_max_new_bytes(
+    raw: nn.Module,
+    prompt_token_count: int,
+    supervision_start: int | None = None,
+) -> int:
+    """Maximum local bytes reachable without exceeding the global KV cache.
+
+    ``supervision_start`` is the raw position of the first training target. When
+    provided, bytes after that position are known teacher-forced target bytes,
+    not a newly left-padded prompt. Accounting for them preserves the training
+    patch phase during continuation.
+    """
     patch_size = int(raw.config.byte_patch_size)
     if patch_size <= 1:
         return max(0, int(raw.max_seq_length) - prompt_token_count + 1)
-    prompt_patches = (prompt_token_count + patch_size - 1) // patch_size
+    if supervision_start is None:
+        prompt_patches = (prompt_token_count + patch_size - 1) // patch_size
+        current_bytes = 0
+    else:
+        if not 0 <= supervision_start < prompt_token_count:
+            raise ValueError("supervision_start must index the raw prompt")
+        prompt_patches = (supervision_start + 1 + patch_size - 1) // patch_size
+        known_targets = prompt_token_count - supervision_start - 1
+        prompt_patches += known_targets // patch_size
+        current_bytes = known_targets % patch_size
     remaining_output_patches = int(raw.max_seq_length) - prompt_patches + 1
-    return max(0, remaining_output_patches * patch_size)
+    return max(0, remaining_output_patches * patch_size - current_bytes)
 
 
 def megabyte_teacher_forced_sample(
@@ -116,6 +136,8 @@ class MegabyteInference:
         region_ids: Tensor,
         offset_ids: Tensor,
         device: torch.device,
+        *,
+        supervision_start: int | None = None,
     ) -> None:
         patch_size = int(raw.config.byte_patch_size)
         if patch_size <= 1:
@@ -123,9 +145,49 @@ class MegabyteInference:
         self.raw = raw
         self.device = device
         self.patch_size = patch_size
+        if supervision_start is None:
+            seed_end = prompt_ids.size(1)
+        else:
+            if not 0 <= supervision_start < prompt_ids.size(1):
+                raise ValueError("supervision_start must index the raw prompt")
+            seed_end = supervision_start + 1
         patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
-            prompt_ids, region_ids, offset_ids, patch_size
+            prompt_ids[:, :seed_end],
+            region_ids[:, :seed_end],
+            offset_ids[:, :seed_end],
+            patch_size,
         )
+        known_ids = prompt_ids[:, seed_end:]
+        known_regions = region_ids[:, seed_end:]
+        known_offsets = offset_ids[:, seed_end:]
+        complete_known = known_ids.size(1) // patch_size
+        complete_bytes = complete_known * patch_size
+        if complete_known:
+            patched_ids = torch.cat(
+                (
+                    patched_ids,
+                    known_ids[:, :complete_bytes].view(1, complete_known, patch_size),
+                ),
+                dim=1,
+            )
+            patched_regions = torch.cat(
+                (
+                    patched_regions,
+                    known_regions[:, :complete_bytes].view(
+                        1, complete_known, patch_size
+                    ),
+                ),
+                dim=1,
+            )
+            patched_offsets = torch.cat(
+                (
+                    patched_offsets,
+                    known_offsets[:, :complete_bytes].view(
+                        1, complete_known, patch_size
+                    ),
+                ),
+                dim=1,
+            )
         self.prompt_patches = patched_ids.size(1)
         if self.prompt_patches > int(raw.max_seq_length):
             raise ValueError(
@@ -145,11 +207,18 @@ class MegabyteInference:
             dtype=cache_dtype,
         )
         self._closed = False
-        self._current_tokens: list[int] = []
-        self._current_regions: list[int] = []
-        self._current_offsets: list[int] = []
+        self._current_tokens = [int(x) for x in known_ids[0, complete_bytes:].tolist()]
+        self._current_regions = [
+            int(x) for x in known_regions[0, complete_bytes:].tolist()
+        ]
+        self._current_offsets = [
+            int(x) for x in known_offsets[0, complete_bytes:].tolist()
+        ]
+        self._current_generated = [False] * len(self._current_tokens)
         self._completed: list[_GeneratedPatch] = []
         self._dirty_positions: set[int] = set()
+        self._generated_count = 0
+        self._next_global_position = self.prompt_patches
         try:
             with self._autocast():
                 global_output = raw.megabyte_global_forward(
@@ -176,12 +245,17 @@ class MegabyteInference:
 
     @property
     def generated_bytes(self) -> int:
-        return len(self._completed) * self.patch_size + len(self._current_tokens)
+        return self._generated_count
 
     @property
     def max_new_bytes(self) -> int:
-        return megabyte_max_new_bytes(
-            self.raw, self.prompt_patches * self.patch_size
+        remaining_output_patches = (
+            int(self.raw.max_seq_length) - self._next_global_position + 1
+        )
+        return max(
+            0,
+            remaining_output_patches * self.patch_size
+            - len(self._current_tokens),
         )
 
     def _forward_patch(self, patch: _GeneratedPatch) -> Tensor:
@@ -219,20 +293,23 @@ class MegabyteInference:
         if len(self._current_tokens) != self.patch_size:
             return
         self._refresh_dirty_cache()
-        position = self.prompt_patches + len(self._completed)
+        position = self._next_global_position
         if position >= int(self.raw.max_seq_length):
             raise RuntimeError("MEGABYTE global context exhausted")
         patch = _GeneratedPatch(
             tokens=self._current_tokens,
             region_ids=self._current_regions,
             offset_ids=self._current_offsets,
+            generated=self._current_generated,
             global_position=position,
         )
         self._global_output = self._forward_patch(patch)
         self._completed.append(patch)
+        self._next_global_position += 1
         self._current_tokens = []
         self._current_regions = []
         self._current_offsets = []
+        self._current_generated = []
 
     @torch.inference_mode()
     def next_logits(self) -> Tensor:
@@ -260,6 +337,8 @@ class MegabyteInference:
         self._current_tokens.append(int(token))
         self._current_regions.append(int(region_id))
         self._current_offsets.append(int(offset_id))
+        self._current_generated.append(True)
+        self._generated_count += 1
 
     def rewrite_recent_metadata(
         self,
@@ -280,10 +359,12 @@ class MegabyteInference:
             raise ValueError("metadata rewrite lengths must equal count")
         locations: list[tuple[_GeneratedPatch | None, int]] = []
         for index in range(len(self._current_tokens) - 1, -1, -1):
-            locations.append((None, index))
+            if self._current_generated[index]:
+                locations.append((None, index))
         for patch in reversed(self._completed):
             for index in range(self.patch_size - 1, -1, -1):
-                locations.append((patch, index))
+                if patch.generated[index]:
+                    locations.append((patch, index))
         if count > len(locations):
             raise ValueError("cannot rewrite metadata before generated output")
 
