@@ -29,6 +29,12 @@ SLICE_MAX_MBS=${SLICE_MAX_MBS:-1}
 FIM_LOSS_SCOPE=${FIM_LOSS_SCOPE:-auto}
 HOLE_SET=${HOLE_SET:-auto}
 HELDOUT_HOLES_PER_WINDOW=${HELDOUT_HOLES_PER_WINDOW:-1}
+EVAL_SET_NAME=${EVAL_SET_NAME:-}
+
+if [[ -n "${EVAL_SET_NAME}" && ! "${EVAL_SET_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "EVAL_SET_NAME may contain only letters, numbers, dot, underscore, and dash" >&2
+    exit 1
+fi
 
 CHECKPOINT_DIR="${OUT_DIR}/${CKPT}"
 if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
@@ -76,6 +82,9 @@ if [[ "${SLICE_LAYOUT}" == "macroblock" ]]; then
 fi
 
 EVAL_ROOT="${OUT_DIR}/eval_fim/train/${CKPT}"
+if [[ -n "${EVAL_SET_NAME}" ]]; then
+    EVAL_ROOT="${EVAL_ROOT}/${EVAL_SET_NAME}"
+fi
 
 run() {
     local name="$1"

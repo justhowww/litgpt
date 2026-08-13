@@ -459,6 +459,31 @@ def test_data_module_keeps_mixed_ar_fim_resampling_for_k_one(tmp_path):
     assert tasks == {"ar", "fim"}
 
 
+def test_explicit_k_is_authoritative_over_enabled_legacy_flag(tmp_path):
+    path = tmp_path / "clip_explicit_k.h264"
+    path.write_bytes(_stream())
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps({"h264_path": str(path), "status": "ok"}) + "\n",
+        encoding="utf-8",
+    )
+    config = ByteDataConfig(
+        p_fim=1.0,
+        fixed_fim_holes=True,
+        fixed_fim_holes_per_window=32,
+        fim_min_gap=16,
+        fim_max_gap=64,
+        slice_header_guard_bytes=16,
+        val_fraction=0.5,
+        dataset_mode="window",
+        window_min_frames=2,
+        num_workers=0,
+    )
+    module = ByteDataModule(manifest_path=manifest, config=config)
+    assert module.config.fixed_fim_holes is True
+    assert module.config.fixed_fim_holes_per_window == 32
+
+
 def test_ar_item_returns_raw_window_bytes_under_p_fim(tmp_path):
     # Regression: prepare_free_run_samples does bytes(item["labels"].tolist()), which
     # died with "bytes must be in range(0, 256)" the moment p_fim > 0 handed it a FIM

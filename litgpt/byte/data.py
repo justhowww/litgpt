@@ -1861,12 +1861,12 @@ class ByteDataModule(DataModule):
             raise ValueError("byte_patch_size must be positive")
         if self.config.fixed_fim_holes_per_window < 0:
             raise ValueError("fixed_fim_holes_per_window must be non-negative")
-        if self.config.fixed_fim_holes:
-            if self.config.fixed_fim_holes_per_window not in (0, 1):
-                raise ValueError(
-                    "fixed_fim_holes conflicts with "
-                    "fixed_fim_holes_per_window > 1"
-                )
+        if (
+            self.config.fixed_fim_holes
+            and self.config.fixed_fim_holes_per_window == 0
+        ):
+            # The legacy Boolean supplies K=1 only when the explicit count is absent.
+            # A positive count is the authoritative representation.
             self.config.fixed_fim_holes_per_window = 1
         self.config.fixed_fim_holes = (
             self.config.fixed_fim_holes_per_window > 0

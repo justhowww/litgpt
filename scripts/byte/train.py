@@ -352,7 +352,6 @@ def main() -> None:
                 "--fixed-fim-holes-per-window > 1"
             )
         args.fixed_fim_holes_per_window = 1
-    args.fixed_fim_holes = args.fixed_fim_holes_per_window > 0
     if args.ce_loss_weight < 0:
         raise ValueError("--ce-loss-weight must be non-negative")
     if args.eos_loss_weight <= 0:
@@ -365,7 +364,7 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
     if args.ce_byte_only and args.use_eos:
         raise ValueError("--ce-byte-only cannot train supervised EOS targets")
-    if args.fixed_fim_holes and (
+    if args.fixed_fim_holes_per_window > 0 and (
         args.dataset_mode != "window" or args.p_fim <= 0.0
     ):
         raise ValueError(
