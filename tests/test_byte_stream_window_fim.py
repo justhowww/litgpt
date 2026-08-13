@@ -311,6 +311,7 @@ def test_data_module_propagates_fixed_hole_mode(
 
     payload = json.loads(split_path.read_text(encoding="utf-8"))
     assert payload["fixed_fim_holes_enabled"] is fixed_fim_holes
+    assert payload["fixed_fim_holes_per_window"] == int(fixed_fim_holes)
     assert payload["fim_loss_scope"] == "span"
     if not fixed_fim_holes:
         assert payload["fixed_fim_holes"] == []
@@ -335,6 +336,127 @@ def test_data_module_propagates_fixed_hole_mode(
     recorded = payload["fixed_fim_holes"][0]
     assert recorded["target_length"] == len(target)
     assert recorded["target_sha256"] == hashlib.sha256(target).hexdigest()
+
+
+def test_finite_k_hole_pool_is_distinct_sampled_and_recorded(tmp_path):
+    rows = []
+    for index in range(2):
+        path = tmp_path / f"clip_k_{index}.h264"
+        path.write_bytes(_stream())
+        rows.append({"h264_path": str(path), "status": "ok"})
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    split_path = tmp_path / "train_split.json"
+    module = ByteDataModule(
+        manifest_path=manifest,
+        config=ByteDataConfig(
+            p_fim=1.0,
+            fixed_fim_holes_per_window=4,
+            fim_format="psm",
+            use_eos=True,
+            fim_min_gap=16,
+            fim_max_gap=64,
+            slice_header_guard_bytes=16,
+            val_fraction=0.5,
+            dataset_mode="window",
+            window_min_frames=2,
+            num_workers=0,
+        ),
+        train_split_dump_path=split_path,
+    )
+    module.connect(batch_size=1, max_seq_length=4096)
+    module.setup()
+
+    base = module.train_dataset.dataset
+    train_index = int(module.train_dataset.indices[0])
+    pool = base.fixed_fim_hole_specs(train_index)
+    assert len(pool) == len(set(pool)) == 4
+    draws = {
+        (_meta(base[train_index])["fim_split"], _meta(base[train_index])["fim_gap"])
+        for _ in range(200)
+    }
+    assert draws == {(split, gap) for _, _, split, gap in pool}
+
+    payload = json.loads(split_path.read_text(encoding="utf-8"))
+    assert payload["fixed_fim_holes_enabled"] is True
+    assert payload["fixed_fim_holes_per_window"] == 4
+    recorded = payload["fixed_fim_holes"]
+    assert len(recorded) == 4
+    assert [hole["hole_id"] for hole in recorded] == list(range(4))
+    recorded_specs = {
+        (
+            hole["frame_lo"],
+            hole["frame_hi"],
+            hole["fim_split"],
+            hole["fim_gap"],
+        )
+        for hole in recorded
+    }
+    assert recorded_specs == set(pool)
+
+
+@pytest.mark.parametrize("holes_per_window", [1, 4])
+def test_finite_hole_pool_with_mixed_ar_fim_resamples_only_the_task_and_pool_choice(
+    tmp_path, holes_per_window
+):
+    ds, _ = _dataset(
+        tmp_path,
+        p_fim=0.5,
+        resample_fim=True,
+        fixed_fim_holes_per_window=holes_per_window,
+    )
+    pool = {
+        (split, gap)
+        for _, _, split, gap in ds.fixed_fim_hole_specs(0)
+    }
+    tasks = set()
+    observed_holes = set()
+    for _ in range(400):
+        meta = _meta(ds[0])
+        tasks.add(meta["task"])
+        if meta["task"] == "fim":
+            observed_holes.add((meta["fim_split"], meta["fim_gap"]))
+
+    assert tasks == {"ar", "fim"}
+    assert observed_holes == pool
+
+
+def test_data_module_keeps_mixed_ar_fim_resampling_for_k_one(tmp_path):
+    rows = []
+    for index in range(2):
+        path = tmp_path / f"clip_mixed_{index}.h264"
+        path.write_bytes(_stream())
+        rows.append({"h264_path": str(path), "status": "ok"})
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    module = ByteDataModule(
+        manifest_path=manifest,
+        config=ByteDataConfig(
+            p_fim=0.5,
+            fixed_fim_holes_per_window=1,
+            fim_format="psm",
+            use_eos=True,
+            fim_min_gap=16,
+            fim_max_gap=64,
+            slice_header_guard_bytes=16,
+            val_fraction=0.5,
+            dataset_mode="window",
+            window_min_frames=2,
+            num_workers=0,
+        ),
+    )
+    module.connect(batch_size=1, max_seq_length=4096)
+    module.setup()
+
+    base = module.train_dataset.dataset
+    train_index = int(module.train_dataset.indices[0])
+    assert base.resample_fim is True
+    tasks = {_meta(base[train_index])["task"] for _ in range(200)}
+    assert tasks == {"ar", "fim"}
 
 
 def test_ar_item_returns_raw_window_bytes_under_p_fim(tmp_path):

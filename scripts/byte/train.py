@@ -193,9 +193,19 @@ def parse_args() -> argparse.Namespace:
         "--fixed-fim-holes",
         action="store_true",
         help=(
-            "Debug overfit mode for window FIM: select one deterministic hole per "
-            "training window instead of redrawing it on every access. Requires "
-            "--dataset-mode window and --p-fim 1.0."
+            "Backward-compatible alias for --fixed-fim-holes-per-window 1."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-fim-holes-per-window",
+        type=int,
+        default=0,
+        metavar="K",
+        help=(
+            "Finite FIM diversity curriculum for window mode. Cache K distinct "
+            "holes per training window and sample uniformly among them; 0 redraws "
+            "a fresh changing hole on every FIM access. The AR/FIM mixture remains "
+            "controlled independently by --p-fim."
         ),
     )
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="bridge")
@@ -333,6 +343,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.fixed_fim_holes_per_window < 0:
+        raise ValueError("--fixed-fim-holes-per-window must be non-negative")
+    if args.fixed_fim_holes:
+        if args.fixed_fim_holes_per_window not in (0, 1):
+            raise ValueError(
+                "--fixed-fim-holes is an alias for K=1 and conflicts with "
+                "--fixed-fim-holes-per-window > 1"
+            )
+        args.fixed_fim_holes_per_window = 1
+    args.fixed_fim_holes = args.fixed_fim_holes_per_window > 0
     if args.ce_loss_weight < 0:
         raise ValueError("--ce-loss-weight must be non-negative")
     if args.eos_loss_weight <= 0:
@@ -346,10 +366,10 @@ def main() -> None:
     if args.ce_byte_only and args.use_eos:
         raise ValueError("--ce-byte-only cannot train supervised EOS targets")
     if args.fixed_fim_holes and (
-        args.dataset_mode != "window" or args.p_fim != 1.0
+        args.dataset_mode != "window" or args.p_fim <= 0.0
     ):
         raise ValueError(
-            "--fixed-fim-holes requires --dataset-mode window and --p-fim 1.0"
+            "finite fixed FIM holes require --dataset-mode window and --p-fim > 0"
         )
     if args.resume and args.initial_checkpoint_dir is not None:
         raise ValueError("--resume and --initial-checkpoint-dir are mutually exclusive")
@@ -433,6 +453,7 @@ def main() -> None:
         byte_patch_size=args.byte_patch_size,
         p_fim=args.p_fim,
         fixed_fim_holes=args.fixed_fim_holes,
+        fixed_fim_holes_per_window=args.fixed_fim_holes_per_window,
         fim_format=args.fim_format,
         fim_loss_scope=args.fim_loss_scope,
         use_eos=args.use_eos,

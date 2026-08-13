@@ -27,6 +27,8 @@ MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-16384}
 SLICE_LAYOUT=${SLICE_LAYOUT:-macroblock}
 SLICE_MAX_MBS=${SLICE_MAX_MBS:-1}
 FIM_LOSS_SCOPE=${FIM_LOSS_SCOPE:-auto}
+HOLE_SET=${HOLE_SET:-auto}
+HELDOUT_HOLES_PER_WINDOW=${HELDOUT_HOLES_PER_WINDOW:-1}
 
 CHECKPOINT_DIR="${OUT_DIR}/${CKPT}"
 if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
@@ -46,6 +48,8 @@ COMMON=(
     --device "${DEVICE}"
     --max-manifest-rows "${MAX_MANIFEST_ROWS}"
     --num-clips "${NUM_CLIPS}"
+    --hole-set "${HOLE_SET}"
+    --heldout-holes-per-window "${HELDOUT_HOLES_PER_WINDOW}"
     --num-visualizations 8
     --viz-fps 6
     --seed "${SEED}"

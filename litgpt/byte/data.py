@@ -91,6 +91,10 @@ class ByteDataConfig:
     # access. When true, seed+dataset-index selects one stable hole per train window
     # so the exact same examples can be replayed by the evaluator.
     fixed_fim_holes: bool = False
+    # Finite-hole diversity curriculum. Zero keeps changing-hole augmentation;
+    # positive K caches K distinct holes per training window. The Boolean above
+    # remains a backward-compatible alias for K=1.
+    fixed_fim_holes_per_window: int = 0
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -1041,6 +1045,7 @@ class ByteStreamWindowDataset(Dataset):
         fim_max_gap: int = 1400,
         frame_guard_bytes: int = 64,
         resample_fim: bool = False,
+        fixed_fim_holes_per_window: int = 0,
         nal_index: dict[str, list[NALUnit]] | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
@@ -1059,6 +1064,8 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError("require 1 <= fim_min_gap <= fim_max_gap")
         if frame_guard_bytes < 0:
             raise ValueError("frame_guard_bytes must be non-negative")
+        if fixed_fim_holes_per_window < 0:
+            raise ValueError("fixed_fim_holes_per_window must be non-negative")
         self.rows = rows
         self.max_seq_length = max_seq_length
         self.min_frames = min_frames
@@ -1070,6 +1077,10 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_max_gap = fim_max_gap
         self.frame_guard_bytes = frame_guard_bytes
         self.resample_fim = resample_fim
+        self.fixed_fim_holes_per_window = fixed_fim_holes_per_window
+        self._fixed_hole_cache: dict[
+            int, tuple[tuple[int, int, int, int], ...]
+        ] = {}
         # Indices pinned to a deterministic hole even when resample_fim is on. With a
         # window-level (within-video) split, train and val are random_split Subsets of
         # ONE dataset instance, so the val indices have to be named here -- there is no
@@ -1316,12 +1327,137 @@ class ByteStreamWindowDataset(Dataset):
         will simply look up.
 
         So training resamples per access: every window is AR on ~half its visits and
-        gets a fresh hole on the others. The corpus split stays seeded (and is dumped
-        to train_split.json), so what is lost is only the exact hole sequence.
+        gets either a fresh hole or a fresh choice from its finite K-hole pool on the
+        others. The corpus split stays seeded (and is dumped to train_split.json).
         """
         if not self.resample_fim or idx in self.fixed_indices:
             return random.Random(self.seed + idx)
         return random.Random()  # fresh OS entropy per access, per worker
+
+    def _draw_hole_spec(
+        self,
+        candidates: list[tuple[int, int]],
+        rng: random.Random,
+    ) -> tuple[int, int, int, int]:
+        frame_lo, frame_hi = rng.choice(candidates)
+        lo = frame_lo + self.frame_guard_bytes
+        gap = rng.randint(
+            self.fim_min_gap,
+            min(self.fim_max_gap, frame_hi - lo - 1),
+        )
+        split = rng.randint(lo, frame_hi - gap)
+        return frame_lo, frame_hi, split, gap
+
+    def _sample_distinct_hole_specs(
+        self,
+        candidates: list[tuple[int, int]],
+        count: int,
+        rng: random.Random,
+        *,
+        exclude: Iterable[tuple[int, int, int, int]] = (),
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Deterministically sample distinct legal holes without replacement."""
+        if count < 0:
+            raise ValueError("hole count must be non-negative")
+        excluded = set(exclude)
+        selected: list[tuple[int, int, int, int]] = []
+        seen = set(excluded)
+        max_attempts = max(10_000, count * 1_000)
+        for _ in range(max_attempts):
+            if len(selected) >= count:
+                break
+            spec = self._draw_hole_spec(candidates, rng)
+            if spec in seen:
+                continue
+            seen.add(spec)
+            selected.append(spec)
+        if len(selected) != count:
+            raise ValueError(
+                f"Could sample only {len(selected)}/{count} distinct FIM holes; "
+                "lower --fixed-fim-holes-per-window or widen the gap/frame range"
+            )
+        return tuple(selected)
+
+    def fixed_fim_hole_specs(
+        self, idx: int
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Return the cached deterministic K-hole pool for one window."""
+        count = self.fixed_fim_holes_per_window
+        if count <= 0:
+            return ()
+        cached = self._fixed_hole_cache.get(idx)
+        if cached is not None:
+            return cached
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        candidates = self._fim_candidates(sample, data)
+        if not candidates:
+            return ()
+        rng = random.Random(self.seed + idx)
+        # Preserve the legacy K=1 draw: __getitem__ historically consumed the
+        # p_fim coin flip before selecting its frame/gap/split.
+        rng.random()
+        cached = self._sample_distinct_hole_specs(candidates, count, rng)
+        self._fixed_hole_cache[idx] = cached
+        return cached
+
+    def heldout_fim_hole_specs(
+        self,
+        idx: int,
+        count: int = 1,
+        *,
+        exclude: Iterable[tuple[int, int, int, int]] | None = None,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Sample deterministic holes disjoint from the cached training pool."""
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        candidates = self._fim_candidates(sample, data)
+        if not candidates:
+            return ()
+        rng = random.Random(self.seed + 1_000_000_007 + idx)
+        return self._sample_distinct_hole_specs(
+            candidates,
+            count,
+            rng,
+            exclude=(
+                self.fixed_fim_hole_specs(idx)
+                if exclude is None
+                else exclude
+            ),
+        )
+
+    def fim_item_for_hole(
+        self,
+        idx: int,
+        hole: tuple[int, int, int, int],
+        *,
+        hole_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Build one exact FIM item from an explicit legal hole specification."""
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        candidates = self._fim_candidates(sample, data)
+        frame_lo, frame_hi, split, gap = hole
+        if (frame_lo, frame_hi) not in candidates:
+            raise ValueError("explicit FIM hole uses an ineligible frame")
+        lo = frame_lo + self.frame_guard_bytes
+        max_gap = min(self.fim_max_gap, frame_hi - lo - 1)
+        if not (
+            self.fim_min_gap <= gap <= max_gap
+            and lo <= split <= frame_hi - gap
+        ):
+            raise ValueError("explicit FIM hole is outside the configured range")
+        window, raw_region, raw_offset = self._window_tensors(sample, data)
+        return self._build_fim_item(
+            sample,
+            window,
+            raw_region,
+            raw_offset,
+            candidates,
+            random.Random(0),
+            hole=hole,
+            hole_id=hole_id,
+        )
 
     def ar_item(self, idx: int) -> dict[str, Any]:
         """The AR view of a window, whatever p_fim is.
@@ -1351,8 +1487,21 @@ class ByteStreamWindowDataset(Dataset):
         if self.p_fim > 0 and rng.random() < self.p_fim:
             candidates = self._fim_candidates(sample, data)
             if candidates:
+                hole = None
+                hole_id = None
+                pool = self.fixed_fim_hole_specs(idx)
+                if pool:
+                    hole_id = 0 if idx in self.fixed_indices else rng.randrange(len(pool))
+                    hole = pool[hole_id]
                 return self._build_fim_item(
-                    sample, window, raw_region, raw_offset, candidates, rng
+                    sample,
+                    window,
+                    raw_region,
+                    raw_offset,
+                    candidates,
+                    rng,
+                    hole=hole,
+                    hole_id=hole_id,
                 )
         return self._build_ar_item(sample, window, raw_region, raw_offset)
 
@@ -1394,11 +1543,14 @@ class ByteStreamWindowDataset(Dataset):
         raw_offset: Tensor,
         candidates: list[tuple[int, int]],
         rng: random.Random,
+        *,
+        hole: tuple[int, int, int, int] | None = None,
+        hole_id: int | None = None,
     ) -> dict[str, Any]:
-        frame_lo, frame_hi = rng.choice(candidates)
-        lo = frame_lo + self.frame_guard_bytes
-        gap = rng.randint(self.fim_min_gap, min(self.fim_max_gap, frame_hi - lo - 1))
-        split = rng.randint(lo, frame_hi - gap)
+        if hole is None:
+            frame_lo, frame_hi, split, gap = self._draw_hole_spec(candidates, rng)
+        else:
+            frame_lo, frame_hi, split, gap = hole
 
         # Everything after the hole's frame is dropped: real-time repair never has
         # future frames, so they must not reach the model as context (0616.md).
@@ -1471,6 +1623,7 @@ class ByteStreamWindowDataset(Dataset):
             fim_split=split,
             frame_lo=frame_lo,
             frame_hi=frame_hi,
+            fim_hole_id=hole_id if hole_id is not None else -1,
         )
 
     def _with_eos(self, content: Tensor) -> Tensor:
@@ -1706,6 +1859,18 @@ class ByteDataModule(DataModule):
         self.manifest_path = Path(self.manifest_path)
         if self.config.byte_patch_size < 1:
             raise ValueError("byte_patch_size must be positive")
+        if self.config.fixed_fim_holes_per_window < 0:
+            raise ValueError("fixed_fim_holes_per_window must be non-negative")
+        if self.config.fixed_fim_holes:
+            if self.config.fixed_fim_holes_per_window not in (0, 1):
+                raise ValueError(
+                    "fixed_fim_holes conflicts with "
+                    "fixed_fim_holes_per_window > 1"
+                )
+            self.config.fixed_fim_holes_per_window = 1
+        self.config.fixed_fim_holes = (
+            self.config.fixed_fim_holes_per_window > 0
+        )
         if self.nal_index_path is not None:
             self.nal_index_path = Path(self.nal_index_path)
 
@@ -1758,6 +1923,9 @@ class ByteDataModule(DataModule):
                     fim_min_gap=self.config.fim_min_gap,
                     fim_max_gap=self.config.fim_max_gap,
                     frame_guard_bytes=self.config.slice_header_guard_bytes,
+                    fixed_fim_holes_per_window=(
+                        self.config.fixed_fim_holes_per_window
+                    ),
                     nal_index=nal_index,
                     seed=self.config.seed,
                 )
@@ -1803,7 +1971,11 @@ class ByteDataModule(DataModule):
             # Separate instances here, so train resamples and val simply does not.
             if isinstance(self.train_dataset, ByteStreamWindowDataset):
                 self.train_dataset.resample_fim = (
-                    self.config.p_fim > 0 and not self.config.fixed_fim_holes
+                    self.config.p_fim > 0
+                    and (
+                        self.config.p_fim < 1.0
+                        or self.config.fixed_fim_holes_per_window != 1
+                    )
                 )
         else:
             dataset = _build_dataset(rows)
@@ -1820,7 +1992,10 @@ class ByteDataModule(DataModule):
             # One shared instance: turn resampling on, then pin the val indices back to
             # deterministic holes so val_loss_fim is the same spans at every eval.
             if isinstance(dataset, ByteStreamWindowDataset) and self.config.p_fim > 0:
-                dataset.resample_fim = not self.config.fixed_fim_holes
+                dataset.resample_fim = (
+                    self.config.p_fim < 1.0
+                    or self.config.fixed_fim_holes_per_window != 1
+                )
                 dataset.pin_fixed_indices(self.val_dataset.indices)
 
         if self.train_split_dump_path is not None:
@@ -1847,40 +2022,39 @@ class ByteDataModule(DataModule):
         ]
         videos = sorted({str(s.h264_path) for s in samples if hasattr(s, "h264_path")})
         fixed_holes: list[dict[str, Any]] = []
-        if self.config.fixed_fim_holes:
+        if self.config.fixed_fim_holes_per_window > 0:
             if not isinstance(base, ByteStreamWindowDataset):
                 raise RuntimeError("fixed FIM holes require ByteStreamWindowDataset")
             for index in sample_indices:
-                item = base[index]
-                meta = item["sample_meta"]
-                if meta.get("task") != "fim":
-                    raise RuntimeError(
-                        "fixed FIM hole recording expected every train item to be FIM; "
-                        "use p_fim=1.0"
+                for hole_id, hole in enumerate(base.fixed_fim_hole_specs(index)):
+                    item = base.fim_item_for_hole(
+                        index, hole, hole_id=hole_id
                     )
-                labels = item["labels"]
-                gap = int(meta["fim_gap"])
-                eos_tokens = 1 if self.config.use_eos else 0
-                missing_targets = labels[-(gap + eos_tokens) :]
-                target = bytes(
-                    int(token)
-                    for token in missing_targets.tolist()
-                    if 0 <= int(token) < BYTE_VOCAB_SIZE
-                )
-                fixed_holes.append(
-                    {
-                        "dataset_index": index,
-                        "h264_path": str(meta["h264_path"]),
-                        "start_nal": int(meta["start_nal"]),
-                        "end_nal": int(meta["end_nal"]),
-                        "frame_lo": int(meta["frame_lo"]),
-                        "frame_hi": int(meta["frame_hi"]),
-                        "fim_split": int(meta["fim_split"]),
-                        "fim_gap": int(meta["fim_gap"]),
-                        "target_length": len(target),
-                        "target_sha256": hashlib.sha256(target).hexdigest(),
-                    }
-                )
+                    meta = item["sample_meta"]
+                    labels = item["labels"]
+                    gap = int(meta["fim_gap"])
+                    eos_tokens = 1 if self.config.use_eos else 0
+                    missing_targets = labels[-(gap + eos_tokens) :]
+                    target = bytes(
+                        int(token)
+                        for token in missing_targets.tolist()
+                        if 0 <= int(token) < BYTE_VOCAB_SIZE
+                    )
+                    fixed_holes.append(
+                        {
+                            "dataset_index": index,
+                            "hole_id": hole_id,
+                            "h264_path": str(meta["h264_path"]),
+                            "start_nal": int(meta["start_nal"]),
+                            "end_nal": int(meta["end_nal"]),
+                            "frame_lo": int(meta["frame_lo"]),
+                            "frame_hi": int(meta["frame_hi"]),
+                            "fim_split": int(meta["fim_split"]),
+                            "fim_gap": int(meta["fim_gap"]),
+                            "target_length": len(target),
+                            "target_sha256": hashlib.sha256(target).hexdigest(),
+                        }
+                    )
         payload = {
             "manifest": str(self.manifest_path),
             "max_manifest_rows": self.max_manifest_rows,
@@ -1900,6 +2074,9 @@ class ByteDataModule(DataModule):
             "fim_loss_scope": self.config.fim_loss_scope,
             "use_eos": self.config.use_eos,
             "fixed_fim_holes_enabled": self.config.fixed_fim_holes,
+            "fixed_fim_holes_per_window": (
+                self.config.fixed_fim_holes_per_window
+            ),
             "n_train_videos": len(videos),
             "n_train_windows": len(windows),
             "videos": videos,

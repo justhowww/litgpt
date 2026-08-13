@@ -31,6 +31,7 @@ export FREE_RUN_INTERVAL=${FREE_RUN_INTERVAL:-0}
 
 export P_FIM=${P_FIM:-1.0}
 export FIXED_FIM_HOLES=${FIXED_FIM_HOLES:-1}
+export FIXED_FIM_HOLES_PER_WINDOW=${FIXED_FIM_HOLES_PER_WINDOW:-0}
 export FIM_FORMAT=${FIM_FORMAT:-psm}
 export USE_EOS=${USE_EOS:-1}
 export FIM_MIN_GAP=${FIM_MIN_GAP:-64}
@@ -47,7 +48,7 @@ sbatch_args=(--parsable --export=ALL
     --output="${OUT_DIR}/logs/%x-%j.out" --error="${OUT_DIR}/logs/%x-%j.err")
 [[ -n "${EXCLUDE_NODES:-}" ]] && sbatch_args+=(--exclude="${EXCLUDE_NODES}")
 
-echo "[fim-fixed-overfit] rows=${MAX_ROWS} model=~10M steps=${STEPS} p_fim=${P_FIM} fixed=${FIXED_FIM_HOLES}"
+echo "[fim-fixed-overfit] rows=${MAX_ROWS} model=~10M steps=${STEPS} p_fim=${P_FIM} fixed=${FIXED_FIM_HOLES} holes_per_window=${FIXED_FIM_HOLES_PER_WINDOW}"
 echo "  OUT_DIR=${OUT_DIR}"
 job_id=$(sbatch "${sbatch_args[@]}" "${SCRIPT_DIR}/train.sbatch")
 echo "Submitted fixed-hole FIM overfit job ${job_id}"

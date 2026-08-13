@@ -33,6 +33,7 @@ echo "[fixed-hole FIM eval] checkpoint=${CKPT} clips=${NUM_CLIPS}"
     --out-dir "${EVAL_ROOT}" \
     --max-manifest-rows 21 \
     --num-clips "${NUM_CLIPS}" \
+    --hole-set trained \
     --num-visualizations 8 \
     --seed "${SEED}" \
     --max-window-bytes 16384 \
@@ -61,9 +62,9 @@ expected = int(sys.argv[2])
 for row in rows:
     verified = int(row.get("exact_training_holes_verified", 0))
     available = int(row.get("fixed_training_holes_available", 0))
-    if verified != expected or available != expected:
+    if verified != expected or available < expected:
         raise SystemExit(
-            f"expected exactly {expected} fixed training holes, "
+            f"expected {expected} verified fixed training holes, "
             f"but verified={verified} available={available}"
         )
     print(

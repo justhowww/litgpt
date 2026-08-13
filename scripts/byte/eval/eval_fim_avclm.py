@@ -98,6 +98,7 @@ class WindowFimSample:
     teacher_labels: Tensor
     target_bytes: bytes
     window_bytes: bytes
+    hole_id: int | None = None
 
     @property
     def target_length(self) -> int:
@@ -165,6 +166,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-clips", type=int, default=20)
+    parser.add_argument(
+        "--hole-set",
+        choices=("auto", "trained", "heldout", "sampled"),
+        default="auto",
+        help=(
+            "Which holes to evaluate. auto replays cached training holes when "
+            "train_split.json contains them, otherwise uses deterministic sampled "
+            "holes. heldout samples holes disjoint from every cached training hole."
+        ),
+    )
+    parser.add_argument(
+        "--heldout-holes-per-window",
+        type=int,
+        default=1,
+        help="Number of deterministic disjoint holes per window for --hole-set heldout.",
+    )
     parser.add_argument(
         "--num-visualizations",
         type=int,
@@ -265,6 +282,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.max_gen_bytes <= 0:
         parser.error("--max-gen-bytes must be positive")
+    if args.heldout_holes_per_window <= 0:
+        parser.error("--heldout-holes-per-window must be positive")
     return args
 
 
@@ -273,7 +292,7 @@ def _load_train_split(
 ) -> tuple[
     set[tuple[str, int, int]],
     set[str],
-    dict[tuple[str, int, int], dict[str, Any]],
+    dict[tuple[str, int, int], list[dict[str, Any]]],
 ]:
     split = json.loads(path.read_text(encoding="utf-8"))
     windows = {
@@ -281,14 +300,16 @@ def _load_train_split(
         for w in split.get("windows", [])
     }
     videos = {str(Path(v)) for v in split.get("videos", [])}
-    fixed_holes = {
-        (
+    fixed_holes: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+    for h in split.get("fixed_fim_holes", []):
+        key = (
             str(Path(h["h264_path"])),
             int(h["start_nal"]),
             int(h["end_nal"]),
-        ): h
-        for h in split.get("fixed_fim_holes", [])
-    }
+        )
+        fixed_holes.setdefault(key, []).append(h)
+    for holes in fixed_holes.values():
+        holes.sort(key=lambda h: int(h.get("hole_id", 0)))
     return windows, videos, fixed_holes
 
 
@@ -402,7 +423,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         seed=args.seed,
     )
 
-    fixed_holes: dict[tuple[str, int, int], dict[str, Any]] = {}
+    fixed_holes: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
     if args.train_split_file is not None:
         train_windows, train_videos, fixed_holes = _load_train_split(
             args.train_split_file
@@ -435,10 +456,91 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
             flush=True,
         )
 
+    requested_hole_set = getattr(args, "hole_set", "auto")
+    if requested_hole_set == "auto":
+        requested_hole_set = "trained" if fixed_holes else "sampled"
+    if requested_hole_set == "trained" and not fixed_holes:
+        raise RuntimeError(
+            "--hole-set trained requires cached fixed_fim_holes in train_split.json"
+        )
+    args.hole_set = requested_hole_set
+
+    # Requests are round-robin by hole id, then window. Thus NUM_CLIPS=number of
+    # windows evaluates one trained hole per window rather than exhausting all K
+    # holes from the first window.
+    requests: list[
+        tuple[
+            int,
+            tuple[int, int, int, int] | None,
+            dict[str, Any] | None,
+        ]
+    ] = []
+    if requested_hole_set == "trained":
+        indexed_holes: list[tuple[int, list[dict[str, Any]]]] = []
+        for idx in indices:
+            sample = dataset.samples[idx]
+            key = (str(sample.h264_path), sample.start_nal, sample.end_nal)
+            holes = fixed_holes.get(key)
+            if not holes:
+                raise RuntimeError(
+                    f"Cached training holes are missing for train window: {key}"
+                )
+            indexed_holes.append((idx, holes))
+        for hole_slot in range(max(len(holes) for _, holes in indexed_holes)):
+            for idx, holes in indexed_holes:
+                if hole_slot >= len(holes):
+                    continue
+                expected = holes[hole_slot]
+                requests.append(
+                    (
+                        idx,
+                        (
+                            int(expected["frame_lo"]),
+                            int(expected["frame_hi"]),
+                            int(expected["fim_split"]),
+                            int(expected["fim_gap"]),
+                        ),
+                        expected,
+                    )
+                )
+    elif requested_hole_set == "heldout":
+        for idx in indices:
+            sample = dataset.samples[idx]
+            key = (str(sample.h264_path), sample.start_nal, sample.end_nal)
+            excluded = tuple(
+                (
+                    int(h["frame_lo"]),
+                    int(h["frame_hi"]),
+                    int(h["fim_split"]),
+                    int(h["fim_gap"]),
+                )
+                for h in fixed_holes.get(key, [])
+            )
+            for hole in dataset.heldout_fim_hole_specs(
+                idx,
+                getattr(args, "heldout_holes_per_window", 1),
+                exclude=excluded,
+            ):
+                requests.append((idx, hole, None))
+    else:
+        requests = [(idx, None, None) for idx in indices]
+
     selected: list[WindowFimSample] = []
     verified_fixed_holes = 0
-    for idx in indices:
-        item = dataset[idx]
+    for idx, explicit_hole, expected in requests:
+        item = (
+            dataset[idx]
+            if explicit_hole is None
+            else dataset.fim_item_for_hole(
+                idx,
+                explicit_hole,
+                hole_id=(
+                    int(expected.get("hole_id", 0))
+                    if expected is not None
+                    else None
+                ),
+            )
+        )
         if item["sample_meta"].get("task") != "fim":
             continue
         labels: Tensor = item["labels"]
@@ -484,13 +586,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
             int(meta["start_nal"]),
             int(meta["end_nal"]),
         )
-        if fixed_holes:
-            expected = fixed_holes.get(window_key)
-            if expected is None:
-                raise RuntimeError(
-                    "Fixed-hole replay mismatch: selected train window has no "
-                    f"recorded hole: {window_key}"
-                )
+        if expected is not None:
             _verify_fixed_hole_replay(expected, meta, target_ids, window_key)
             verified_fixed_holes += 1
         selected.append(
@@ -512,6 +608,11 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                 teacher_labels=item["labels"].clone(),
                 target_bytes=bytes(target_ids),
                 window_bytes=window_bytes,
+                hole_id=(
+                    int(meta["fim_hole_id"])
+                    if int(meta.get("fim_hole_id", -1)) >= 0
+                    else None
+                ),
             )
         )
         if len(selected) >= args.num_clips:
@@ -521,15 +622,26 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         raise RuntimeError(
             "No FIM samples selected. Lower gap/guard constraints or check that window-FIM is reachable."
         )
-    if fixed_holes:
+    if requested_hole_set == "trained":
         print(
             f"Exact fixed training holes verified: "
             f"{verified_fixed_holes}/{len(selected)}",
             flush=True,
         )
+    elif requested_hole_set == "heldout":
+        print(
+            f"Held-out holes verified disjoint from cached training pool: "
+            f"{len(selected)}/{len(selected)}",
+            flush=True,
+        )
     args.exact_training_holes_verified = verified_fixed_holes
-    args.fixed_training_holes_available = len(fixed_holes)
-    print(f"Selected {len(selected)} FIM AVC-LM samples", flush=True)
+    args.fixed_training_holes_available = sum(
+        len(holes) for holes in fixed_holes.values()
+    )
+    print(
+        f"Selected {len(selected)} FIM samples from hole_set={requested_hole_set}",
+        flush=True,
+    )
     return selected
 
 
@@ -1425,6 +1537,7 @@ def main() -> None:
             "frame_hi": s.frame_hi,
             "split": s.split,
             "gap": s.gap,
+            "hole_id": s.hole_id,
             "target_length": s.target_length,
             "gt_parser_reconnect_ok": gt_reconnect_ok[i],
         }
