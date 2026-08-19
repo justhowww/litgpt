@@ -18,6 +18,52 @@ from litgpt.pretrain import initialize_weights
 from litgpt.utils import _RunIf
 
 
+def test_optimizer_schedule_is_world_size_independent():
+    block_size = 16384
+    global_batch_size = 64
+    requested_steps = 160000
+    train = TrainArgs(
+        global_batch_size=global_batch_size,
+        micro_batch_size=1,
+        max_tokens=requested_steps * global_batch_size * block_size,
+        max_norm=1.0,
+        lr_warmup_steps=3200,
+    )
+    dataloader = [None] * 38
+
+    one_gpu = pretrain._optimizer_step_schedule(
+        train,
+        block_size,
+        devices=1,
+        num_nodes=1,
+        max_iters=requested_steps * 64,
+        train_dataloader=dataloader,
+    )
+    four_gpu = pretrain._optimizer_step_schedule(
+        train,
+        block_size,
+        devices=4,
+        num_nodes=1,
+        max_iters=requested_steps * 16,
+        train_dataloader=dataloader,
+    )
+
+    assert one_gpu == (64, requested_steps, 3200)
+    assert four_gpu == (16, requested_steps, 3200)
+
+
+def test_resume_rebases_microiterations_from_optimizer_step():
+    state = {"iter_num": 1_280_000, "step_count": 20_000}
+
+    resumed, rebased = pretrain._rebase_microiteration_counter(
+        state, gradient_accumulation_iters=16
+    )
+
+    assert resumed == 1_280_000
+    assert rebased == 320_000
+    assert state == {"iter_num": 320_000, "step_count": 20_000}
+
+
 @_RunIf(min_cuda_gpus=1, standalone=True)
 @mock.patch("litgpt.pretrain.save_hyperparameters")
 def test_optimizer_args(_, tmp_path):

@@ -291,9 +291,12 @@ class ByteTrainingRuntime:
         return 0.0 if total is None else float(total.sqrt())
 
     def log_mrt(
-        self, fabric: Fabric, metrics: dict[str, float], step: int, iter_num: int
+        self, fabric: Fabric, metrics: dict[str, float], step: int
     ) -> None:
-        fabric.log_dict(metrics, step=iter_num - 1)
+        # TensorBoard's x-axis is the device-independent optimizer step. The
+        # per-rank microiteration count changes when a checkpoint moves between
+        # launchers with different world sizes.
+        fabric.log_dict(metrics, step=step)
         if metrics["mrt/skipped"]:
             fabric.print(
                 f"MRT step {step} skipped: reference frame did not decode strictly"

@@ -302,6 +302,7 @@ def main(
         fabric.load(resume, state, weights_only=False)
 
     train_time = time.perf_counter()
+    initial_step_count = state["step_count"]
 
     # work around PyTorch issue https://github.com/pytorch/pytorch/issues/152162
     # which does not like the lazy initialization to be called in dynamo.
@@ -339,7 +340,12 @@ def main(
         checkpoint_hparams=checkpoint_hparams,
     )
 
-    total_tokens = state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size
+    total_tokens = state["step_count"] * train.global_batch_size * model.max_seq_length
+    segment_tokens = (
+        (state["step_count"] - initial_step_count)
+        * train.global_batch_size
+        * model.max_seq_length
+    )
     patch_size = model.config.byte_patch_size
 
     elapsed_train_time = time.perf_counter() - train_time
@@ -355,7 +361,7 @@ def main(
             f"(patch_size={patch_size})"
         )
     fabric.print(f"| - Training Time : {elapsed_train_time:.2f} s")
-    fabric.print(f"| - Tok/sec       : {total_tokens / elapsed_train_time:.2f} tok/s")
+    fabric.print(f"| - Tok/sec       : {segment_tokens / elapsed_train_time:.2f} tok/s")
     fabric.print("| " + "-" * 40)
 
     if fabric.device.type == "cuda":
@@ -422,16 +428,42 @@ def fit(
     max_tokens_per_device = train.max_tokens // fabric.world_size
     tokens_per_iter = train.micro_batch_size * model.max_seq_length
     max_iters = max_tokens_per_device // tokens_per_iter
-    log_iter_interval = train.log_interval * train.gradient_accumulation_iters(devices, num_nodes)
+    gradient_accumulation_iters, max_steps, warmup_steps = _optimizer_step_schedule(
+        train,
+        model.max_seq_length,
+        devices,
+        num_nodes,
+        max_iters,
+        train_dataloader,
+    )
+
+    # ``iter_num`` counts per-rank microbatches, so its units change whenever the
+    # number of devices, nodes, or the microbatch size changes. Checkpoints are only
+    # written at optimizer-step boundaries, which lets us reconstruct the correct
+    # current-launch counter from the device-independent ``step_count``. Without
+    # this rebase, a 1-GPU -> 4-GPU resume appears four times farther through both
+    # the LR schedule and token budget.
+    resumed_iter_num, rebased_iter_num = _rebase_microiteration_counter(
+        state, gradient_accumulation_iters
+    )
+    if resumed_iter_num != rebased_iter_num:
+        fabric.print(
+            "Rebasing device-dependent microiteration counter for this launch: "
+            f"iter_num {resumed_iter_num} -> {rebased_iter_num} at optimizer step "
+            f"{state['step_count']} (grad_accum={gradient_accumulation_iters})."
+        )
+    log_iter_interval = train.log_interval * gradient_accumulation_iters
     initial_iter = state["iter_num"]
+    initial_step = state["step_count"]
     train_iterator = CycleIterator(train_dataloader)
 
     # Batch config -- read this alongside the per-step "peak mem" to size micro_batch_size.
     fabric.print(
         f"batch config | micro_batch={train.micro_batch_size} "
-        f"grad_accum={train.gradient_accumulation_iters(devices, num_nodes)} "
+        f"grad_accum={gradient_accumulation_iters} "
         f"global_batch={train.global_batch_size} block/seq={model.max_seq_length} "
-        f"devices={devices}x{num_nodes} -> watch 'peak mem' below vs the card size"
+        f"devices={devices}x{num_nodes} max_steps={max_steps} warmup_steps={warmup_steps} "
+        "-> watch 'peak mem' below vs the card size"
     )
 
     # Per-rank distributed topology (printed from EVERY rank, not just rank 0) -- the first
@@ -455,7 +487,7 @@ def fit(
     fabric.barrier()  # surfaces a broken communicator HERE (with the topology above) rather
     # than 30 min later inside validate()
 
-    running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
+    running_loss = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(
         fabric.device
     )
     # Track the CE represented by one optimizer step. MRT is applied only at
@@ -466,15 +498,21 @@ def fit(
     fabric.barrier()
     total_t0 = time.perf_counter()
 
-    warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
     last_reconstruction_step = -1
 
     for train_data in train_iterator:
-        if state["iter_num"] >= max_iters:
+        if state["step_count"] >= max_steps:
             break
 
-        # determine and set the learning rate for this iteration
-        lr = get_lr(optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, train.min_lr)
+        # LR is constant across all microbatches contributing to one optimizer
+        # update and depends only on the device-independent optimizer step.
+        lr = get_lr(
+            optimizer.defaults["lr"],
+            state["step_count"],
+            warmup_steps,
+            max_steps,
+            train.min_lr,
+        )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -485,7 +523,7 @@ def fit(
         # auxiliary ids, while original text batches retain LitGPT's shift path.
         model_inputs, targets = get_model_inputs_and_targets(train_data, model.max_seq_length)
 
-        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
+        is_accumulating = state["iter_num"] % gradient_accumulation_iters != 0
         run_mrt = byte_runtime.should_run_mrt(
             state["step_count"] + 1, is_accumulating
         )
@@ -497,7 +535,7 @@ def fit(
             fabric.backward(
                 byte_runtime.ce_loss_weight
                 * loss
-                / train.gradient_accumulation_iters(devices, num_nodes)
+                / gradient_accumulation_iters
             )
         step_ce_sum += loss.detach()
         step_ce_count += 1
@@ -537,9 +575,7 @@ def fit(
             optimizer.zero_grad()
             state["step_count"] += 1
             if mrt_metrics is not None:
-                byte_runtime.log_mrt(
-                    fabric, mrt_metrics, state["step_count"], state["iter_num"]
-                )
+                byte_runtime.log_mrt(fabric, mrt_metrics, state["step_count"])
             step_ce_sum.zero_()
             step_ce_count = 0
 
@@ -549,21 +585,31 @@ def fit(
             throughput.update(
                 time=(t1 - total_t0),
                 flops=(measured_flops * log_iter_interval),
-                batches=state["iter_num"],
-                samples=(state["iter_num"] * train.micro_batch_size),
-                lengths=(state["iter_num"] * train.micro_batch_size * model.max_seq_length),
+                batches=(state["iter_num"] - initial_iter),
+                samples=((state["iter_num"] - initial_iter) * train.micro_batch_size),
+                lengths=(
+                    (state["iter_num"] - initial_iter)
+                    * train.micro_batch_size
+                    * model.max_seq_length
+                ),
             )
+            completed_steps = state["step_count"]
+            completed_samples = completed_steps * train.global_batch_size
+            completed_tokens = completed_samples * model.max_seq_length
+            elapsed_steps = completed_steps - initial_step
             metrics = {
                 "loss": loss,
                 "iter": state["iter_num"],
-                "step": state["step_count"],
+                "step": completed_steps,
                 "epoch": train_iterator.epoch,
                 "iter_time": t1 - iter_t0,
                 "remaining_time": (
-                    (t1 - total_t0) / (state["iter_num"] - initial_iter) * (max_iters - state["iter_num"])
+                    (t1 - total_t0) / elapsed_steps * (max_steps - completed_steps)
                 ),
-                "tokens": state["iter_num"] * train.micro_batch_size * model.max_seq_length,
-                "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
+                # Canonical global counters remain continuous when world size changes.
+                "samples_seen": completed_samples,
+                "tokens": completed_tokens,
+                "total_tokens": completed_tokens,
                 "learning_rate": lr,
             }
             # Byte-domain extension: context and padding are masked, so record
@@ -595,7 +641,7 @@ def fit(
 
             throughput_metrics = throughput.compute()
             metrics.update(throughput_metrics)
-            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+            fabric.log_dict(metrics, step=completed_steps)
 
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
             t0 = time.perf_counter()
@@ -615,7 +661,7 @@ def fit(
                 metrics[f"val_loss_{name}"] = tl
                 metrics[f"val_ppl_{name}"] = math.exp(tl)
             metrics.update(eos_metrics)
-            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+            fabric.log_dict(metrics, step=state["step_count"])
             fabric.barrier()
 
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
@@ -632,7 +678,7 @@ def fit(
             and not is_accumulating
         ):
             byte_runtime.evaluate_reconstruction(
-                fabric, model, state["iter_num"] - 1
+                fabric, model, state["step_count"]
             )
             last_reconstruction_step = state["step_count"]
 
@@ -641,7 +687,7 @@ def fit(
             and not is_accumulating
         ):
             byte_runtime.evaluate_free_run(
-                fabric, model, state["iter_num"] - 1
+                fabric, model, state["step_count"]
             )
 
     # Final validation
@@ -654,7 +700,7 @@ def fit(
             metrics[f"val_loss_{name}"] = tl
             metrics[f"val_ppl_{name}"] = math.exp(tl)
         metrics.update(eos_metrics)
-        fabric.log_dict(metrics, step=state["iter_num"])
+        fabric.log_dict(metrics, step=state["step_count"])
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
     if (
@@ -663,7 +709,7 @@ def fit(
         and last_reconstruction_step != state["step_count"]
     ):
         byte_runtime.evaluate_reconstruction(
-            fabric, model, state["iter_num"], final=True
+            fabric, model, state["step_count"], final=True
         )
 
 
@@ -685,6 +731,43 @@ def get_dataloaders(
 
 
 # learning rate decay scheduler (cosine with linear warmup)
+def _optimizer_step_schedule(
+    train: TrainArgs,
+    max_seq_length: int,
+    devices: int,
+    num_nodes: int,
+    max_iters: int,
+    train_dataloader: DataLoader,
+) -> tuple[int, int, int]:
+    """Return accumulation, maximum, and warmup counts in optimizer-step units.
+
+    ``TrainArgs.max_tokens`` is global, so dividing by the global tokens per
+    optimizer update produces a limit that does not depend on launcher world size.
+    ``TrainArgs.warmup_iters`` returns per-rank microiterations; convert it once at
+    the boundary instead of scheduling directly in those device-dependent units.
+    """
+    gradient_accumulation_iters = train.gradient_accumulation_iters(devices, num_nodes)
+    max_steps = train.max_tokens // (train.global_batch_size * max_seq_length)
+    if train.max_steps is not None:
+        max_steps = min(max_steps, train.max_steps)
+    warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
+    warmup_steps = min(
+        math.ceil(warmup_iters / gradient_accumulation_iters),
+        max_steps,
+    )
+    return gradient_accumulation_iters, max_steps, warmup_steps
+
+
+def _rebase_microiteration_counter(
+    state: dict, gradient_accumulation_iters: int
+) -> tuple[int, int]:
+    """Re-express a boundary checkpoint's microiteration counter for this launch."""
+    resumed_iter_num = int(state["iter_num"])
+    rebased_iter_num = int(state["step_count"]) * gradient_accumulation_iters
+    state["iter_num"] = rebased_iter_num
+    return resumed_iter_num, rebased_iter_num
+
+
 def get_lr(learning_rate: float, it: int, warmup_iters: int, max_iters: int, min_lr: float) -> float:
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:

@@ -572,6 +572,15 @@ def choose_logger(
     if logger_name == "csv":
         return CSVLogger(root_dir=(out_dir / "logs"), name="csv", flush_logs_every_n_steps=log_interval, **kwargs)
     if logger_name == "tensorboard":
+        # A Slurm resubmission is another segment of the same training run, not a
+        # new TensorBoard experiment. Lightning otherwise auto-increments
+        # ``version_N`` on every launcher invocation and splits one curve across
+        # directories. ``scripts/byte/train.py`` uses resume="auto" from the first
+        # segment onward, so pin resumable runs to one named directory. Do not append
+        # to legacy ``version_0`` logs: those used device-dependent microiterations
+        # on the x-axis and cannot be mixed safely with optimizer-step events.
+        if resume and "version" not in kwargs:
+            kwargs["version"] = "optimizer_steps"
         return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", **kwargs)
     if logger_name == "wandb":
         project = log_args.pop("project", None) or os.environ.get("WANDB_PROJECT") or name

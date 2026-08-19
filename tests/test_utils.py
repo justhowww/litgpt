@@ -323,6 +323,16 @@ def test_choose_logger(tmp_path):
         choose_logger("foo", out_dir=tmp_path, name="foo")
 
 
+def test_resumed_tensorboard_logger_reuses_optimizer_step_version(tmp_path):
+    if not _TENSORBOARD_AVAILABLE:
+        pytest.skip("tensorboard is not installed")
+
+    logger = choose_logger("tensorboard", out_dir=tmp_path, name="tb", resume=True)
+
+    assert logger.version == "optimizer_steps"
+    assert Path(logger.log_dir) == tmp_path / "logs" / "tensorboard" / "optimizer_steps"
+
+
 @pytest.mark.parametrize(
     "path_type, input_path, expected",
     [
