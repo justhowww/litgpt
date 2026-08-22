@@ -21,6 +21,14 @@ from litgpt.byte.data import (
     REGION_TARGET,
     SEQ_EOS_ID,
 )
+from litgpt.byte.grpo import (
+    GRPOConfig,
+    build_group_patch_inputs,
+    group_token_log_probabilities,
+    grpo_clipped_loss,
+    prepare_grpo_step,
+    should_run_grpo as _should_run_grpo,
+)
 from litgpt.byte.mrt import (
     MRTConfig,
     candidate_mean_log_probability,
@@ -32,6 +40,7 @@ from litgpt.byte.reconstruction import (
     ReconstructionEvalConfig,
     ReconstructionSample,
     ReconstructionVisualization,
+    _unwrap_model,
     run_reconstruction_probe,
     save_reconstruction_sample_manifest,
     select_reconstruction_samples,
@@ -61,6 +70,13 @@ class ByteTrainingRuntime:
     mrt_samples: list[ReconstructionSample] = field(default_factory=list)
     free_run_config: FreeRunEvalConfig | None = None
     free_run_samples: list[FreeRunSample] = field(default_factory=list)
+    grpo_config: GRPOConfig | None = None
+    grpo_ar_pool: list[ReconstructionSample] = field(default_factory=list)
+    grpo_fim_pool: list[ReconstructionSample] = field(default_factory=list)
+    # Frozen initial-policy copy for the GRPO KL penalty. Populated by the
+    # caller (litgpt.pretrain.main) once weights are loaded, since building it
+    # requires the fully-materialized model -- prepare() runs before that.
+    reference_model: nn.Module | None = None
 
     @classmethod
     def prepare(
@@ -77,6 +93,7 @@ class ByteTrainingRuntime:
         reconstruction_config: ReconstructionEvalConfig | None,
         mrt_config: MRTConfig | None,
         free_run_config: FreeRunEvalConfig | None = None,
+        grpo_config: GRPOConfig | None = None,
     ) -> "ByteTrainingRuntime":
         """Select fixed probe/MRT contexts once before distributed wrapping."""
         reconstruction_samples: dict[str, list[ReconstructionSample]] = {}
@@ -140,6 +157,41 @@ class ByteTrainingRuntime:
                 f"{mrt_config.interval} steps, risk={mrt_config.risk_mode}"
             )
 
+        grpo_ar_pool: list[ReconstructionSample] = []
+        grpo_fim_pool: list[ReconstructionSample] = []
+        if grpo_config is not None and grpo_config.enabled:
+            grpo_config.validate()
+            if fabric.world_size != 1:
+                raise ValueError("Online byte GRPO currently supports one device only")
+            grpo_ar_pool = select_reconstruction_samples(
+                train_dataset,
+                grpo_config.ar_pool_size,
+                grpo_config.max_target_bytes,
+                "ar",
+            )
+            grpo_fim_pool = select_reconstruction_samples(
+                train_dataset,
+                grpo_config.fim_pool_size,
+                grpo_config.max_target_bytes,
+                "fim",
+            )
+            if not grpo_ar_pool or not grpo_fim_pool:
+                raise ValueError(
+                    "GRPO is enabled but no eligible AR and/or FIM samples were found"
+                )
+            if fabric.global_rank == 0:
+                save_reconstruction_sample_manifest(
+                    grpo_ar_pool, out_dir / "grpo_training_samples_ar.json"
+                )
+                save_reconstruction_sample_manifest(
+                    grpo_fim_pool, out_dir / "grpo_training_samples_fim.json"
+                )
+            fabric.print(
+                f"Online GRPO enabled: {len(grpo_ar_pool)} AR + {len(grpo_fim_pool)} FIM "
+                f"contexts (alternating), group_size={grpo_config.group_size} every "
+                f"{grpo_config.interval} steps, kl_coeff={grpo_config.kl_coeff}"
+            )
+
         free_run_samples: list[FreeRunSample] = []
         if free_run_config is not None and free_run_config.enabled:
             # Selection is deterministic, so every rank builds the same fixed clips.
@@ -172,6 +224,9 @@ class ByteTrainingRuntime:
             mrt_samples=mrt_samples,
             free_run_config=free_run_config,
             free_run_samples=free_run_samples,
+            grpo_config=grpo_config,
+            grpo_ar_pool=grpo_ar_pool,
+            grpo_fim_pool=grpo_fim_pool,
         )
 
     def loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -188,6 +243,129 @@ class ByteTrainingRuntime:
             not is_accumulating
             and self.mrt_config is not None
             and should_run_mrt(next_step, self.mrt_config)
+        )
+
+    def should_run_grpo(self, next_step: int, is_accumulating: bool) -> bool:
+        return (
+            not is_accumulating
+            and self.grpo_config is not None
+            and _should_run_grpo(next_step, self.grpo_config)
+        )
+
+    def run_grpo(
+        self,
+        fabric: Fabric,
+        optimizer,
+        model: nn.Module,
+        max_norm: float,
+        next_step: int,
+    ) -> dict[str, float] | None:
+        """Sample one group and run mu clipped-surrogate gradient steps on it.
+
+        Self-contained: owns its own zero_grad/backward/clip/step cycle,
+        separate from the shared CE optimizer step. Must only be called after
+        the CE step for this iteration has already been applied (see the
+        call site in litgpt.pretrain.fit) so it starts from a clean gradient
+        slate and doesn't clobber CE's accumulated gradient.
+
+        Alternates between the AR and FIM context pools each call, so
+        AR-only and FIM-only reward trends stay separately loggable.
+        """
+        config = self.grpo_config
+        if config is None or not self.grpo_ar_pool or not self.grpo_fim_pool:
+            return None
+        update_index = (next_step - config.start_step) // config.interval - 1
+        pool = self.grpo_ar_pool if update_index % 2 == 0 else self.grpo_fim_pool
+        pool_name = "ar" if update_index % 2 == 0 else "fim"
+        sample = pool[(update_index // 2) % len(pool)]
+
+        prepared = prepare_grpo_step(model, sample, config, fabric.device)
+        if prepared is None:
+            return {"grpo/skipped": 1.0, "grpo/pool": pool_name}
+
+        raw_model = _unwrap_model(model)
+        patch_size = int(raw_model.config.byte_patch_size)
+        inputs, labels = build_group_patch_inputs(
+            prepared.sample, prepared.candidates, patch_size, fabric.device
+        )
+
+        with torch.no_grad(), fabric.autocast():
+            old_gathered, supervised = group_token_log_probabilities(model, inputs, labels)
+            old_gathered = old_gathered.detach()
+            reference_gathered = None
+            if self.reference_model is not None and config.kl_coeff > 0:
+                reference_gathered, _ = group_token_log_probabilities(
+                    self.reference_model, inputs, labels
+                )
+                reference_gathered = reference_gathered.detach()
+
+        loss_metrics: dict[str, float] = {}
+        final_loss = 0.0
+        for _ in range(config.mu):
+            optimizer.zero_grad()
+            with fabric.autocast():
+                gathered, _ = group_token_log_probabilities(model, inputs, labels)
+                loss, loss_metrics = grpo_clipped_loss(
+                    gathered,
+                    old_gathered,
+                    supervised,
+                    prepared.advantages,
+                    reference_gathered,
+                    config.kl_coeff,
+                    config.clip_range,
+                )
+            fabric.backward(loss)
+            fabric.clip_gradients(model, optimizer, max_norm=max_norm)
+            optimizer.step()
+            final_loss = float(loss.detach())
+        optimizer.zero_grad()
+
+        metrics = {
+            "grpo/skipped": 0.0,
+            "grpo/pool": pool_name,
+            "grpo/task": prepared.task,
+            "grpo/mean_reward": prepared.mean_reward,
+            "grpo/reward_min": float(prepared.rewards.min()),
+            "grpo/reward_max": float(prepared.rewards.max()),
+            "grpo/reward_std": float(prepared.rewards.std(unbiased=False)),
+            "grpo/decode_rate": prepared.decode_rate,
+            "grpo/group_size": float(len(prepared.candidates)),
+            "grpo/mu": float(config.mu),
+            f"grpo/{pool_name}/mean_reward": prepared.mean_reward,
+            f"grpo/{pool_name}/decode_rate": prepared.decode_rate,
+        }
+        finite_psnrs = prepared.psnrs[torch.isfinite(prepared.psnrs)]
+        if finite_psnrs.numel() > 0:
+            metrics["grpo/psnr_mean"] = float(finite_psnrs.mean())
+        metrics.update(loss_metrics)
+        metrics["grpo/loss"] = final_loss
+        return metrics
+
+    def log_grpo(self, fabric: Fabric, metrics: dict[str, float], step: int) -> None:
+        pool = metrics.get("grpo/pool", "?")
+        if metrics.get("grpo/skipped"):
+            fabric.log_dict(
+                {k: v for k, v in metrics.items() if isinstance(v, (int, float))}, step=step
+            )
+            fabric.print(f"GRPO step {step} [{pool}] skipped: reference frame did not decode strictly")
+            return
+        # fabric.log_dict requires scalar values; string fields (pool/task) are
+        # print-only diagnostics, not logged as metrics.
+        loggable = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+        fabric.log_dict(loggable, step=step)
+        fabric.print(
+            f"GRPO step {step} [{pool}/{metrics.get('grpo/task', '?')}] "
+            f"reward: {metrics['grpo/mean_reward']:.4f} "
+            f"(std {metrics['grpo/reward_std']:.4f}), "
+            f"decode: {metrics['grpo/decode_rate']:.1%}, "
+            f"loss: {metrics['grpo/loss']:.4f}, "
+            f"mu: {int(metrics.get('grpo/mu', 1))}, "
+            f"clip_frac: {metrics.get('grpo/clip_fraction', 0.0):.3f}"
+            + (
+                f", kl: {metrics['grpo/kl_to_reference']:.4f}"
+                if "grpo/kl_to_reference" in metrics
+                else ""
+            )
         )
 
     def run_mrt(

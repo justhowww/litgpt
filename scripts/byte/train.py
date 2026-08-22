@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from litgpt.args import EvalArgs, TrainArgs
+from litgpt.byte.grpo import GRPOConfig
 from litgpt.byte.mrt import MRTConfig, MRT_RISK_MODES
 from litgpt.config import Config
 from litgpt.byte.data import (
@@ -335,6 +336,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mrt-decode-failure-weight", type=float, default=2.0)
     parser.add_argument("--mrt-max-risk", type=float, default=2.0)
     parser.add_argument("--mrt-decode-workers", type=int, default=8)
+    parser.add_argument("--grpo-interval", type=int, default=0)
+    parser.add_argument("--grpo-start-step", type=int, default=0)
+    parser.add_argument("--grpo-group-size", type=int, default=64)
+    parser.add_argument("--grpo-ar-pool-size", type=int, default=16)
+    parser.add_argument("--grpo-fim-pool-size", type=int, default=16)
+    parser.add_argument("--grpo-max-target-bytes", type=int, default=2048)
+    parser.add_argument("--grpo-temperature", type=float, default=1.0)
+    parser.add_argument("--grpo-top-k", type=int, default=0)
+    parser.add_argument("--grpo-top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--grpo-kl-coeff",
+        type=float,
+        default=0.02,
+        help="KL-to-reference-policy penalty weight. 0 disables the KL term "
+        "(and the frozen reference checkpoint load).",
+    )
+    parser.add_argument(
+        "--grpo-psnr-cap",
+        type=float,
+        default=40.0,
+        help="PSNR (dB) normalization ceiling for the reward's decode-success shaping.",
+    )
+    parser.add_argument("--grpo-decode-failure-reward", type=float, default=-1.0)
+    parser.add_argument(
+        "--grpo-mu",
+        type=int,
+        default=1,
+        help=(
+            "Inner gradient steps per sampled group via the clipped ratio "
+            "surrogate, before resampling. mu=1 (default) is plain on-policy "
+            "GRPO; mu>1 reuses one (expensive) rollout for extra updates."
+        ),
+    )
+    parser.add_argument("--grpo-clip-range", type=float, default=0.2)
+    parser.add_argument("--grpo-timeout-sec", type=int, default=30)
+    parser.add_argument("--grpo-decode-workers", type=int, default=8)
+    parser.add_argument("--grpo-ffmpeg-binary", default="ffmpeg")
+    parser.add_argument(
+        "--grpo-reference-checkpoint-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Frozen initial-policy checkpoint the GRPO KL penalty is measured "
+            "against. Required when --grpo-kl-coeff > 0. Kept independent of "
+            "--initial-checkpoint-dir/--resume so the KL anchor survives a "
+            "resumed phase-2 run; typically the same checkpoint as "
+            "--initial-checkpoint-dir on a fresh phase-2 launch."
+        ),
+    )
     parser.add_argument("--precision", default=None)
     parser.add_argument("--logger-name", default="tensorboard")
     parser.add_argument("--seed", type=int, default=42)
@@ -399,6 +449,16 @@ def main() -> None:
     # same checkpoint; the eval path emits both as separate metric prefixes.
     if args.mrt_interval > 0 and args.p_fim <= 0:
         raise ValueError("MRT requires a non-zero --p-fim")
+    if args.grpo_interval > 0 and args.p_fim <= 0:
+        raise ValueError("GRPO requires a non-zero --p-fim for its FIM pool")
+    if (
+        args.grpo_interval > 0
+        and args.grpo_kl_coeff > 0
+        and args.grpo_reference_checkpoint_dir is None
+    ):
+        raise ValueError(
+            "--grpo-kl-coeff > 0 requires --grpo-reference-checkpoint-dir"
+        )
     # Window FIM's hole spans many NALs (on a slice-max-mbs=1 corpus a 64-1400 byte
     # hole covers ~100+ of them), so the window-AR offset convention -- arange within
     # each NAL, reset at every boundary -- has no coherent value across the generated
@@ -560,6 +620,28 @@ def main() -> None:
     if mrt.enabled:
         mrt.validate()
 
+    grpo = GRPOConfig(
+        interval=args.grpo_interval,
+        start_step=args.grpo_start_step,
+        group_size=args.grpo_group_size,
+        ar_pool_size=args.grpo_ar_pool_size,
+        fim_pool_size=args.grpo_fim_pool_size,
+        max_target_bytes=args.grpo_max_target_bytes,
+        temperature=args.grpo_temperature,
+        top_k=args.grpo_top_k,
+        top_p=args.grpo_top_p,
+        kl_coeff=args.grpo_kl_coeff,
+        psnr_cap=args.grpo_psnr_cap,
+        decode_failure_reward=args.grpo_decode_failure_reward,
+        mu=args.grpo_mu,
+        clip_range=args.grpo_clip_range,
+        timeout_sec=args.grpo_timeout_sec,
+        decode_workers=args.grpo_decode_workers,
+        ffmpeg_binary=args.grpo_ffmpeg_binary,
+    )
+    if grpo.enabled:
+        grpo.validate()
+
     setup(
         model_name=args.model_name,
         model_config=model_config,
@@ -584,6 +666,8 @@ def main() -> None:
         eos_aux_loss_weight=args.eos_aux_loss_weight,
         mrt=mrt,
         free_run_eval=free_run_eval,
+        grpo=grpo,
+        grpo_reference_checkpoint_dir=args.grpo_reference_checkpoint_dir,
     )
 
 

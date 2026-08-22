@@ -22,6 +22,7 @@ from torchmetrics.aggregation import RunningMean
 from litgpt import Tokenizer
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.byte.free_run_eval import FreeRunEvalConfig
+from litgpt.byte.grpo import GRPOConfig
 from litgpt.byte.mrt import MRTConfig
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
@@ -95,6 +96,8 @@ def setup(
     eos_aux_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
     free_run_eval: FreeRunEvalConfig | None = None,
+    grpo: GRPOConfig | None = None,
+    grpo_reference_checkpoint_dir: Path | None = None,
 ):
     """Pretrain a model.
 
@@ -129,6 +132,9 @@ def setup(
 
     if initial_checkpoint_dir is not None:
         initial_checkpoint_dir = extend_checkpoint_dir(initial_checkpoint_dir)
+
+    if grpo_reference_checkpoint_dir is not None:
+        grpo_reference_checkpoint_dir = extend_checkpoint_dir(grpo_reference_checkpoint_dir)
 
     if tokenizer_dir is not None:
         tokenizer_dir = extend_checkpoint_dir(tokenizer_dir)
@@ -202,6 +208,8 @@ def setup(
         eos_aux_loss_weight=eos_aux_loss_weight,
         mrt=mrt,
         free_run_eval=free_run_eval,
+        grpo=grpo,
+        grpo_reference_checkpoint_dir=grpo_reference_checkpoint_dir,
     )
 
 
@@ -229,6 +237,8 @@ def main(
     eos_aux_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
     free_run_eval: FreeRunEvalConfig | None = None,
+    grpo: GRPOConfig | None = None,
+    grpo_reference_checkpoint_dir: Path | None = None,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -274,6 +284,7 @@ def main(
         reconstruction_config=reconstruction_eval,
         mrt_config=mrt,
         free_run_config=free_run_eval,
+        grpo_config=grpo,
     )
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
@@ -293,6 +304,28 @@ def main(
         # local checkpoint; PyTorch 2.6+ otherwise rejects those extra objects
         # under its default weights-only policy.
         fabric.load(checkpoint_path, {"model": model}, weights_only=False)
+
+    if grpo is not None and grpo.enabled and grpo.kl_coeff > 0:
+        if grpo_reference_checkpoint_dir is None:
+            raise ValueError(
+                "GRPO kl_coeff > 0 requires grpo_reference_checkpoint_dir "
+                "(kept independent of initial_checkpoint_dir/resume so the KL "
+                "anchor survives a resumed phase-2 run)."
+            )
+        fabric.print(f"Loading frozen GRPO reference policy from {grpo_reference_checkpoint_dir}")
+        reference_model = GPT(config)
+        reference_checkpoint = torch.load(
+            grpo_reference_checkpoint_dir / "lit_model.pth",
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
+        )
+        reference_state_dict = reference_checkpoint.get("model", reference_checkpoint)
+        reference_model.load_state_dict(reference_state_dict)
+        reference_model = reference_model.to(fabric.device).eval()
+        for parameter in reference_model.parameters():
+            parameter.requires_grad_(False)
+        byte_runtime.reference_model = reference_model
 
     resume = find_resume_path(resume, out_dir)
     if resume:
@@ -567,6 +600,8 @@ def fit(
                     }
                 )
 
+        run_grpo = byte_runtime.should_run_grpo(state["step_count"] + 1, is_accumulating)
+
         running_loss.update(loss.detach())
 
         if not is_accumulating:
@@ -578,6 +613,17 @@ def fit(
                 byte_runtime.log_mrt(fabric, mrt_metrics, state["step_count"])
             step_ce_sum.zero_()
             step_ce_count = 0
+
+            # Runs after the CE step commits and clears its gradient, since
+            # GRPO (mu possibly > 1) owns its own zero_grad/backward/step
+            # cycle on a clean slate rather than sharing this iteration's CE
+            # gradient accumulation.
+            if run_grpo:
+                grpo_metrics = byte_runtime.run_grpo(
+                    fabric, optimizer, model, train.max_norm, state["step_count"]
+                )
+                if grpo_metrics is not None:
+                    byte_runtime.log_grpo(fabric, grpo_metrics, state["step_count"])
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization

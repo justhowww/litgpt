@@ -12,9 +12,31 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
-from litgpt.byte.data import PAD_ID, REGION_PAD, patch_byte_sample
+from litgpt.byte.data import BYTE_VOCAB_SIZE, PAD_ID, REGION_PAD, patch_byte_sample
+
+
+def sample_tokens(logits: Tensor, temperature: float, top_k: int, top_p: float) -> Tensor:
+    """Sample one token per row from ``logits`` (``[B, V]``)."""
+    if temperature <= 0:
+        return logits.argmax(dim=-1)
+    logits = logits.float() / temperature
+    if top_k > 0:
+        threshold = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values[:, -1:]
+        logits = logits.masked_fill(logits < threshold, float("-inf"))
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        cumulative = sorted_probs.cumsum(dim=-1)
+        remove = cumulative > top_p
+        remove[:, 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+        logits = torch.full_like(logits, float("-inf"))
+        logits.scatter_(1, sorted_indices, sorted_logits)
+    probabilities = F.softmax(logits, dim=-1)
+    return torch.multinomial(probabilities, num_samples=1).squeeze(1)
 
 
 @dataclass
@@ -124,6 +146,120 @@ def megabyte_teacher_forced_sample(
             "target_region_ids",
         )
     }
+
+
+@torch.inference_mode()
+def megabyte_generate_batch(
+    raw: nn.Module,
+    sample,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> list[bytes] | None:
+    """Generate a full group of candidates for one context in one batched loop.
+
+    Only valid when generation follows a *deterministic* region/offset
+    schedule fixed in advance by ``sample.generation_region_id`` and
+    ``sample.generation_offset_start + step`` (as with reconstruction-sample
+    targets) -- it does not depend on which bytes get sampled, unlike
+    free-run generation's start-code-tracking schedule. That lets all
+    ``batch_size`` candidates share identical patch metadata and run through
+    the same global-decoder forward passes together; only the sampled byte
+    content differs per batch row. This does NOT generalize to free-run
+    generation as-is, and it always generates exactly
+    ``sample.target_length`` bytes (no early EOS stopping).
+    """
+    patch_size = int(raw.config.byte_patch_size)
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
+        prompt, region_ids, offset_ids, patch_size
+    )
+    prompt_patches = patched_ids.size(1)
+    if prompt_patches > int(raw.max_seq_length):
+        return None
+    if sample.target_length > megabyte_max_new_bytes(raw, prompt.size(1)):
+        return None
+
+    def _autocast():
+        return torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        )
+
+    b = batch_size
+    patched_ids_b = patched_ids.expand(b, -1, -1).contiguous()
+    patched_regions_b = patched_regions.expand(b, -1, -1).contiguous()
+    patched_offsets_b = patched_offsets.expand(b, -1, -1).contiguous()
+
+    # Size the KV cache to what this generation actually needs (prompt patches
+    # plus the patches the target span will occupy), not the model's full
+    # max_seq_length. At batch_size=1 the gap between "needed" and "full" is
+    # harmless; multiplied by a batch dimension of G it is not.
+    needed_patches = min(
+        int(raw.max_seq_length),
+        prompt_patches + -(-sample.target_length // patch_size),
+    )
+    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
+    try:
+        raw.set_kv_cache(
+            batch_size=b, max_seq_length=needed_patches, device=device, dtype=cache_dtype
+        )
+        with _autocast():
+            global_output = raw.megabyte_global_forward(
+                patched_ids_b,
+                input_pos=torch.arange(prompt_patches, device=device, dtype=torch.long),
+                input_pos_maxp1=prompt_patches,
+                region_ids=patched_regions_b,
+                offset_ids=patched_offsets_b,
+            )
+        global_output = global_output[:, -1]  # (B, n_embd)
+
+        generated: list[list[int]] = [[] for _ in range(b)]
+        current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+        current_region_ids: list[int] = []
+        current_offset_ids: list[int] = []
+        position = prompt_patches
+        for step in range(sample.target_length):
+            if current_tokens.size(1) == patch_size:
+                # Commit the just-completed patch: one batched global-forward step.
+                patch_regions = torch.tensor(
+                    current_region_ids, device=device, dtype=torch.long
+                ).view(1, 1, patch_size).expand(b, -1, -1)
+                patch_offsets = torch.tensor(
+                    current_offset_ids, device=device, dtype=torch.long
+                ).view(1, 1, patch_size).expand(b, -1, -1)
+                with _autocast():
+                    out = raw.megabyte_global_forward(
+                        current_tokens.view(b, 1, patch_size),
+                        input_pos=torch.tensor([position], device=device, dtype=torch.long),
+                        input_pos_maxp1=position + 1,
+                        region_ids=patch_regions,
+                        offset_ids=patch_offsets,
+                    )
+                global_output = out[:, -1]
+                position += 1
+                current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+                current_region_ids = []
+                current_offset_ids = []
+
+            with _autocast():
+                logits = raw.megabyte_local_next_logits(
+                    global_output, current_tokens
+                )[:, :BYTE_VOCAB_SIZE]
+            tokens = sample_tokens(logits, temperature, top_k, top_p)  # (B,)
+            for row, token in enumerate(tokens.tolist()):
+                generated[row].append(token)
+            current_tokens = torch.cat([current_tokens, tokens.unsqueeze(1)], dim=1)
+            current_region_ids.append(sample.generation_region_id)
+            current_offset_ids.append(sample.generation_offset_start + step)
+    finally:
+        raw.clear_kv_cache()
+    return [bytes(row) for row in generated]
 
 
 class MegabyteInference:

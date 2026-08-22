@@ -39,8 +39,8 @@ if str(_REPO_ROOT) not in sys.path:
 from litgpt.byte.data import BYTE_VOCAB_SIZE  # noqa: E402
 from litgpt.byte.megabyte_inference import (  # noqa: E402
     MegabyteInference,
+    megabyte_generate_batch,
     megabyte_max_new_bytes,
-    megabyte_prompt_patches,
 )
 from litgpt.byte.reconstruction import (  # noqa: E402
     _unwrap_model,
@@ -116,6 +116,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Repeat each (prefix, G) timing this many times to see variance.",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Skip the timing sweep. Instead, for each prefix run the sequential "
+            "(MegabyteInference) and batched megabyte generators at group_size=1, "
+            "temperature=0 (greedy) and assert byte-identical output. Only "
+            "meaningful for byte_patch_size>1 checkpoints."
+        ),
     )
     return parser.parse_args()
 
@@ -208,119 +218,6 @@ def _megabyte_generate_one(
     return bytes(generated)
 
 
-@torch.inference_mode()
-def _megabyte_generate_batch(
-    raw_model: Any,
-    sample: Any,
-    device: torch.device,
-    batch_size: int,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-) -> list[bytes] | None:
-    """Generate a full group of candidates in one batched megabyte loop.
-
-    Only valid because reconstruction-sample generation has a *deterministic*
-    region/offset schedule (fixed by sample.generation_region_id and
-    sample.generation_offset_start + step index) -- it does not depend on
-    which bytes get sampled, unlike free_run_rollout's start-code-tracking
-    schedule. That means all G candidates share identical patch metadata and
-    can run through the same global-decoder forward passes together; only the
-    sampled byte content differs per batch row. This does NOT generalize to
-    free-run generation as-is.
-    """
-    patch_size = int(raw_model.config.byte_patch_size)
-    prompt = sample.prompt_ids.to(device).unsqueeze(0)
-    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
-    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
-    patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
-        prompt, region_ids, offset_ids, patch_size
-    )
-    prompt_patches = patched_ids.size(1)
-    if prompt_patches > int(raw_model.max_seq_length):
-        return None
-    if sample.target_length > megabyte_max_new_bytes(raw_model, prompt.size(1)):
-        return None
-
-    def _autocast():
-        return torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        )
-
-    b = batch_size
-    patched_ids_b = patched_ids.expand(b, -1, -1).contiguous()
-    patched_regions_b = patched_regions.expand(b, -1, -1).contiguous()
-    patched_offsets_b = patched_offsets.expand(b, -1, -1).contiguous()
-
-    # Size the KV cache to what this generation actually needs (prompt patches
-    # plus the patches the target span will occupy), not the model's full
-    # max_seq_length. At batch_size=1 (sequential mode) the gap between "needed"
-    # and "full" is harmless; multiplied by a batch dimension of G it is not --
-    # this is what made G=16 borderline and G=32/64 OOM.
-    needed_patches = min(
-        int(raw_model.max_seq_length),
-        prompt_patches + -(-sample.target_length // patch_size),
-    )
-    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw_model.parameters()).dtype
-    try:
-        raw_model.set_kv_cache(
-            batch_size=b, max_seq_length=needed_patches, device=device, dtype=cache_dtype
-        )
-        with _autocast():
-            global_output = raw_model.megabyte_global_forward(
-                patched_ids_b,
-                input_pos=torch.arange(prompt_patches, device=device, dtype=torch.long),
-                input_pos_maxp1=prompt_patches,
-                region_ids=patched_regions_b,
-                offset_ids=patched_offsets_b,
-            )
-        global_output = global_output[:, -1]  # (B, n_embd)
-
-        generated: list[list[int]] = [[] for _ in range(b)]
-        current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
-        current_region_ids: list[int] = []
-        current_offset_ids: list[int] = []
-        position = prompt_patches
-        for step in range(sample.target_length):
-            if current_tokens.size(1) == patch_size:
-                # Commit the just-completed patch: one batched global-forward step.
-                patch_regions = torch.tensor(
-                    current_region_ids, device=device, dtype=torch.long
-                ).view(1, 1, patch_size).expand(b, -1, -1)
-                patch_offsets = torch.tensor(
-                    current_offset_ids, device=device, dtype=torch.long
-                ).view(1, 1, patch_size).expand(b, -1, -1)
-                with _autocast():
-                    out = raw_model.megabyte_global_forward(
-                        current_tokens.view(b, 1, patch_size),
-                        input_pos=torch.tensor([position], device=device, dtype=torch.long),
-                        input_pos_maxp1=position + 1,
-                        region_ids=patch_regions,
-                        offset_ids=patch_offsets,
-                    )
-                global_output = out[:, -1]
-                position += 1
-                current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
-                current_region_ids = []
-                current_offset_ids = []
-
-            with _autocast():
-                logits = raw_model.megabyte_local_next_logits(
-                    global_output, current_tokens
-                )[:, :BYTE_VOCAB_SIZE]
-            tokens = sample_tokens(logits, temperature, top_k, top_p)  # (B,)
-            for row, token in enumerate(tokens.tolist()):
-                generated[row].append(token)
-            current_tokens = torch.cat([current_tokens, tokens.unsqueeze(1)], dim=1)
-            current_region_ids.append(sample.generation_region_id)
-            current_offset_ids.append(sample.generation_offset_start + step)
-    finally:
-        raw_model.clear_kv_cache()
-    return [bytes(row) for row in generated]
-
-
 def generate_group(
     model: Any,
     sample: Any,
@@ -359,7 +256,7 @@ def generate_group(
             "batched",
         )
     if megabyte_mode == "batched":
-        candidates = _megabyte_generate_batch(
+        candidates = megabyte_generate_batch(
             raw_model, sample, device, group_size, temperature, top_k, top_p
         )
         return (candidates or [], "megabyte_batched")
@@ -374,6 +271,56 @@ def generate_group(
     return candidates, "megabyte_sequential"
 
 
+def verify_batched_generation(
+    model: Any,
+    samples: list[Any],
+    device: torch.device,
+) -> bool:
+    """Greedy-diff sequential vs. batched megabyte generation, byte-for-byte.
+
+    Runs at temperature=0 (argmax) so there is exactly one correct output per
+    prefix, then checks the batched generator (group_size=1) reproduces
+    exactly what the production sequential path (MegabyteInference) produces.
+    Only meaningful for byte_patch_size>1 checkpoints; a mismatch here means
+    the batched KV-cache/masking logic has a bug that would otherwise
+    silently corrupt every gradient computed from it.
+    """
+    raw_model = _unwrap_model(model)
+    patch_size = int(raw_model.config.byte_patch_size)
+    if patch_size <= 1:
+        print("--verify only applies to byte_patch_size>1 checkpoints; nothing to check.")
+        return True
+
+    all_ok = True
+    for sample_index, sample in enumerate(samples):
+        sequential = _megabyte_generate_one(raw_model, sample, device, 0.0, 0, 1.0)
+        batched = megabyte_generate_batch(raw_model, sample, device, 1, 0.0, 0, 1.0)
+        if sequential is None or batched is None:
+            print(f"[{sample_index}] SKIP (target_length exceeds max_seq_length)")
+            continue
+        batched_bytes = batched[0]
+        ok = sequential == batched_bytes
+        all_ok = all_ok and ok
+        status = "OK" if ok else "MISMATCH"
+        print(
+            f"[{sample_index}] {status} target_length={sample.target_length} "
+            f"frame_index={sample.frame_index}",
+            flush=True,
+        )
+        if not ok:
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(sequential, batched_bytes)) if a != b),
+                min(len(sequential), len(batched_bytes)),
+            )
+            print(
+                f"    lengths: sequential={len(sequential)} batched={len(batched_bytes)}; "
+                f"first differing byte at index {first_diff}: "
+                f"{sequential[first_diff:first_diff + 8]!r} vs {batched_bytes[first_diff:first_diff + 8]!r}",
+                flush=True,
+            )
+    return all_ok
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -385,6 +332,11 @@ def main() -> None:
     print(f"Benchmarking on {len(samples)} prefixes", flush=True)
 
     model = load_model(args.checkpoint_dir, device)
+
+    if args.verify:
+        ok = verify_batched_generation(model, samples, device)
+        print("\nVERIFY " + ("PASSED" if ok else "FAILED"), flush=True)
+        sys.exit(0 if ok else 1)
 
     rows: list[dict[str, Any]] = []
     for sample_index, sample in enumerate(samples):

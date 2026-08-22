@@ -29,6 +29,7 @@ from litgpt.byte.data import (
     ByteDataConfig,
     ByteDataModule,
 )
+from litgpt.byte.megabyte_inference import sample_tokens
 from litgpt.byte.reconstruction import (
     ReconstructionSample,
     _unwrap_model,
@@ -238,26 +239,6 @@ def generate_bytes(
     finally:
         raw_model.clear_kv_cache()
     return [bytes(candidate) for candidate in generated]
-
-
-def sample_tokens(logits: Tensor, temperature: float, top_k: int, top_p: float) -> Tensor:
-    if temperature <= 0:
-        return logits.argmax(dim=-1)
-    logits = logits.float() / temperature
-    if top_k > 0:
-        threshold = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values[:, -1:]
-        logits = logits.masked_fill(logits < threshold, float("-inf"))
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        sorted_probs = F.softmax(sorted_logits, dim=-1)
-        cumulative = sorted_probs.cumsum(dim=-1)
-        remove = cumulative > top_p
-        remove[:, 0] = False
-        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-        logits = torch.full_like(logits, float("-inf"))
-        logits.scatter_(1, sorted_indices, sorted_logits)
-    probabilities = F.softmax(logits, dim=-1)
-    return torch.multinomial(probabilities, num_samples=1).squeeze(1)
 
 
 @torch.inference_mode()
