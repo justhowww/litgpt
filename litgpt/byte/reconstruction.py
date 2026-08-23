@@ -23,6 +23,7 @@ from litgpt.byte.data import (
     SEQ_EOS_ID,
     VCL_NAL_TYPES,
     ByteSliceDataset,
+    ByteStreamWindowDataset,
 )
 
 
@@ -95,6 +96,90 @@ class ReconstructionVisualization:
     statuses: dict[str, str]
 
 
+def _select_window_fim_samples(
+    base_dataset: ByteStreamWindowDataset,
+    indices: list[int],
+    num_samples: int,
+    max_target_bytes: int,
+    *,
+    force_eos_stopping: bool,
+) -> list[ReconstructionSample]:
+    """Deterministic window-mode FIM samples, addressed into the source file.
+
+    ``ByteStreamWindowDataset``'s hole geometry (``frame_lo``/``frame_hi``/
+    ``split``/``gap``) is WINDOW-relative -- offset 0 is the first byte of
+    ``nals[start_nal]`` -- not a byte range within one NAL the way
+    ``ByteSliceDataset`` FIM samples are. Rebasing to absolute file offsets
+    (``window_start_abs = nals[start_nal].start``) lets the resulting
+    ``ReconstructionSample`` reuse ``replace_target_nal``/``decode_frame``
+    unchanged: ``target_start=window_start_abs``,
+    ``replacement_start/end=split/split+gap`` (window-relative, exactly what
+    ``replace_target_nal`` adds onto ``target_start`` for the "fim" task).
+
+    The prompt/target split cannot use the generic "first supervised label"
+    rule (as the ``ByteSliceDataset`` path below does): under
+    ``fim_loss_scope="full"`` nearly every position is supervised, not just
+    the missing span. Instead the missing span's start is computed directly
+    from the known hole geometry and marker layout (see
+    ``ByteStreamWindowDataset._build_fim_item``), which is scope-independent.
+    """
+    use_eos = bool(getattr(base_dataset, "use_eos", False))
+    is_psm = base_dataset.fim_format == "psm"
+    selected: list[ReconstructionSample] = []
+    for idx in indices:
+        sample = base_dataset.samples[idx]
+        data = sample.h264_path.read_bytes()
+        candidates = base_dataset._fim_candidates(sample, data)
+        if not candidates:
+            continue
+        rng = random.Random(base_dataset.seed + idx)
+        frame_lo, frame_hi, split, gap = base_dataset._draw_hole_spec(candidates, rng)
+        target_length = gap
+        if target_length <= 0 or target_length > max_target_bytes:
+            continue
+
+        item = base_dataset.fim_item_for_hole(idx, (frame_lo, frame_hi, split, gap))
+        # Marker layout from _build_fim_item's `pieces`: psm inserts FIM_BEGIN
+        # and FIM_HOLE (2 extra bytes) before middle_in; bridge inserts none.
+        prompt_end = (frame_hi - gap + 2) if is_psm else (frame_hi - gap)
+
+        nals = base_dataset.nal_index[str(sample.h264_path)]
+        window_start_abs = nals[sample.start_nal].start
+        cursor = 0
+        target_nal_index = sample.start_nal
+        for i in range(sample.start_nal, sample.end_nal):
+            if cursor == frame_lo:
+                target_nal_index = i
+                break
+            cursor += nals[i].end - nals[i].start
+        frame_index = sum(
+            nal.nal_type in VCL_NAL_TYPES for nal in nals[:target_nal_index]
+        )
+
+        selected.append(
+            ReconstructionSample(
+                h264_path=sample.h264_path,
+                target_start=window_start_abs,
+                target_end=window_start_abs + frame_hi,
+                target_nal_index=target_nal_index,
+                frame_index=frame_index,
+                prompt_ids=item["input_ids"][:prompt_end].clone(),
+                prompt_region_ids=item["region_ids"][:prompt_end].clone(),
+                prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
+                target_length=target_length,
+                task="fim",
+                replacement_start=split,
+                replacement_end=split + gap,
+                generation_region_id=REGION_BRIDGE,
+                generation_offset_start=0,
+                stop_token=SEQ_EOS_ID if use_eos or force_eos_stopping else None,
+            )
+        )
+        if len(selected) >= num_samples:
+            break
+    return selected
+
+
 def select_reconstruction_samples(
     dataset: object,
     num_samples: int,
@@ -114,6 +199,21 @@ def select_reconstruction_samples(
     else:
         base_dataset = dataset
         indices = list(range(len(dataset))) if hasattr(dataset, "__len__") else []
+    if isinstance(base_dataset, ByteStreamWindowDataset):
+        if task != "fim":
+            # Window-mode AR has no single-NAL target to splice/decode (its
+            # target is the whole multi-frame window, generated free-run) --
+            # that needs litgpt.byte.free_run_eval's rollout+scoring path, not
+            # this fixed-schedule splice-and-decode one. Graceful no-op here,
+            # matching this function's existing "wrong dataset type" contract.
+            return []
+        return _select_window_fim_samples(
+            base_dataset,
+            indices,
+            num_samples,
+            max_target_bytes,
+            force_eos_stopping=force_eos_stopping,
+        )
     if not isinstance(base_dataset, ByteSliceDataset):
         return []
 
