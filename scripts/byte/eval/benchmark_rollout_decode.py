@@ -67,6 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-prefixes", type=int, default=8)
     parser.add_argument("--max-manifest-rows", type=int, default=0)
     parser.add_argument("--task", choices=("ar", "fim"), default="ar")
+    parser.add_argument(
+        "--dataset-mode",
+        choices=("slice", "window"),
+        default="slice",
+        help=(
+            "Must match the dataset_mode the checkpoint was trained with. "
+            "Per-macroblock-sliced corpora train FIM with 'window' "
+            "(ByteStreamWindowDataset) because a gap spans many single-MB "
+            "NALs; 'slice' (the default, ByteSliceDataset) has no such "
+            "notion and will silently select zero FIM samples if the "
+            "checkpoint actually needs window mode."
+        ),
+    )
+    parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument("--fixed-fim-holes", action="store_true")
+    parser.add_argument("--fixed-fim-holes-per-window", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--split-by-video", action="store_true")
     parser.add_argument("--seed", type=int, default=42)

@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=100)
     parser.add_argument("--num-visualizations", type=int, default=8)
     parser.add_argument("--task", choices=("fim",), default="fim")
+    parser.add_argument("--dataset-mode", choices=("slice", "window"), default="slice")
+    parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument("--fixed-fim-holes", action="store_true")
+    parser.add_argument("--fixed-fim-holes-per-window", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--split-by-video", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -139,6 +143,16 @@ def build_eval_samples(args: argparse.Namespace) -> list[ReconstructionSample]:
         val_fraction=args.val_fraction,
         split_by_video=args.split_by_video,
         seed=args.seed,
+        # Default "slice" builds ByteSliceDataset, which has no notion of a
+        # gap spanning many NALs. Per-macroblock-sliced corpora train FIM with
+        # --dataset-mode window (ByteStreamWindowDataset) specifically because
+        # a 64-1400B gap there spans ~100+ single-MB NALs; evaluating such a
+        # checkpoint without the matching mode here silently selects zero (or
+        # architecturally mismatched) FIM samples.
+        dataset_mode=getattr(args, "dataset_mode", "slice"),
+        window_min_frames=getattr(args, "window_min_frames", 2),
+        fixed_fim_holes=getattr(args, "fixed_fim_holes", False),
+        fixed_fim_holes_per_window=getattr(args, "fixed_fim_holes_per_window", 0),
     )
     data = ByteDataModule(
         manifest_path=args.manifest,
