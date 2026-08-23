@@ -36,10 +36,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from litgpt.byte.data import BYTE_VOCAB_SIZE  # noqa: E402
+from litgpt.byte.data import BYTE_VOCAB_SIZE, SEQ_EOS_ID  # noqa: E402
 from litgpt.byte.megabyte_inference import (  # noqa: E402
+    GeneratedCandidate,
     MegabyteInference,
     megabyte_generate_batch,
+    megabyte_generate_batch_eos,
     megabyte_max_new_bytes,
 )
 from litgpt.byte.reconstruction import (  # noqa: E402
@@ -234,6 +236,55 @@ def _megabyte_generate_one(
     return bytes(generated)
 
 
+@torch.inference_mode()
+def _megabyte_generate_one_eos(
+    raw_model: Any,
+    sample: Any,
+    device: torch.device,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    budget_multiplier: float = 2.0,
+) -> GeneratedCandidate | None:
+    """Sequential single-candidate learned-EOS reference, for --verify.
+
+    Mirrors megabyte_generate_batch_eos's stopping/sampling exactly (257-way
+    byte+EOS sample, stop without feeding EOS back) but one candidate at a
+    time via MegabyteInference, so it can serve as ground truth for
+    verifying the batched-EOS path.
+    """
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    mi = MegabyteInference(raw_model, prompt, region_ids, offset_ids, device)
+    generated: list[int] = []
+    stopped = False
+    try:
+        max_new = min(int(budget_multiplier * sample.target_length), mi.max_new_bytes)
+        if max_new <= 0:
+            return None
+        for generated_idx in range(max_new):
+            logits = mi.next_logits()
+            allowed_logits = torch.cat(
+                (logits[:, :BYTE_VOCAB_SIZE], logits[:, SEQ_EOS_ID : SEQ_EOS_ID + 1]),
+                dim=-1,
+            )
+            sampled = sample_tokens(allowed_logits, temperature, top_k, top_p)
+            token = int(sampled.item())
+            if token == BYTE_VOCAB_SIZE:
+                stopped = True
+                break
+            generated.append(token)
+            mi.append(
+                token,
+                sample.generation_region_id,
+                sample.generation_offset_start + generated_idx,
+            )
+    finally:
+        mi.close()
+    return GeneratedCandidate(data=bytes(generated), stopped=stopped)
+
+
 def generate_group(
     model: Any,
     sample: Any,
@@ -287,39 +338,23 @@ def generate_group(
     return candidates, "megabyte_sequential"
 
 
-def verify_batched_generation(
-    model: Any,
-    samples: list[Any],
-    device: torch.device,
+def _verify_oracle_length(
+    raw_model: Any, samples: list[Any], device: torch.device
 ) -> bool:
-    """Greedy-diff sequential vs. batched megabyte generation, byte-for-byte.
-
-    Runs at temperature=0 (argmax) so there is exactly one correct output per
-    prefix, then checks the batched generator (group_size=1) reproduces
-    exactly what the production sequential path (MegabyteInference) produces.
-    Only meaningful for byte_patch_size>1 checkpoints; a mismatch here means
-    the batched KV-cache/masking logic has a bug that would otherwise
-    silently corrupt every gradient computed from it.
-    """
-    raw_model = _unwrap_model(model)
-    patch_size = int(raw_model.config.byte_patch_size)
-    if patch_size <= 1:
-        print("--verify only applies to byte_patch_size>1 checkpoints; nothing to check.")
-        return True
-
+    """Greedy-diff sequential vs. batched oracle-length generation, byte-for-byte."""
     all_ok = True
     for sample_index, sample in enumerate(samples):
         sequential = _megabyte_generate_one(raw_model, sample, device, 0.0, 0, 1.0)
         batched = megabyte_generate_batch(raw_model, sample, device, 1, 0.0, 0, 1.0)
         if sequential is None or batched is None:
-            print(f"[{sample_index}] SKIP (target_length exceeds max_seq_length)")
+            print(f"[oracle {sample_index}] SKIP (target_length exceeds max_seq_length)")
             continue
         batched_bytes = batched[0]
         ok = sequential == batched_bytes
         all_ok = all_ok and ok
         status = "OK" if ok else "MISMATCH"
         print(
-            f"[{sample_index}] {status} target_length={sample.target_length} "
+            f"[oracle {sample_index}] {status} target_length={sample.target_length} "
             f"frame_index={sample.frame_index}",
             flush=True,
         )
@@ -335,6 +370,79 @@ def verify_batched_generation(
                 flush=True,
             )
     return all_ok
+
+
+def _verify_learned_eos(
+    raw_model: Any, samples: list[Any], device: torch.device
+) -> bool:
+    """Greedy-diff sequential vs. batched learned-EOS generation, byte-for-byte.
+
+    Also checks the two paths agree on WHETHER (not just where) each
+    candidate stopped via EOS -- a mismatch there means the batched path's
+    active/stopped bookkeeping has drifted from the sequential reference
+    even if the emitted bytes happen to still match up to that point.
+    """
+    all_ok = True
+    for sample_index, sample in enumerate(samples):
+        sequential = _megabyte_generate_one_eos(raw_model, sample, device, 0.0, 0, 1.0)
+        batched = megabyte_generate_batch_eos(raw_model, sample, device, 1, 0.0, 0, 1.0)
+        if sequential is None or batched is None:
+            print(f"[eos {sample_index}] SKIP (target_length exceeds max_seq_length)")
+            continue
+        batched_candidate = batched[0]
+        ok = (
+            sequential.data == batched_candidate.data
+            and sequential.stopped == batched_candidate.stopped
+        )
+        all_ok = all_ok and ok
+        status = "OK" if ok else "MISMATCH"
+        print(
+            f"[eos {sample_index}] {status} target_length={sample.target_length} "
+            f"frame_index={sample.frame_index} "
+            f"stopped(seq/batched)={sequential.stopped}/{batched_candidate.stopped}",
+            flush=True,
+        )
+        if not ok:
+            seq_bytes, batched_bytes = sequential.data, batched_candidate.data
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(seq_bytes, batched_bytes)) if a != b),
+                min(len(seq_bytes), len(batched_bytes)),
+            )
+            print(
+                f"    lengths: sequential={len(seq_bytes)} batched={len(batched_bytes)}; "
+                f"first differing byte at index {first_diff}: "
+                f"{seq_bytes[first_diff:first_diff + 8]!r} vs {batched_bytes[first_diff:first_diff + 8]!r}",
+                flush=True,
+            )
+    return all_ok
+
+
+def verify_batched_generation(
+    model: Any,
+    samples: list[Any],
+    device: torch.device,
+) -> bool:
+    """Greedy-diff sequential vs. batched megabyte generation, byte-for-byte.
+
+    Runs at temperature=0 (argmax) so there is exactly one correct output per
+    prefix, then checks the batched generators (group_size=1) reproduce
+    exactly what the production sequential paths (MegabyteInference)
+    produce, for both the oracle-length and learned-EOS generation modes.
+    Only meaningful for byte_patch_size>1 checkpoints; a mismatch here means
+    the batched KV-cache/masking logic has a bug that would otherwise
+    silently corrupt every gradient computed from it.
+    """
+    raw_model = _unwrap_model(model)
+    patch_size = int(raw_model.config.byte_patch_size)
+    if patch_size <= 1:
+        print("--verify only applies to byte_patch_size>1 checkpoints; nothing to check.")
+        return True
+
+    oracle_ok = _verify_oracle_length(raw_model, samples, device)
+    eos_ok = _verify_learned_eos(raw_model, samples, device)
+    print(f"\noracle-length: {'PASSED' if oracle_ok else 'FAILED'}")
+    print(f"learned-eos:   {'PASSED' if eos_ok else 'FAILED'}")
+    return oracle_ok and eos_ok
 
 
 def main() -> None:

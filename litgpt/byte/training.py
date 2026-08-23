@@ -285,26 +285,24 @@ class ByteTrainingRuntime:
 
         raw_model = _unwrap_model(model)
         patch_size = int(raw_model.config.byte_patch_size)
-        inputs, labels = build_group_patch_inputs(
+        inputs, labels, supervised = build_group_patch_inputs(
             prepared.sample, prepared.candidates, patch_size, fabric.device
         )
 
         with torch.no_grad(), fabric.autocast():
-            old_gathered, supervised = group_token_log_probabilities(model, inputs, labels)
-            old_gathered = old_gathered.detach()
+            old_gathered = group_token_log_probabilities(model, inputs, labels).detach()
             reference_gathered = None
             if self.reference_model is not None and config.kl_coeff > 0:
-                reference_gathered, _ = group_token_log_probabilities(
+                reference_gathered = group_token_log_probabilities(
                     self.reference_model, inputs, labels
-                )
-                reference_gathered = reference_gathered.detach()
+                ).detach()
 
         loss_metrics: dict[str, float] = {}
         final_loss = 0.0
         for _ in range(config.mu):
             optimizer.zero_grad()
             with fabric.autocast():
-                gathered, _ = group_token_log_probabilities(model, inputs, labels)
+                gathered = group_token_log_probabilities(model, inputs, labels)
                 loss, loss_metrics = grpo_clipped_loss(
                     gathered,
                     old_gathered,

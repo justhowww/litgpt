@@ -15,7 +15,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from litgpt.byte.data import BYTE_VOCAB_SIZE, PAD_ID, REGION_PAD, patch_byte_sample
+from litgpt.byte.data import (
+    BYTE_VOCAB_SIZE,
+    PAD_ID,
+    REGION_PAD,
+    SEQ_EOS_ID,
+    patch_byte_sample,
+)
+
+
+@dataclass(frozen=True)
+class GeneratedCandidate:
+    """One batched-generation candidate. ``data`` excludes the EOS marker itself."""
+
+    data: bytes
+    stopped: bool
 
 
 def sample_tokens(logits: Tensor, temperature: float, top_k: int, top_p: float) -> Tensor:
@@ -260,6 +274,152 @@ def megabyte_generate_batch(
     finally:
         raw.clear_kv_cache()
     return [bytes(row) for row in generated]
+
+
+@torch.inference_mode()
+def megabyte_generate_batch_eos(
+    raw: nn.Module,
+    sample,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    budget_multiplier: float = 2.0,
+) -> list[GeneratedCandidate] | None:
+    """Batched generation with per-candidate learned-EOS stopping.
+
+    Same fixed-schedule assumption as :func:`megabyte_generate_batch` (region
+    and offset ids depend only on step index, not on sampled content -- valid
+    for reconstruction-sample targets), but the true target length is no
+    longer assumed known: each candidate samples from a 257-way distribution
+    (256 bytes + EOS) and may stop at its own length, up to
+    ``budget_multiplier * sample.target_length`` bytes. Mirrors
+    ``litgpt.byte.mrt.sample_candidates``'s active/stopped bookkeeping,
+    adapted to advance the batch through this generator's shared
+    patch-commit schedule instead of a flat per-token forward.
+
+    Stopped rows are excluded from further sampling/appending, and their
+    sampled EOS token is never fed back into the model (fed as byte 0
+    instead, discarded) -- the shared patch-commit machinery still advances
+    every row in lockstep regardless of who has stopped, since all rows
+    share one KV cache and one loop.
+    """
+    patch_size = int(raw.config.byte_patch_size)
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
+        prompt, region_ids, offset_ids, patch_size
+    )
+    prompt_patches = patched_ids.size(1)
+    if prompt_patches > int(raw.max_seq_length):
+        return None
+    max_new = min(
+        int(budget_multiplier * sample.target_length),
+        megabyte_max_new_bytes(raw, prompt.size(1)),
+    )
+    if max_new <= 0:
+        return None
+
+    def _autocast():
+        return torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        )
+
+    b = batch_size
+    patched_ids_b = patched_ids.expand(b, -1, -1).contiguous()
+    patched_regions_b = patched_regions.expand(b, -1, -1).contiguous()
+    patched_offsets_b = patched_offsets.expand(b, -1, -1).contiguous()
+
+    needed_patches = min(
+        int(raw.max_seq_length),
+        prompt_patches + -(-max_new // patch_size),
+    )
+    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
+    try:
+        raw.set_kv_cache(
+            batch_size=b, max_seq_length=needed_patches, device=device, dtype=cache_dtype
+        )
+        with _autocast():
+            global_output = raw.megabyte_global_forward(
+                patched_ids_b,
+                input_pos=torch.arange(prompt_patches, device=device, dtype=torch.long),
+                input_pos_maxp1=prompt_patches,
+                region_ids=patched_regions_b,
+                offset_ids=patched_offsets_b,
+            )
+        global_output = global_output[:, -1]  # (B, n_embd)
+
+        generated: list[list[int]] = [[] for _ in range(b)]
+        active = torch.ones(b, dtype=torch.bool, device=device)
+        stopped = torch.zeros(b, dtype=torch.bool, device=device)
+        current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+        current_region_ids: list[int] = []
+        current_offset_ids: list[int] = []
+        position = prompt_patches
+        for step in range(max_new):
+            if current_tokens.size(1) == patch_size:
+                patch_regions = torch.tensor(
+                    current_region_ids, device=device, dtype=torch.long
+                ).view(1, 1, patch_size).expand(b, -1, -1)
+                patch_offsets = torch.tensor(
+                    current_offset_ids, device=device, dtype=torch.long
+                ).view(1, 1, patch_size).expand(b, -1, -1)
+                with _autocast():
+                    out = raw.megabyte_global_forward(
+                        current_tokens.view(b, 1, patch_size),
+                        input_pos=torch.tensor([position], device=device, dtype=torch.long),
+                        input_pos_maxp1=position + 1,
+                        region_ids=patch_regions,
+                        offset_ids=patch_offsets,
+                    )
+                global_output = out[:, -1]
+                position += 1
+                current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+                current_region_ids = []
+                current_offset_ids = []
+
+            with _autocast():
+                local_logits = raw.megabyte_local_next_logits(global_output, current_tokens)
+            allowed_logits = torch.cat(
+                (
+                    local_logits[:, :BYTE_VOCAB_SIZE],
+                    local_logits[:, SEQ_EOS_ID : SEQ_EOS_ID + 1],
+                ),
+                dim=-1,
+            )
+            sampled = sample_tokens(allowed_logits, temperature, top_k, top_p)  # (B,)
+            sampled = torch.where(
+                sampled == BYTE_VOCAB_SIZE,
+                torch.full_like(sampled, SEQ_EOS_ID),
+                sampled,
+            )
+
+            active_indices = active.nonzero(as_tuple=False).flatten()
+            for row in active_indices.tolist():
+                token = int(sampled[row])
+                if token == SEQ_EOS_ID:
+                    stopped[row] = True
+                    active[row] = False
+                else:
+                    generated[row].append(token)
+            if not bool(active.any()) or step == max_new - 1:
+                break
+
+            fed_tokens = torch.where(active, sampled, torch.zeros_like(sampled))
+            current_tokens = torch.cat([current_tokens, fed_tokens.unsqueeze(1)], dim=1)
+            current_region_ids.append(sample.generation_region_id)
+            current_offset_ids.append(sample.generation_offset_start + step)
+    finally:
+        raw.clear_kv_cache()
+
+    return [
+        GeneratedCandidate(data=bytes(row), stopped=bool(stopped[i]))
+        for i, row in enumerate(generated)
+    ]
 
 
 class MegabyteInference:

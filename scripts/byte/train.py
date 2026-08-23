@@ -370,6 +370,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--grpo-clip-range", type=float, default=0.2)
+    parser.add_argument(
+        "--grpo-learned-eos",
+        action="store_true",
+        help=(
+            "Rollouts stop via the model's own SEQ_EOS prediction (unknown "
+            "length, widened generation budget) instead of oracle-length "
+            "generation (told the true target length, EOS masked out). "
+            "Requires the checkpoint to have been trained with --use-eos."
+        ),
+    )
+    parser.add_argument(
+        "--grpo-generation-budget-multiplier",
+        type=float,
+        default=2.0,
+        help="Learned-EOS generation budget, as a multiple of the true target length.",
+    )
     parser.add_argument("--grpo-timeout-sec", type=int, default=30)
     parser.add_argument("--grpo-decode-workers", type=int, default=8)
     parser.add_argument("--grpo-ffmpeg-binary", default="ffmpeg")
@@ -459,6 +475,8 @@ def main() -> None:
         raise ValueError(
             "--grpo-kl-coeff > 0 requires --grpo-reference-checkpoint-dir"
         )
+    if args.grpo_interval > 0 and args.grpo_learned_eos and not args.use_eos:
+        raise ValueError("--grpo-learned-eos requires --use-eos")
     # Window FIM's hole spans many NALs (on a slice-max-mbs=1 corpus a 64-1400 byte
     # hole covers ~100+ of them), so the window-AR offset convention -- arange within
     # each NAL, reset at every boundary -- has no coherent value across the generated
@@ -635,6 +653,8 @@ def main() -> None:
         decode_failure_reward=args.grpo_decode_failure_reward,
         mu=args.grpo_mu,
         clip_range=args.grpo_clip_range,
+        learned_eos=args.grpo_learned_eos,
+        generation_budget_multiplier=args.grpo_generation_budget_multiplier,
         timeout_sec=args.grpo_timeout_sec,
         decode_workers=args.grpo_decode_workers,
         ffmpeg_binary=args.grpo_ffmpeg_binary,
