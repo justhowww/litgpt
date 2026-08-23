@@ -27,6 +27,7 @@ from litgpt.byte.grpo import (
     group_token_log_probabilities,
     grpo_clipped_loss,
     prepare_grpo_step,
+    prepare_grpo_step_ar,
     should_run_grpo as _should_run_grpo,
 )
 from litgpt.byte.mrt import (
@@ -71,7 +72,7 @@ class ByteTrainingRuntime:
     free_run_config: FreeRunEvalConfig | None = None
     free_run_samples: list[FreeRunSample] = field(default_factory=list)
     grpo_config: GRPOConfig | None = None
-    grpo_ar_pool: list[ReconstructionSample] = field(default_factory=list)
+    grpo_ar_pool: list[FreeRunSample] = field(default_factory=list)
     grpo_fim_pool: list[ReconstructionSample] = field(default_factory=list)
     # Frozen initial-policy copy for the GRPO KL penalty. Populated by the
     # caller (litgpt.pretrain.main) once weights are loaded, since building it
@@ -157,17 +158,26 @@ class ByteTrainingRuntime:
                 f"{mrt_config.interval} steps, risk={mrt_config.risk_mode}"
             )
 
-        grpo_ar_pool: list[ReconstructionSample] = []
+        grpo_ar_pool: list[FreeRunSample] = []
         grpo_fim_pool: list[ReconstructionSample] = []
         if grpo_config is not None and grpo_config.enabled:
             grpo_config.validate()
             if fabric.world_size != 1:
                 raise ValueError("Online byte GRPO currently supports one device only")
-            grpo_ar_pool = select_reconstruction_samples(
+            # AR reuses free_run_eval's clip selection (prefix_frames/cont_frames/
+            # slice_layout mirror FreeRunEvalConfig's own defaults); only its
+            # interval/num_clips fields are read here, purely as a pool-building
+            # utility -- the resulting samples are scored via
+            # litgpt.byte.grpo.prepare_grpo_step_ar, not the free-run probe.
+            grpo_ar_pool = prepare_free_run_samples(
                 train_dataset,
-                grpo_config.ar_pool_size,
-                grpo_config.max_target_bytes,
-                "ar",
+                FreeRunEvalConfig(
+                    interval=1,
+                    num_clips=grpo_config.ar_pool_size,
+                    prefix_frames=grpo_config.ar_prefix_frames,
+                    cont_frames=grpo_config.ar_cont_frames,
+                    slice_layout=grpo_config.ar_slice_layout,
+                ),
             )
             grpo_fim_pool = select_reconstruction_samples(
                 train_dataset,
@@ -180,9 +190,9 @@ class ByteTrainingRuntime:
                     "GRPO is enabled but no eligible AR and/or FIM samples were found"
                 )
             if fabric.global_rank == 0:
-                save_reconstruction_sample_manifest(
-                    grpo_ar_pool, out_dir / "grpo_training_samples_ar.json"
-                )
+                # AR pool has no ReconstructionSample-shaped manifest writer
+                # (FreeRunSample's fields don't match); FIM pool keeps its
+                # existing manifest for debuggability.
                 save_reconstruction_sample_manifest(
                     grpo_fim_pool, out_dir / "grpo_training_samples_fim.json"
                 )
@@ -279,14 +289,24 @@ class ByteTrainingRuntime:
         pool_name = "ar" if update_index % 2 == 0 else "fim"
         sample = pool[(update_index // 2) % len(pool)]
 
-        prepared = prepare_grpo_step(model, sample, config, fabric.device)
+        if pool_name == "ar":
+            prepared = prepare_grpo_step_ar(model, sample, config, fabric.device)
+        else:
+            prepared = prepare_grpo_step(model, sample, config, fabric.device)
         if prepared is None:
             return {"grpo/skipped": 1.0, "grpo/pool": pool_name}
 
         raw_model = _unwrap_model(model)
         patch_size = int(raw_model.config.byte_patch_size)
+        # AR stops on a structural frame-count condition, not a sampled EOS
+        # token -- there is nothing to append to a stopped AR candidate's
+        # target sequence, unlike FIM's learned-EOS stopping.
         inputs, labels, supervised = build_group_patch_inputs(
-            prepared.sample, prepared.candidates, patch_size, fabric.device
+            prepared.sample,
+            prepared.candidates,
+            patch_size,
+            fabric.device,
+            append_eos_on_stop=(pool_name != "ar"),
         )
 
         with torch.no_grad(), fabric.autocast():

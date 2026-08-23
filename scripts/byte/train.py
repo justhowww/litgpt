@@ -386,6 +386,24 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Learned-EOS generation budget, as a multiple of the true target length.",
     )
+    parser.add_argument(
+        "--grpo-ar-prefix-frames",
+        type=int,
+        default=8,
+        help="Window-mode AR pool: real frames of clean prefix per clip.",
+    )
+    parser.add_argument(
+        "--grpo-ar-cont-frames",
+        type=int,
+        default=4,
+        help="Window-mode AR pool: target continuation frame count per rollout.",
+    )
+    parser.add_argument(
+        "--grpo-ar-slice-layout",
+        choices=SLICE_LAYOUTS,
+        default=SLICE_LAYOUT_MACROBLOCK,
+        help="Window-mode AR pool: slice layout for frame-boundary detection.",
+    )
     parser.add_argument("--grpo-timeout-sec", type=int, default=30)
     parser.add_argument("--grpo-decode-workers", type=int, default=8)
     parser.add_argument("--grpo-ffmpeg-binary", default="ffmpeg")
@@ -655,6 +673,9 @@ def main() -> None:
         clip_range=args.grpo_clip_range,
         learned_eos=args.grpo_learned_eos,
         generation_budget_multiplier=args.grpo_generation_budget_multiplier,
+        ar_prefix_frames=args.grpo_ar_prefix_frames,
+        ar_cont_frames=args.grpo_ar_cont_frames,
+        ar_slice_layout=args.grpo_ar_slice_layout,
         timeout_sec=args.grpo_timeout_sec,
         decode_workers=args.grpo_decode_workers,
         ffmpeg_binary=args.grpo_ffmpeg_binary,

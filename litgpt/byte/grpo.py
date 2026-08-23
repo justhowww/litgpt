@@ -32,11 +32,18 @@ from __future__ import annotations
 import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor, nn
 
+from litgpt.byte import h264_mask as HM
 from litgpt.byte.data import BYTE_VOCAB_SIZE, IGNORE_INDEX, REGION_PAD, SEQ_EOS_ID
+from litgpt.byte.free_run_eval import (
+    FreeRunSample,
+    _survival_and_validity,
+    megabyte_generate_batch_frames,
+)
 from litgpt.byte.megabyte_inference import (
     GeneratedCandidate,
     megabyte_generate_batch,
@@ -86,6 +93,14 @@ class GRPOConfig:
     # out). Requires the checkpoint to have been trained with --use-eos.
     learned_eos: bool = False
     generation_budget_multiplier: float = 2.0
+    # Window-mode AR pool: reuses litgpt.byte.free_run_eval's clip selection
+    # (prefix_frames/cont_frames/slice_layout mirror FreeRunEvalConfig's
+    # defaults) via megabyte_generate_batch_frames, which stops each
+    # candidate independently once it closes ar_cont_frames real frames.
+    # Only valid for checkpoints with region/offset conditioning disabled.
+    ar_prefix_frames: int = 8
+    ar_cont_frames: int = 4
+    ar_slice_layout: str = "macroblock"
 
     @property
     def enabled(self) -> bool:
@@ -116,13 +131,17 @@ class GRPOConfig:
             raise ValueError("GRPO clip_range must be in (0, 1)")
         if self.generation_budget_multiplier <= 1:
             raise ValueError("GRPO generation budget multiplier must exceed 1")
+        if self.ar_prefix_frames <= 0 or self.ar_cont_frames <= 0:
+            raise ValueError("GRPO AR prefix/continuation frame counts must be positive")
+        if self.ar_slice_layout not in HM.SLICE_LAYOUTS:
+            raise ValueError(f"GRPO AR slice layout must be one of {HM.SLICE_LAYOUTS}")
 
 
 @dataclass(frozen=True)
 class PreparedGRPOStep:
     """Decoder-scored candidate group ready for a batched scoring forward."""
 
-    sample: ReconstructionSample
+    sample: ReconstructionSample | FreeRunSample
     task: str
     candidates: list[GeneratedCandidate]
     rewards: Tensor
@@ -277,23 +296,168 @@ def prepare_grpo_step(
     )
 
 
+def candidate_reward_ar(
+    stream: bytes,
+    sample: FreeRunSample,
+    references: list[Tensor | None],
+    candidate: GeneratedCandidate,
+    config: GRPOConfig,
+) -> tuple[float, bool, float | None]:
+    """Parse, splice, decode, and score one AR continuation candidate.
+
+    Mirrors ``candidate_reward``'s shape (reward, decoded, psnr) but scores
+    potentially several continuation frames, not one. Uses
+    ``_survival_and_validity`` (cheap, no ffmpeg) for frame-closure counting
+    first: a candidate that never closed any valid frame, or that ran to
+    budget without closing the target frame count (``not candidate.stopped``
+    -- structurally the AR analog of FIM's no-EOS case), gets the same
+    decode-failure floor. Otherwise splices the generated continuation in
+    (truncated to ``result.survival`` -- bytes before any post-prefix
+    desync) and decode+PSNRs whichever frames both parsed clean and have a
+    successfully-decoded ground-truth reference, averaging their PSNR.
+    """
+    if not candidate.stopped:
+        return config.decode_failure_reward, False, None
+    result = _survival_and_validity(sample.prefix_bytes, candidate.data, sample.cont_frames)
+    if result.valid_cont == 0:
+        return config.decode_failure_reward, False, None
+
+    candidate_stream = (
+        stream[: sample.prefix_end_abs]
+        + candidate.data[: result.survival]
+        + stream[sample.gt_end_abs :]
+    )
+    psnrs: list[float] = []
+    for k in range(result.valid_cont):
+        reference = references[k] if k < len(references) else None
+        if reference is None:
+            continue
+        frame, status = decode_frame(
+            candidate_stream,
+            sample.frame_index_base + k,
+            config.ffmpeg_binary,
+            config.timeout_sec,
+            strict_syntax=True,
+        )
+        if frame is None or frame.shape != reference.shape:
+            continue
+        psnr = image_psnr(reference, frame)
+        psnrs.append(config.psnr_cap if math.isinf(psnr) else psnr)
+    if not psnrs:
+        return config.decode_failure_reward, False, None
+    mean_psnr = sum(psnrs) / len(psnrs)
+    normalized = max(0.0, min(mean_psnr, config.psnr_cap)) / config.psnr_cap
+    return normalized, True, mean_psnr
+
+
+@torch.inference_mode()
+def prepare_grpo_step_ar(
+    model: nn.Module,
+    sample: FreeRunSample,
+    config: GRPOConfig,
+    device: torch.device,
+) -> PreparedGRPOStep | None:
+    """Sample an AR group, decode-score every candidate, and compute advantages.
+
+    Mirrors ``prepare_grpo_step``'s shape. Ground-truth reference frames are
+    decoded once per group (not per candidate) since they don't depend on
+    the candidate; ``references[k] is None`` short-circuits scoring for
+    continuation frame ``k`` in every candidate that reaches it.
+    """
+    raw_model = _unwrap_model(model)
+    stream = Path(sample.h264_path).read_bytes()
+    references: list[Tensor | None] = []
+    for k in range(sample.cont_frames):
+        frame, _ = decode_frame(
+            stream,
+            sample.frame_index_base + k,
+            config.ffmpeg_binary,
+            config.timeout_sec,
+            strict_syntax=True,
+        )
+        references.append(frame)
+    if references[0] is None:
+        return None
+
+    was_training = raw_model.training
+    raw_model.eval()
+    try:
+        candidates = megabyte_generate_batch_frames(
+            raw_model,
+            sample,
+            device,
+            config.group_size,
+            config.temperature,
+            config.top_k,
+            config.top_p,
+            config.ar_cont_frames,
+            config.generation_budget_multiplier,
+            config.ar_slice_layout,
+        )
+    finally:
+        raw_model.train(was_training)
+    if not candidates:
+        return None
+
+    with ThreadPoolExecutor(max_workers=config.decode_workers) as executor:
+        results = list(
+            executor.map(
+                lambda candidate: candidate_reward_ar(stream, sample, references, candidate, config),
+                candidates,
+            )
+        )
+    rewards = torch.tensor([reward for reward, _, _ in results], device=device)
+    decoded = torch.tensor([ok for _, ok, _ in results], dtype=torch.bool, device=device)
+    psnrs = torch.tensor(
+        [float("nan") if psnr is None else psnr for _, _, psnr in results], device=device
+    )
+    if float(rewards.std(unbiased=False)) < GRPO_EPS:
+        return None
+
+    return PreparedGRPOStep(
+        sample=sample,
+        task="ar",
+        candidates=candidates,
+        rewards=rewards,
+        advantages=grpo_advantages(rewards),
+        decoded=decoded,
+        psnrs=psnrs,
+        decode_rate=float(decoded.float().mean()),
+        mean_reward=float(rewards.mean()),
+    )
+
+
 def build_group_patch_inputs(
-    sample: ReconstructionSample,
+    sample: ReconstructionSample | FreeRunSample,
     candidates: list[GeneratedCandidate],
     patch_size: int,
     device: torch.device,
+    *,
+    append_eos_on_stop: bool = True,
 ) -> tuple[dict[str, Tensor], Tensor]:
     """Build a batched, patch-aligned teacher-forcing input for a candidate group.
 
-    Under learned-EOS generation, candidates stop at different lengths --
-    right-pad every candidate's target span (content bytes, plus SEQ_EOS_ID
-    if it stopped) to the group's max length before patching, so every
+    Candidates can stop at different lengths -- right-pad every candidate's
+    target span to the group's max length before patching, so every
     candidate reaches the same ``(T, P)`` grid and the whole group still
     goes through the model in one forward call. Padded positions get a
     harmless filler byte (0) for ``input_ids``/``labels`` -- always a valid
     gather index, masked out of the loss via the returned ``supervised``
     mask -- and ``REGION_PAD`` for ``region_ids``, matching the padding
     convention ``collate_byte_samples`` already uses elsewhere.
+
+    ``append_eos_on_stop`` controls whether a stopped candidate's target
+    sequence gets ``SEQ_EOS_ID`` appended: True for FIM's learned-EOS mode
+    (stopping means the model sampled EOS -- it should get gradient credit
+    for that prediction), False for AR's frame-count stopping (stopping
+    there is a structural fact about the generated bytes, not a sampled
+    token -- there is no EOS to score).
+
+    ``sample.generation_region_id``/``generation_offset_start`` (only
+    present on ``ReconstructionSample``) default to 0 for ``FreeRunSample``
+    inputs, which have no such schedule -- safe because this is only called
+    for checkpoints with region/offset conditioning disabled (see
+    ``megabyte_generate_batch_frames``), where the values are inert.
 
     ``patch_byte_sample`` (via ``megabyte_teacher_forced_sample``) requires
     supervision to run through the literal end of the sequence, so the
@@ -309,11 +473,13 @@ def build_group_patch_inputs(
     prompt_region_ids = sample.prompt_region_ids.to(device)
     prompt_offset_ids = sample.prompt_offset_ids.to(device)
     prompt_len = prompt_ids.numel()
+    generation_region_id = getattr(sample, "generation_region_id", 0)
+    generation_offset_start = getattr(sample, "generation_offset_start", 0)
 
     target_token_lists: list[list[int]] = []
     for candidate in candidates:
         tokens = list(candidate.data)
-        if candidate.stopped:
+        if candidate.stopped and append_eos_on_stop:
             tokens.append(SEQ_EOS_ID)
         target_token_lists.append(tokens)
     real_lens = [len(tokens) for tokens in target_token_lists]
@@ -336,15 +502,15 @@ def build_group_patch_inputs(
         )
         target_regions_full = torch.cat(
             (
-                torch.full((real_len,), sample.generation_region_id, dtype=torch.long, device=device),
+                torch.full((real_len,), generation_region_id, dtype=torch.long, device=device),
                 torch.full((pad_len,), REGION_PAD, dtype=torch.long, device=device),
             )
         )
         target_offsets_full = torch.cat(
             (
                 torch.arange(
-                    sample.generation_offset_start,
-                    sample.generation_offset_start + real_len,
+                    generation_offset_start,
+                    generation_offset_start + real_len,
                     dtype=torch.long,
                     device=device,
                 ),

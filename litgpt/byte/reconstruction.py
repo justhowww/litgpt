@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.data import Subset
 
+from litgpt.byte import h264_syntax as HS
 from litgpt.byte.data import (
     BYTE_VOCAB_SIZE,
     IGNORE_INDEX,
@@ -96,6 +97,28 @@ class ReconstructionVisualization:
     statuses: dict[str, str]
 
 
+def _count_real_frames(nals: list, data: bytes, upto_index: int) -> int:
+    """Count real picture boundaries among VCL NALs before ``upto_index``.
+
+    ``decode_frame`` passes its ``frame_index`` straight to ffmpeg as
+    ``-vf select=eq(n,frame_index)``, where ``n`` counts DECODED PICTURES,
+    not NALs. On this corpus's slice-max-mbs=1 encoding, a real picture
+    spans many single-macroblock VCL NALs, and only the ones with
+    ``first_mb_in_slice == 0`` open a new picture -- counting every VCL NAL
+    would badly overcount versus ffmpeg's picture index. Mirrors
+    ``litgpt.byte.free_run_eval._frame_bounds``'s exact definition; do not
+    let the two drift apart.
+    """
+    count = 0
+    for nal in nals[:upto_index]:
+        if nal.nal_type not in VCL_NAL_TYPES:
+            continue
+        payload = data[nal.start + nal.start_code_len : nal.end]
+        if HS.slice_first_mb(payload) == 0:
+            count += 1
+    return count
+
+
 def _select_window_fim_samples(
     base_dataset: ByteStreamWindowDataset,
     indices: list[int],
@@ -152,9 +175,7 @@ def _select_window_fim_samples(
                 target_nal_index = i
                 break
             cursor += nals[i].end - nals[i].start
-        frame_index = sum(
-            nal.nal_type in VCL_NAL_TYPES for nal in nals[:target_nal_index]
-        )
+        frame_index = _count_real_frames(nals, data, target_nal_index)
 
         selected.append(
             ReconstructionSample(
@@ -241,9 +262,8 @@ def select_reconstruction_samples(
         sample = base_dataset.samples[idx]
         nals = base_dataset.nal_index[str(sample.h264_path)]
         target_nal = nals[sample.target_index]
-        frame_index = sum(
-            nal.nal_type in VCL_NAL_TYPES for nal in nals[: sample.target_index]
-        )
+        data = sample.h264_path.read_bytes()
+        frame_index = _count_real_frames(nals, data, sample.target_index)
         selected.append(
             ReconstructionSample(
                 h264_path=sample.h264_path,

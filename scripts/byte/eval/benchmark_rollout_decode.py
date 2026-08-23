@@ -36,7 +36,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from litgpt.byte.data import BYTE_VOCAB_SIZE, SEQ_EOS_ID  # noqa: E402
+from litgpt.byte.data import (  # noqa: E402
+    BYTE_VOCAB_SIZE,
+    SEQ_EOS_ID,
+    ByteDataConfig,
+    ByteDataModule,
+)
+from litgpt.byte.free_run_eval import (  # noqa: E402
+    FreeRunEvalConfig,
+    FreeRunSample,
+    free_run_rollout,
+    megabyte_generate_batch_frames,
+    prepare_free_run_samples,
+)
+from litgpt.byte.h264_mask import SLICE_LAYOUT_MACROBLOCK, SLICE_LAYOUTS  # noqa: E402
 from litgpt.byte.megabyte_inference import (  # noqa: E402
     GeneratedCandidate,
     MegabyteInference,
@@ -83,6 +96,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument(
+        "--ar-prefix-frames",
+        type=int,
+        default=8,
+        help="--verify --task ar: real frames of clean prefix per clip.",
+    )
+    parser.add_argument(
+        "--ar-cont-frames",
+        type=int,
+        default=4,
+        help="--verify --task ar: target continuation frame count per rollout.",
+    )
+    parser.add_argument(
+        "--ar-slice-layout",
+        choices=SLICE_LAYOUTS,
+        default=SLICE_LAYOUT_MACROBLOCK,
+        help="--verify --task ar: slice layout for frame-boundary detection.",
+    )
     parser.add_argument("--fixed-fim-holes", action="store_true")
     parser.add_argument("--fixed-fim-holes-per-window", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.05)
@@ -417,6 +448,149 @@ def _verify_learned_eos(
     return all_ok
 
 
+def build_ar_verify_samples(args: argparse.Namespace) -> list[FreeRunSample]:
+    """Window-mode AR clips for --verify --task ar, via free_run_eval's own
+    clip selection (prepare_free_run_samples) rather than the fixed-schedule
+    reconstruction-sample path (which structurally can't address AR --
+    see select_reconstruction_samples' window-mode AR no-op).
+    """
+    print("Building byte validation dataset (AR/window)...", flush=True)
+    data_config = ByteDataConfig(
+        p_fim=0.0,
+        use_eos=args.use_eos,
+        num_ref_slices=args.num_ref_slices,
+        reference_mode=args.reference_mode,
+        target_nal_types=tuple(args.target_nal_types),
+        slice_header_guard_bytes=args.slice_header_guard_bytes,
+        num_workers=args.num_workers,
+        condition_on_sps_pps=not args.no_sps_pps_conditioning,
+        default_max_seq_length=args.block_size,
+        val_fraction=args.val_fraction,
+        split_by_video=args.split_by_video,
+        seed=args.seed,
+        dataset_mode="window",
+        window_min_frames=args.window_min_frames,
+    )
+    data = ByteDataModule(
+        manifest_path=args.manifest,
+        config=data_config,
+        max_manifest_rows=None if args.max_manifest_rows == 0 else args.max_manifest_rows,
+        nal_index_path=args.nal_index_path,
+    )
+    data.connect(tokenizer=None, batch_size=1, max_seq_length=args.block_size)
+    print("Setting up ByteDataModule...", flush=True)
+    data.setup()
+    if data.val_dataset is None:
+        raise RuntimeError("ByteDataModule did not produce a validation dataset")
+    print("Selecting AR free-run clips...", flush=True)
+    samples = prepare_free_run_samples(
+        data.val_dataset,
+        FreeRunEvalConfig(
+            interval=1,
+            num_clips=args.num_prefixes,
+            prefix_frames=args.ar_prefix_frames,
+            cont_frames=args.ar_cont_frames,
+            slice_layout=args.ar_slice_layout,
+        ),
+    )
+    if not samples:
+        raise RuntimeError("No AR free-run clips matched the requested filters")
+    print(f"Selected {len(samples)} AR free-run clips", flush=True)
+    return samples
+
+
+@torch.inference_mode()
+def _ar_generate_one_reference(
+    raw_model: Any,
+    sample: FreeRunSample,
+    device: torch.device,
+    cont_frames: int,
+    slice_layout: str,
+    budget_multiplier: float = 2.0,
+) -> GeneratedCandidate:
+    """Sequential single-candidate reference for --verify --task ar.
+
+    Thin wrapper over the production free_run_rollout, at temperature=0
+    (greedy) -- the same rollout used by the in-training free-run probe and
+    the standalone eval, so this reference is trustworthy by construction
+    rather than a reimplementation. ``stopped`` reflects whether the target
+    frame count actually closed (trace's ``stop_reason == "frame_target"`),
+    matching megabyte_generate_batch_frames's GeneratedCandidate contract.
+    """
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    max_gen = min(
+        int(budget_multiplier * sample.gt_cont_bytes) + 512,
+        megabyte_max_new_bytes(raw_model, prompt.size(1)),
+    )
+    trace: dict[str, Any] = {}
+    generated, _ = free_run_rollout(
+        raw_model,
+        prompt,
+        region_ids,
+        offset_ids,
+        device,
+        cont_frames,
+        max_gen,
+        0.0,
+        slice_layout=slice_layout,
+        trace=trace,
+    )
+    return GeneratedCandidate(data=generated, stopped=trace.get("stop_reason") == "frame_target")
+
+
+def _verify_ar_frames(
+    raw_model: Any,
+    samples: list[FreeRunSample],
+    device: torch.device,
+    cont_frames: int,
+    slice_layout: str,
+) -> bool:
+    """Greedy-diff sequential vs. batched AR frame-stopping generation.
+
+    Also checks agreement on WHETHER each candidate closed the target frame
+    count (not just where), same discipline as the FIM learned-EOS check.
+    """
+    all_ok = True
+    for sample_index, sample in enumerate(samples):
+        sequential = _ar_generate_one_reference(
+            raw_model, sample, device, cont_frames, slice_layout
+        )
+        batched = megabyte_generate_batch_frames(
+            raw_model, sample, device, 1, 0.0, 0, 1.0, cont_frames, 2.0, slice_layout
+        )
+        if batched is None:
+            print(f"[ar {sample_index}] SKIP (prompt exceeds max_seq_length)")
+            continue
+        batched_candidate = batched[0]
+        ok = (
+            sequential.data == batched_candidate.data
+            and sequential.stopped == batched_candidate.stopped
+        )
+        all_ok = all_ok and ok
+        status = "OK" if ok else "MISMATCH"
+        print(
+            f"[ar {sample_index}] {status} gt_cont_bytes={sample.gt_cont_bytes} "
+            f"frame_index_base={sample.frame_index_base} "
+            f"stopped(seq/batched)={sequential.stopped}/{batched_candidate.stopped}",
+            flush=True,
+        )
+        if not ok:
+            seq_bytes, batched_bytes = sequential.data, batched_candidate.data
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(seq_bytes, batched_bytes)) if a != b),
+                min(len(seq_bytes), len(batched_bytes)),
+            )
+            print(
+                f"    lengths: sequential={len(seq_bytes)} batched={len(batched_bytes)}; "
+                f"first differing byte at index {first_diff}: "
+                f"{seq_bytes[first_diff:first_diff + 8]!r} vs {batched_bytes[first_diff:first_diff + 8]!r}",
+                flush=True,
+            )
+    return all_ok
+
+
 def verify_batched_generation(
     model: Any,
     samples: list[Any],
@@ -449,6 +623,24 @@ def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+
+    if args.verify and args.task == "ar" and args.dataset_mode == "window":
+        # Window-mode AR has no fixed-schedule reconstruction-sample target
+        # (see select_reconstruction_samples' AR no-op) -- uses free_run_eval's
+        # own clip selection and its own sequential/batched pair instead of
+        # the FIM verify path below.
+        ar_samples = build_ar_verify_samples(args)
+        model = load_model(args.checkpoint_dir, device)
+        raw_model = _unwrap_model(model)
+        patch_size = int(raw_model.config.byte_patch_size)
+        if patch_size <= 1:
+            print("--verify only applies to byte_patch_size>1 checkpoints; nothing to check.")
+            sys.exit(0)
+        ok = _verify_ar_frames(
+            raw_model, ar_samples, device, args.ar_cont_frames, args.ar_slice_layout
+        )
+        print("\nAR frame-stopping: " + ("PASSED" if ok else "FAILED"), flush=True)
+        sys.exit(0 if ok else 1)
 
     args.num_samples = args.num_prefixes
     samples = build_eval_samples(args)

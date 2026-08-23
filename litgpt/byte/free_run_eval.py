@@ -40,8 +40,14 @@ from litgpt.byte.data import (
     SEQ_EOS_ID,
     VCL_NAL_TYPES,
 )
-from litgpt.byte.megabyte_inference import MegabyteInference, megabyte_max_new_bytes
-from litgpt.byte.reconstruction import _unwrap_model
+from litgpt.byte.megabyte_inference import (
+    GeneratedCandidate,
+    MegabyteInference,
+    megabyte_max_new_bytes,
+    megabyte_prompt_patches,
+    sample_tokens,
+)
+from litgpt.byte.reconstruction import _count_real_frames, _unwrap_model
 
 START_CODE = (0, 0, 1)
 
@@ -92,6 +98,15 @@ class FreeRunSample:
     prefix_bytes: bytes
     gt_cont_bytes: int  # ground-truth continuation byte count (for the gen budget)
     cont_frames: int
+    # Absolute (file-relative) byte offsets and real-picture index, for
+    # reward computation: splice a generated continuation in at
+    # prefix_end_abs, restore the original tail from gt_end_abs onward, and
+    # decode_frame the k-th continuation frame at frame_index_base + k
+    # (real-picture index, matching decode_frame's ffmpeg -vf select
+    # convention -- see reconstruction._count_real_frames).
+    prefix_end_abs: int
+    gt_end_abs: int
+    frame_index_base: int
 
 
 def _window_byte_lengths(nals, start_nal: int, end_nal: int) -> list[int]:
@@ -179,6 +194,9 @@ def prepare_free_run_samples(
         if any(n.status != HS.ParseStatus.OK for n in parsed_prefix.nals):
             continue
 
+        window_start_abs = nals[win.start_nal].start
+        frames_before_window = _count_real_frames(nals, data, win.start_nal)
+
         prompt_end = prefix_bytes_len + 1  # +1 for the BOS at position 0
         samples.append(
             FreeRunSample(
@@ -189,6 +207,9 @@ def prepare_free_run_samples(
                 prefix_bytes=prefix_bytes,
                 gt_cont_bytes=cont_bytes_len - prefix_bytes_len,
                 cont_frames=config.cont_frames,
+                prefix_end_abs=window_start_abs + prefix_bytes_len,
+                gt_end_abs=window_start_abs + cont_bytes_len,
+                frame_index_base=frames_before_window + config.prefix_frames,
             )
         )
         if len(samples) >= config.num_clips:
@@ -615,6 +636,164 @@ def free_run_rollout(
         trace["mask_probability_mass_count"] = mask_probability_mass_count
         trace["first_mask_intervention"] = first_mask_intervention
     return bytes(generated), start_codes
+
+
+@torch.inference_mode()
+def megabyte_generate_batch_frames(
+    raw: nn.Module,
+    sample: FreeRunSample,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    cont_frames: int,
+    budget_multiplier: float = 2.0,
+    slice_layout: str = HM.SLICE_LAYOUT_MACROBLOCK,
+) -> list[GeneratedCandidate] | None:
+    """Batched free-run generation, each candidate stopping independently once
+    it closes ``cont_frames`` target VCL-NAL frames.
+
+    Only valid when the checkpoint's region/offset conditioning is disabled
+    (``config.use_region_id`` and ``config.use_offset_id`` both False).
+    Region/offset ids are otherwise content-dependent -- they reset at NAL
+    boundaries discovered only as bytes are generated -- which would require
+    per-row metadata tracking incompatible with sharing one batched loop.
+    When disabled, ``GPT._megabyte_global_embed`` never touches them at all
+    (see litgpt/model.py), so passing constant placeholders is exact, not an
+    approximation. Guarded explicitly below rather than silently producing
+    wrong conditioning on a future checkpoint that does use them.
+
+    Frame detection mirrors free_run_rollout's start-code/first_mb_in_slice
+    logic (same primitives, same VCL_NAL_TYPES/first_mb==0 frame-boundary
+    definition), evaluated independently per row against that row's own
+    generated-byte buffer -- do not let this drift from free_run_rollout's
+    definition of a frame boundary.
+    """
+    if raw.config.use_region_id or raw.config.use_offset_id:
+        raise ValueError(
+            "megabyte_generate_batch_frames only supports checkpoints with "
+            "region/offset conditioning disabled (--no-region-id --no-offset-id)"
+        )
+    patch_size = int(raw.config.byte_patch_size)
+    prompt = sample.prompt_ids.to(device).unsqueeze(0)
+    region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
+    offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+    patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
+        prompt, region_ids, offset_ids, patch_size
+    )
+    prompt_patches = patched_ids.size(1)
+    if prompt_patches > int(raw.max_seq_length):
+        return None
+    max_new = min(
+        int(budget_multiplier * sample.gt_cont_bytes) + 512,
+        megabyte_max_new_bytes(raw, prompt.size(1)),
+    )
+    if max_new <= 0:
+        return None
+    target_boundaries = _target_closed_vcl_nals(cont_frames, slice_layout)
+
+    def _autocast():
+        return torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        )
+
+    b = batch_size
+    patched_ids_b = patched_ids.expand(b, -1, -1).contiguous()
+    patched_regions_b = patched_regions.expand(b, -1, -1).contiguous()
+    patched_offsets_b = patched_offsets.expand(b, -1, -1).contiguous()
+
+    needed_patches = min(
+        int(raw.max_seq_length),
+        prompt_patches + -(-max_new // patch_size),
+    )
+    cache_dtype = torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
+    try:
+        raw.set_kv_cache(
+            batch_size=b, max_seq_length=needed_patches, device=device, dtype=cache_dtype
+        )
+        with _autocast():
+            global_output = raw.megabyte_global_forward(
+                patched_ids_b,
+                input_pos=torch.arange(prompt_patches, device=device, dtype=torch.long),
+                input_pos_maxp1=prompt_patches,
+                region_ids=patched_regions_b,
+                offset_ids=patched_offsets_b,
+            )
+        global_output = global_output[:, -1]  # (B, n_embd)
+
+        # Region/offset are inert (guarded above), so patch commits during
+        # generation use a constant placeholder rather than tracking any
+        # real per-row schedule.
+        placeholder_meta = torch.zeros((b, 1, patch_size), dtype=torch.long, device=device)
+
+        generated: list[list[int]] = [[] for _ in range(b)]
+        active = torch.ones(b, dtype=torch.bool, device=device)
+        stopped = torch.zeros(b, dtype=torch.bool, device=device)
+        frames_seen = [0] * b
+        nal_start_idx: list[int | None] = [None] * b
+        current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+        position = prompt_patches
+        for step in range(max_new):
+            if current_tokens.size(1) == patch_size:
+                with _autocast():
+                    out = raw.megabyte_global_forward(
+                        current_tokens.view(b, 1, patch_size),
+                        input_pos=torch.tensor([position], device=device, dtype=torch.long),
+                        input_pos_maxp1=position + 1,
+                        region_ids=placeholder_meta,
+                        offset_ids=placeholder_meta,
+                    )
+                global_output = out[:, -1]
+                position += 1
+                current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+
+            with _autocast():
+                logits = raw.megabyte_local_next_logits(
+                    global_output, current_tokens
+                )[:, :BYTE_VOCAB_SIZE]
+            tokens = sample_tokens(logits, temperature, top_k, top_p)  # (B,)
+
+            active_indices = active.nonzero(as_tuple=False).flatten()
+            for row in active_indices.tolist():
+                token = int(tokens[row])
+                buf = generated[row]
+                buf.append(token)
+                if len(buf) >= 3 and tuple(buf[-3:]) == START_CODE:
+                    if nal_start_idx[row] is not None:
+                        nal_bytes = bytes(buf[nal_start_idx[row] : len(buf) - 3])
+                        nal_type = (nal_bytes[0] & 0x1F) if nal_bytes else -1
+                        if nal_type in VCL_NAL_TYPES:
+                            first_mb = HS.slice_first_mb(nal_bytes)
+                            if first_mb is None:
+                                # Can't determine the frame boundary -- treat
+                                # as a desync and stop, like free_run_rollout.
+                                del buf[-3:]
+                                active[row] = False
+                                continue
+                            if first_mb == 0:
+                                frames_seen[row] += 1
+                                if frames_seen[row] == target_boundaries:
+                                    del buf[-3:]
+                                    stopped[row] = True
+                                    active[row] = False
+                                    continue
+                    nal_start_idx[row] = len(buf)
+
+            if not bool(active.any()) or step == max_new - 1:
+                break
+
+            fed_tokens = torch.where(active, tokens, torch.zeros_like(tokens))
+            current_tokens = torch.cat([current_tokens, fed_tokens.unsqueeze(1)], dim=1)
+    finally:
+        raw.clear_kv_cache()
+
+    return [
+        GeneratedCandidate(data=bytes(row), stopped=bool(stopped[i]))
+        for i, row in enumerate(generated)
+    ]
 
 
 @torch.inference_mode()
