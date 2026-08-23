@@ -146,7 +146,7 @@ def candidate_reward(
     stream: bytes,
     sample: ReconstructionSample,
     reference: Tensor,
-    candidate: bytes,
+    candidate: GeneratedCandidate,
     config: GRPOConfig,
 ) -> tuple[float, bool, float | None]:
     """Splice, strictly decode, and score one candidate.
@@ -154,8 +154,19 @@ def candidate_reward(
     Returns ``(reward, decoded, psnr)``. A failed/mismatched decode gets the
     fixed ``decode_failure_reward`` floor; a successful decode gets PSNR
     normalized into ``[0, 1]`` against ``psnr_cap``.
+
+    Under learned-EOS generation, a candidate that ran to the budget ceiling
+    without ever emitting SEQ_EOS gets the same decode-failure floor,
+    skipping the decode entirely. Decode success alone doesn't reliably
+    punish an unbounded-length candidate (trailing garbage past the true
+    span can decode fine, or fail for reasons unrelated to length), so
+    without this the model has no direct signal that it failed to stop --
+    only the CE pretraining objective (which does supervise EOS directly)
+    would be teaching that skill, with GRPO never touching it.
     """
-    candidate_stream = replace_target_nal(stream, sample, candidate)
+    if config.learned_eos and not candidate.stopped:
+        return config.decode_failure_reward, False, None
+    candidate_stream = replace_target_nal(stream, sample, candidate.data)
     frame, status = decode_frame(
         candidate_stream,
         sample.frame_index,
@@ -241,7 +252,7 @@ def prepare_grpo_step(
     with ThreadPoolExecutor(max_workers=config.decode_workers) as executor:
         results = list(
             executor.map(
-                lambda candidate: candidate_reward(stream, sample, reference, candidate.data, config),
+                lambda candidate: candidate_reward(stream, sample, reference, candidate, config),
                 candidates,
             )
         )
