@@ -459,22 +459,47 @@ def build_group_patch_inputs(
     for checkpoints with region/offset conditioning disabled (see
     ``megabyte_generate_batch_frames``), where the values are inert.
 
+    ``FreeRunSample.prompt_ids`` is ``[BOS, prefix bytes...]``, and both real
+    AR training (``_build_ar_item``: supervision starts at position 0, so
+    ``patch_byte_sample`` treats only the 1-byte BOS as its unsupervised
+    "prompt") and ``megabyte_generate_batch_frames`` (which must match, since
+    that's what the KV cache was actually built from) patch-align this
+    sample with a 1-byte seed -- everything after it, INCLUDING the given
+    prefix, packs into the same patch grid as the generated continuation.
+    Scoring must reproduce that alignment or it evaluates log-probs against
+    a misaligned patch structure the model never actually saw this way
+    (confirmed as a real, silent bug via --verify before this was added).
+    So for ``FreeRunSample`` inputs, the prefix bytes after the seed are
+    prepended to each candidate's target sequence for PATCHING purposes,
+    marked invalid (not supervised) via the same validity-mask mechanism
+    already used for padding -- distinct from ``ReconstructionSample``,
+    whose whole prompt genuinely is patch-aligned as one left-padded block.
+
     ``patch_byte_sample`` (via ``megabyte_teacher_forced_sample``) requires
     supervision to run through the literal end of the sequence, so the
     filler can't be encoded as ``IGNORE_INDEX`` the way real padding
     normally would be. Instead this runs the patching transformation TWICE
     per candidate on identical geometry (same prompt, same padded length) --
     once with real content, once with a parallel validity flag (1=real,
-    0=filler) in the label slot -- and uses the second pass's reshaped
-    output as the supervised mask, rather than re-deriving prompt/target
-    patch-boundary placement by hand.
+    0=filler/given-prefix) in the label slot -- and uses the second pass's
+    reshaped output as the supervised mask, rather than re-deriving
+    prompt/target patch-boundary placement by hand.
     """
     prompt_ids = sample.prompt_ids.to(device)
     prompt_region_ids = sample.prompt_region_ids.to(device)
     prompt_offset_ids = sample.prompt_offset_ids.to(device)
-    prompt_len = prompt_ids.numel()
     generation_region_id = getattr(sample, "generation_region_id", 0)
     generation_offset_start = getattr(sample, "generation_offset_start", 0)
+
+    is_ar = isinstance(sample, FreeRunSample)
+    seed_len = 1 if is_ar else prompt_ids.numel()
+    seed_ids = prompt_ids[:seed_len]
+    seed_region_ids = prompt_region_ids[:seed_len]
+    seed_offset_ids = prompt_offset_ids[:seed_len]
+    prefix_tail_ids = prompt_ids[seed_len:]
+    prefix_tail_region_ids = prompt_region_ids[seed_len:]
+    prefix_tail_offset_ids = prompt_offset_ids[seed_len:]
+    prefix_tail_len = prefix_tail_ids.numel()
 
     target_token_lists: list[list[int]] = []
     for candidate in candidates:
@@ -494,20 +519,30 @@ def build_group_patch_inputs(
     patched_validity: list[Tensor] = []
     for tokens, real_len in zip(target_token_lists, real_lens):
         pad_len = max_len - real_len
-        target_tokens = torch.tensor(
-            tokens + [0] * pad_len, dtype=torch.long, device=device
-        )
-        validity_full = torch.tensor(
-            [1] * real_len + [0] * pad_len, dtype=torch.long, device=device
-        )
-        target_regions_full = torch.cat(
+        combined_tokens = torch.cat(
             (
+                prefix_tail_ids,
+                torch.tensor(tokens, dtype=torch.long, device=device),
+                torch.zeros((pad_len,), dtype=torch.long, device=device),
+            )
+        )
+        combined_validity = torch.cat(
+            (
+                torch.zeros((prefix_tail_len,), dtype=torch.long, device=device),
+                torch.ones((real_len,), dtype=torch.long, device=device),
+                torch.zeros((pad_len,), dtype=torch.long, device=device),
+            )
+        )
+        combined_regions = torch.cat(
+            (
+                prefix_tail_region_ids,
                 torch.full((real_len,), generation_region_id, dtype=torch.long, device=device),
                 torch.full((pad_len,), REGION_PAD, dtype=torch.long, device=device),
             )
         )
-        target_offsets_full = torch.cat(
+        combined_offsets = torch.cat(
             (
+                prefix_tail_offset_ids,
                 torch.arange(
                     generation_offset_start,
                     generation_offset_start + real_len,
@@ -518,14 +553,14 @@ def build_group_patch_inputs(
             )
         )
 
-        appended_ids = target_tokens[:-1]
-        input_ids = torch.cat((prompt_ids, appended_ids))
+        appended_ids = combined_tokens[:-1]
+        input_ids = torch.cat((seed_ids, appended_ids))
         labels = torch.full_like(input_ids, IGNORE_INDEX)
-        labels[prompt_len - 1 :] = target_tokens
+        labels[seed_len - 1 :] = combined_tokens
         validity_labels = torch.full_like(input_ids, IGNORE_INDEX)
-        validity_labels[prompt_len - 1 :] = validity_full
-        region_ids = torch.cat((prompt_region_ids, target_regions_full[:-1]))
-        offset_ids = torch.cat((prompt_offset_ids, target_offsets_full[:-1]))
+        validity_labels[seed_len - 1 :] = combined_validity
+        region_ids = torch.cat((seed_region_ids, combined_regions[:-1]))
+        offset_ids = torch.cat((seed_offset_ids, combined_offsets[:-1]))
 
         patched = megabyte_teacher_forced_sample(
             input_ids, labels, region_ids, offset_ids, patch_size

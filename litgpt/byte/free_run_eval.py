@@ -679,15 +679,50 @@ def megabyte_generate_batch_frames(
     prompt = sample.prompt_ids.to(device).unsqueeze(0)
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
+
+    # FreeRunSample.prompt_ids is [BOS, prefix bytes...]. Match
+    # MegabyteInference(..., supervision_start=0) -- what free_run_rollout
+    # actually uses for this exact sample shape -- rather than
+    # megabyte_prompt_patches' whole-prompt left-pad (correct for FIM's
+    # reconstruction-sample prompts, which have no such BOS prefix). Only
+    # the 1-byte BOS is a left-padded "seed" patch; the rest packs as
+    # complete patches with no left-padding, and any remainder becomes the
+    # starting in-progress patch buffer generation continues filling. These
+    # two conventions produce the SAME patch count (a ceiling-division
+    # identity) but DIFFERENT byte-to-patch alignment whenever
+    # len(prefix_bytes) % patch_size != 0 -- i.e. almost always -- which is
+    # what silently broke this function before this fix (confirmed via
+    # --verify: byte-identical divergence exactly at patch boundaries).
+    seed_end = 1
     patched_ids, patched_regions, patched_offsets = megabyte_prompt_patches(
-        prompt, region_ids, offset_ids, patch_size
+        prompt[:, :seed_end], region_ids[:, :seed_end], offset_ids[:, :seed_end], patch_size
     )
+    known_ids = prompt[:, seed_end:]
+    known_regions = region_ids[:, seed_end:]
+    known_offsets = offset_ids[:, seed_end:]
+    complete_known = known_ids.size(1) // patch_size
+    complete_bytes = complete_known * patch_size
+    if complete_known:
+        patched_ids = torch.cat(
+            (patched_ids, known_ids[:, :complete_bytes].view(1, complete_known, patch_size)),
+            dim=1,
+        )
+        patched_regions = torch.cat(
+            (patched_regions, known_regions[:, :complete_bytes].view(1, complete_known, patch_size)),
+            dim=1,
+        )
+        patched_offsets = torch.cat(
+            (patched_offsets, known_offsets[:, :complete_bytes].view(1, complete_known, patch_size)),
+            dim=1,
+        )
     prompt_patches = patched_ids.size(1)
     if prompt_patches > int(raw.max_seq_length):
         return None
+    remainder_ids = known_ids[0, complete_bytes:]  # in-progress partial patch, if any
+
     max_new = min(
         int(budget_multiplier * sample.gt_cont_bytes) + 512,
-        megabyte_max_new_bytes(raw, prompt.size(1)),
+        megabyte_max_new_bytes(raw, prompt.size(1), supervision_start=0),
     )
     if max_new <= 0:
         return None
@@ -734,7 +769,16 @@ def megabyte_generate_batch_frames(
         stopped = torch.zeros(b, dtype=torch.bool, device=device)
         frames_seen = [0] * b
         nal_start_idx: list[int | None] = [None] * b
-        current_tokens = torch.zeros((b, 0), dtype=torch.long, device=device)
+        # Seed with the remainder bytes left over from the prompt split
+        # above (identical across the batch -- same prompt for every row),
+        # not an empty patch: matches MegabyteInference's
+        # self._current_tokens initialization exactly.
+        r = remainder_ids.numel()
+        current_tokens = (
+            remainder_ids.to(device).view(1, r).expand(b, r).contiguous()
+            if r
+            else torch.zeros((b, 0), dtype=torch.long, device=device)
+        )
         position = prompt_patches
         for step in range(max_new):
             if current_tokens.size(1) == patch_size:
