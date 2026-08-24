@@ -591,11 +591,17 @@ def build_group_patch_inputs(
                 target_validity,
             )
         )
+        # megabyte_teacher_forced_sample returns its fields pre-unsqueezed
+        # with a batch dim (see its `.unsqueeze(0)` for each key), so that
+        # torch.cat(..., dim=0) below stacks candidates into (B, T, P).
+        # candidate_validity is built by hand and needs the same unsqueeze,
+        # or concatenation flattens candidates along the patch dimension
+        # instead of stacking a batch dimension.
+        patched_validity.append(candidate_validity.unsqueeze(0))
         patched_inputs.append(patched["input_ids"])
         patched_labels.append(patched["labels"])
         patched_regions.append(patched["region_ids"])
         patched_offsets.append(patched["offset_ids"])
-        patched_validity.append(candidate_validity)
 
     inputs = {
         "idx": torch.cat(patched_inputs, dim=0),
