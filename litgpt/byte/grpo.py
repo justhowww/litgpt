@@ -38,7 +38,13 @@ import torch
 from torch import Tensor, nn
 
 from litgpt.byte import h264_mask as HM
-from litgpt.byte.data import BYTE_VOCAB_SIZE, IGNORE_INDEX, REGION_PAD, SEQ_EOS_ID
+from litgpt.byte.data import (
+    BYTE_VOCAB_SIZE,
+    IGNORE_INDEX,
+    REGION_PAD,
+    SEQ_EOS_ID,
+    _pad_patch_axis,
+)
 from litgpt.byte.free_run_eval import (
     FreeRunSample,
     _survival_and_validity,
@@ -478,12 +484,16 @@ def build_group_patch_inputs(
     ``patch_byte_sample`` (via ``megabyte_teacher_forced_sample``) requires
     supervision to run through the literal end of the sequence, so the
     filler can't be encoded as ``IGNORE_INDEX`` the way real padding
-    normally would be. Instead this runs the patching transformation TWICE
-    per candidate on identical geometry (same prompt, same padded length) --
-    once with real content, once with a parallel validity flag (1=real,
-    0=filler/given-prefix) in the label slot -- and uses the second pass's
-    reshaped output as the supervised mask, rather than re-deriving
-    prompt/target patch-boundary placement by hand.
+    normally would be. It also internally enforces that ``input_ids`` really
+    is the shifted ``labels`` (real byte content) as a consistency guard --
+    calling it a second time with labels swapped for a validity flag against
+    the SAME input_ids (an earlier version of this function did exactly
+    that) always fails that guard. So the supervised mask here is instead
+    computed directly via ``_pad_patch_axis`` -- the same pure,
+    value-independent padding primitive ``patch_byte_sample`` itself uses
+    for both its prompt and target sides -- applied to a plain validity
+    array (1=real content, 0=padding/given-prefix) using the identical
+    patch-count geometry the real-content call already produced.
     """
     prompt_ids = sample.prompt_ids.to(device)
     prompt_region_ids = sample.prompt_region_ids.to(device)
@@ -557,22 +567,35 @@ def build_group_patch_inputs(
         input_ids = torch.cat((seed_ids, appended_ids))
         labels = torch.full_like(input_ids, IGNORE_INDEX)
         labels[seed_len - 1 :] = combined_tokens
-        validity_labels = torch.full_like(input_ids, IGNORE_INDEX)
-        validity_labels[seed_len - 1 :] = combined_validity
         region_ids = torch.cat((seed_region_ids, combined_regions[:-1]))
         offset_ids = torch.cat((seed_offset_ids, combined_offsets[:-1]))
 
         patched = megabyte_teacher_forced_sample(
             input_ids, labels, region_ids, offset_ids, patch_size
         )
-        patched_validity_sample = megabyte_teacher_forced_sample(
-            input_ids, validity_labels, region_ids, offset_ids, patch_size
+        # patch_byte_sample enforces input_ids == shifted labels (real byte
+        # content) as an internal consistency guard -- it cannot accept a
+        # second call with labels swapped for 0/1 validity flags against the
+        # SAME (real-content) input_ids, so re-running it for the validity
+        # mask (as an earlier version of this function did) always raises
+        # "teacher-forcing shift is inconsistent". Instead replicate its
+        # patch geometry directly via _pad_patch_axis (the same pure,
+        # value-independent padding primitive patch_byte_sample itself uses
+        # for both the prompt and target sides) -- this only needs to know
+        # WHERE positions fall, not validate matching byte values.
+        prompt_patch_count = -(-seed_len // patch_size)
+        target_validity = _pad_patch_axis(combined_validity, patch_size, 0, left=False)
+        candidate_validity = torch.cat(
+            (
+                torch.zeros((prompt_patch_count - 1, patch_size), dtype=torch.long, device=device),
+                target_validity,
+            )
         )
         patched_inputs.append(patched["input_ids"])
         patched_labels.append(patched["labels"])
         patched_regions.append(patched["region_ids"])
         patched_offsets.append(patched["offset_ids"])
-        patched_validity.append(patched_validity_sample["labels"])
+        patched_validity.append(candidate_validity)
 
     inputs = {
         "idx": torch.cat(patched_inputs, dim=0),
