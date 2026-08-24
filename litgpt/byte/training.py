@@ -295,6 +295,16 @@ class ByteTrainingRuntime:
             prepared = prepare_grpo_step(model, sample, config, fabric.device)
         if prepared is None:
             return {"grpo/skipped": 1.0, "grpo/pool": pool_name}
+        # prepare_grpo_step[_ar] run under torch.inference_mode() (correct,
+        # faster than no_grad, for pure sampling/scoring with no gradient
+        # ever needed there) -- but that permanently tags every tensor
+        # created inside as an "inference tensor", which can never
+        # participate in autograd afterward even once back in normal mode.
+        # advantages gets multiplied against a gradient-tracked ratio below,
+        # so it must be cloned here, now that we're outside that context --
+        # cloning inside prepare_grpo_step[_ar] itself would not help, since
+        # the clone would still happen while inference-mode is active.
+        advantages = prepared.advantages.clone()
 
         raw_model = _unwrap_model(model)
         patch_size = int(raw_model.config.byte_patch_size)
@@ -327,7 +337,7 @@ class ByteTrainingRuntime:
                     gathered,
                     old_gathered,
                     supervised,
-                    prepared.advantages,
+                    advantages,
                     reference_gathered,
                     config.kl_coeff,
                     config.clip_range,
