@@ -1745,6 +1745,7 @@ def decode_h264(
     *,
     strict: bool,
     max_frames: int | None = None,
+    keep_partial_on_error: bool = False,
 ) -> tuple[list[Tensor], str, dict[str, Any]]:
     command = [args.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
     if strict:
@@ -1809,7 +1810,8 @@ def decode_h264(
         if isinstance(stderr, str):
             stderr = stderr.encode()
         info = diagnostics(status="timeout", stdout=stdout, stderr=stderr)
-        return [], "timeout", info
+        frames = parse_ppm_sequence(stdout) if keep_partial_on_error else []
+        return frames, "timeout", info
     info = diagnostics(
         status="completed",
         stdout=result.stdout,
@@ -1818,7 +1820,12 @@ def decode_h264(
     )
     if strict and result.returncode != 0:
         info["status"] = "decoder_error"
-        return [], "decoder_error", info
+        frames = (
+            parse_ppm_sequence(result.stdout)
+            if keep_partial_on_error and result.stdout
+            else []
+        )
+        return frames, "decoder_error", info
     if not result.stdout:
         info["status"] = "no_frame"
         return [], "no_frame", info
@@ -1880,20 +1887,24 @@ def save_continuation_videos(
         out_path = frame_dir / f"clip_{clip_idx:04d}_{tag}.mp4"
         saved = save_comparison_video(
             reference_frames=gt,
+            middle_frames=gt,
             result_frames=model,
             out_path=out_path,
             ffmpeg_binary=args.ffmpeg_binary,
             fps=args.viz_fps,
             timeout_sec=args.timeout_sec,
-            columns=("AR input", "model output"),
-            left_blank_from=item["prefix_frames"],
+            columns=("clean GT", "AR input", "generated output"),
+            middle_blank_from=item["prefix_frames"],
+            border_changes_at=item["prefix_frames"],
             thumbnail_frame=item["prefix_frames"],
             metadata={
                 "checkpoint": checkpoint_name,
                 "clip_index": clip_idx,
                 "prefix_frames": item["prefix_frames"],
                 "generation_starts_at_frame": item["prefix_frames"],
-                "black_left_tile": "unknown continuation; not given to the model",
+                "black_middle_tile": (
+                    "unknown continuation; not given to the model"
+                ),
                 "h264_path": item["h264_path"],
             },
         )

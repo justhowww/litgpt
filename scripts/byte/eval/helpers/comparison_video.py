@@ -38,25 +38,34 @@ def save_comparison_video(
     *,
     reference_frames: list[Tensor],
     result_frames: list[Tensor],
+    middle_frames: list[Tensor] | None = None,
     out_path: Path,
     ffmpeg_binary: str,
     fps: int,
     timeout_sec: int,
-    columns: tuple[str, str],
+    columns: tuple[str, ...],
     left_blank_from: int | None = None,
+    middle_blank_from: int | None = None,
     border_changes_at: int | None = None,
     thumbnail_frame: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
-    """Write ``left | right`` video aligned to the reference timeline.
+    """Write a two- or three-column video aligned to the reference timeline.
 
-    ``left_blank_from`` turns the left panel into an AR-input view: observed prefix
-    frames remain visible and unknown continuation frames are black. For FIM,
-    ``border_changes_at`` draws green borders before the damaged frame and red
-    borders from the damaged frame onward on both panels.
+    ``left_blank_from`` or ``middle_blank_from`` turns that panel into an AR-input
+    view: observed prefix frames remain visible and unknown continuation frames are
+    black. ``border_changes_at`` draws green borders before the task boundary and
+    red borders from the first target frame onward on every panel. Passing
+    ``middle_frames`` produces ``reference | input | result``; omitted preserves a
+    two-column ``reference | result`` layout.
     """
     if not reference_frames:
         return False
+    expected_columns = 3 if middle_frames is not None else 2
+    if len(columns) != expected_columns:
+        raise ValueError(
+            f"Expected {expected_columns} column labels, received {len(columns)}"
+        )
     reference = reference_frames[0]
     blank = torch.zeros_like(reference)
     failed = torch.zeros_like(reference)
@@ -77,13 +86,33 @@ def save_comparison_video(
             and result_frames[frame_index].shape == gt_frame.shape
             else failed
         )
+        middle = None
+        if middle_frames is not None:
+            middle = (
+                blank
+                if middle_blank_from is not None
+                and frame_index >= middle_blank_from
+                else (
+                    middle_frames[frame_index]
+                    if frame_index < len(middle_frames)
+                    and middle_frames[frame_index].shape == gt_frame.shape
+                    else failed
+                )
+            )
         if border_changes_at is not None:
             color = (
                 (0.0, 0.85, 0.0) if frame_index < border_changes_at else (1.0, 0.0, 0.0)
             )
             left = _border(left, color)
+            if middle is not None:
+                middle = _border(middle, color)
             right = _border(right, color)
-        panels.append(torch.cat((left, separator, right), dim=1).clamp(0, 1))
+        row = (
+            (left, separator, middle, separator, right)
+            if middle is not None
+            else (left, separator, right)
+        )
+        panels.append(torch.cat(row, dim=1).clamp(0, 1))
 
     h, w = panels[0].shape[:2]
     pad_h, pad_w = h % 2, w % 2
@@ -152,10 +181,11 @@ def save_comparison_video(
         "columns": list(columns),
         "fps": fps,
         "left_blank_from": left_blank_from,
+        "middle_blank_from": middle_blank_from,
         "border_changes_at": border_changes_at,
-        "green_border": "frame occurs before the corruption",
-        "red_border": "corrupted frame or a later frame",
-        "dark_red_tile": "result frame failed to decode",
+        "green_border": "frame occurs before the task boundary",
+        "red_border": "target frame or a later frame",
+        "dark_red_tile": "comparison frame failed to decode or is unavailable",
         **(metadata or {}),
     }
     out_path.with_suffix(".json").write_text(

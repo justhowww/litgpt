@@ -116,6 +116,11 @@ class WindowFimSample:
     def gt_truncated_stream(self) -> bytes:
         return self.window_bytes[: self.frame_hi]
 
+    @property
+    def corrupted_stream(self) -> bytes:
+        """The decoder input with the sampled FIM span physically removed."""
+        return self.bytes_before_hole + self.bytes_after_hole
+
     def repaired_stream(self, generated: bytes) -> bytes:
         return (
             self.window_bytes[: self.split]
@@ -186,7 +191,7 @@ def parse_args() -> argparse.Namespace:
         "--num-visualizations",
         type=int,
         default=8,
-        help="Number of synchronized GT-versus-repaired MP4s to save.",
+        help="Number of synchronized GT/corrupted/repaired MP4s to save.",
     )
     parser.add_argument("--viz-fps", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
@@ -266,14 +271,18 @@ def parse_args() -> argparse.Namespace:
         "--save-streams",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Write GT-truncated and repaired H.264 streams for each sample.",
+        help=(
+            "Write clean GT, deleted-span corrupted, and repaired H.264 streams "
+            "for each sample."
+        ),
     )
     parser.add_argument(
         "--decode",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Strict-decode GT and repaired streams and score repaired-frame success. "
+            "Strict-decode GT and repaired streams, score repaired-frame success, "
+            "and strictly decode corrupted streams requested for visualization. "
             "Enabled by default; --no-decode is a parser-only debug mode."
         ),
     )
@@ -1188,7 +1197,7 @@ def save_fim_videos(
     if not viz:
         return
     print(
-        f"Saving {len(viz)} FIM GT-versus-repaired videos for "
+        f"Saving {len(viz)} FIM GT/corrupted/repaired videos for "
         f"{checkpoint_name}/{stop_mode}",
         flush=True,
     )
@@ -1196,12 +1205,13 @@ def save_fim_videos(
         out_path = frame_dir / f"sample_{sample_id:04d}_{stop_mode}.mp4"
         saved = save_comparison_video(
             reference_frames=item["gt_frames"],
+            middle_frames=item["corrupted_frames"],
             result_frames=item["model_frames"],
             out_path=out_path,
             ffmpeg_binary=args.ffmpeg_binary,
             fps=args.viz_fps,
             timeout_sec=args.timeout_sec,
-            columns=("GT video", "repaired video"),
+            columns=("clean GT", "corrupted input", "repaired output"),
             border_changes_at=item["target_frame"],
             thumbnail_frame=item["target_frame"],
             metadata={
@@ -1209,6 +1219,10 @@ def save_fim_videos(
                 "sample_id": sample_id,
                 "stop_mode": stop_mode,
                 "target_frame": item["target_frame"],
+                "corrupted_strict_decode_status": item[
+                    "corrupted_strict_decode_status"
+                ],
+                "corrupted_ffmpeg_decode": item["corrupted_ffmpeg_decode"],
                 "strict_valid": item["strict_valid"],
                 "h264_path": item["h264_path"],
             },
@@ -1571,6 +1585,13 @@ def main() -> None:
                 )
             else:
                 gt_cache.append(([], "not_run", {}))
+        # The deleted-span input is checkpoint- and stopping-mode-independent. Decode
+        # it lazily only for requested visualizations, and retain any complete PPM
+        # frames emitted before strict FFmpeg reports the corruption. This uses the
+        # same strict command as scoring; it does not enable error concealment.
+        corrupted_viz_cache: dict[
+            int, tuple[list[Tensor], str, dict[str, Any]]
+        ] = {}
         for stop_mode in args.stop_modes:
             print(f"[{ckpt_name}] FIM AVC-LM stop_mode={stop_mode}", flush=True)
             rows: list[dict[str, Any]] = []
@@ -1680,16 +1701,19 @@ def main() -> None:
                     stem = f"sample_{sample_id:04d}_{stop_mode}"
                     gt_path = stream_dir / f"{stem}_gt.h264"
                     model_path = stream_dir / f"{stem}_model.h264"
+                    corrupted_path = stream_dir / f"{stem}_corrupted.h264"
                     missing_path = stream_dir / f"{stem}_missing_gt.bin"
                     gen_path = stream_dir / f"{stem}_missing_model.bin"
                     gt_path.write_bytes(gt_stream)
                     model_path.write_bytes(model_stream)
+                    corrupted_path.write_bytes(sample.corrupted_stream)
                     missing_path.write_bytes(sample.target_bytes)
                     gen_path.write_bytes(result.data)
                     row.update(
                         {
                             "gt_stream_path": str(gt_path),
                             "model_stream_path": str(model_path),
+                            "corrupted_stream_path": str(corrupted_path),
                             "gt_missing_path": str(missing_path),
                             "model_missing_path": str(gen_path),
                         }
@@ -1747,6 +1771,19 @@ def main() -> None:
                                 model_frames[target_index - 1],
                             )
                     if sample_id < args.num_visualizations:
+                        if sample_id not in corrupted_viz_cache:
+                            corrupted_viz_cache[sample_id] = AR.decode_h264(
+                                sample.corrupted_stream,
+                                args,
+                                strict=True,
+                                max_frames=None,
+                                keep_partial_on_error=True,
+                            )
+                        (
+                            corrupted_frames,
+                            corrupted_status,
+                            corrupted_decode,
+                        ) = corrupted_viz_cache[sample_id]
                         comparison_path = (
                             args.out_dir
                             / "frames"
@@ -1755,8 +1792,13 @@ def main() -> None:
                         )
                         viz[sample_id] = {
                             "gt_frames": [frame.cpu() for frame in gt_frames],
+                            "corrupted_frames": [
+                                frame.cpu() for frame in corrupted_frames
+                            ],
                             "model_frames": [frame.cpu() for frame in model_frames],
                             "target_frame": prefix_frames,
+                            "corrupted_strict_decode_status": corrupted_status,
+                            "corrupted_ffmpeg_decode": corrupted_decode,
                             "strict_valid": strict_valid,
                             "h264_path": str(sample.h264_path),
                         }
