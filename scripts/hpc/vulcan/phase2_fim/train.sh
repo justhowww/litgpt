@@ -91,6 +91,35 @@ FREE_RUN_PREFIX_FRAMES=${FREE_RUN_PREFIX_FRAMES:-288}
 FREE_RUN_CONT_FRAMES=${FREE_RUN_CONT_FRAMES:-144}
 FREE_RUN_SLICE_LAYOUT=${FREE_RUN_SLICE_LAYOUT:-macroblock}
 
+# --- Optional fresh-stage initialization and online GRPO -------------------------
+# The ordinary CE launch keeps RESUME=1. A new RL stage instead sets RESUME=0 and
+# INITIAL_CHECKPOINT_DIR to the pretrained policy; only model weights are loaded,
+# avoiding an invalid FSDP-optimizer -> DDP-optimizer resume across strategies.
+RESUME=${RESUME:-1}
+INITIAL_CHECKPOINT_DIR=${INITIAL_CHECKPOINT_DIR:-}
+GRPO_INTERVAL=${GRPO_INTERVAL:-0}
+GRPO_START_STEP=${GRPO_START_STEP:-0}
+GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-64}
+GRPO_CONTEXT_SAMPLING=${GRPO_CONTEXT_SAMPLING:-fixed}
+GRPO_CONTEXT_SEED=${GRPO_CONTEXT_SEED:-42}
+GRPO_MAX_TARGET_BYTES=${GRPO_MAX_TARGET_BYTES:-2048}
+GRPO_TEMPERATURE=${GRPO_TEMPERATURE:-1.0}
+GRPO_TOP_K=${GRPO_TOP_K:-0}
+GRPO_TOP_P=${GRPO_TOP_P:-1.0}
+GRPO_KL_COEFF=${GRPO_KL_COEFF:-0.02}
+GRPO_PSNR_CAP=${GRPO_PSNR_CAP:-40.0}
+GRPO_DECODE_FAILURE_REWARD=${GRPO_DECODE_FAILURE_REWARD:--1.0}
+GRPO_MU=${GRPO_MU:-1}
+GRPO_CLIP_RANGE=${GRPO_CLIP_RANGE:-0.2}
+GRPO_LEARNED_EOS=${GRPO_LEARNED_EOS:-0}
+GRPO_GENERATION_BUDGET_MULTIPLIER=${GRPO_GENERATION_BUDGET_MULTIPLIER:-2.0}
+GRPO_AR_PREFIX_FRAMES=${GRPO_AR_PREFIX_FRAMES:-8}
+GRPO_AR_CONT_FRAMES=${GRPO_AR_CONT_FRAMES:-4}
+GRPO_AR_SLICE_LAYOUT=${GRPO_AR_SLICE_LAYOUT:-macroblock}
+GRPO_TIMEOUT_SEC=${GRPO_TIMEOUT_SEC:-30}
+GRPO_DECODE_WORKERS=${GRPO_DECODE_WORKERS:-8}
+GRPO_REFERENCE_CHECKPOINT_DIR=${GRPO_REFERENCE_CHECKPOINT_DIR:-}
+
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
     exit 1
@@ -140,8 +169,17 @@ cmd=(
     --eval-interval "${EVAL_INTERVAL}"
     --eval-iters 20
     --save-interval "${SAVE_INTERVAL}"
-    --resume
 )
+
+if [[ -n "${INITIAL_CHECKPOINT_DIR}" ]]; then
+    if [[ "${RESUME}" == "1" ]]; then
+        echo "INITIAL_CHECKPOINT_DIR and RESUME=1 are mutually exclusive" >&2
+        exit 1
+    fi
+    cmd+=(--initial-checkpoint-dir "${INITIAL_CHECKPOINT_DIR}")
+elif [[ "${RESUME}" == "1" ]]; then
+    cmd+=(--resume)
+fi
 
 if [[ "${MAX_ROWS}" != "0" ]]; then
     cmd+=(--max-manifest-rows "${MAX_ROWS}")
@@ -178,6 +216,40 @@ if [[ "${FREE_RUN_INTERVAL}" != "0" ]]; then
         --free-run-slice-layout "${FREE_RUN_SLICE_LAYOUT}"
     )
 fi
+if [[ "${GRPO_INTERVAL}" != "0" ]]; then
+    if [[ -z "${GRPO_REFERENCE_CHECKPOINT_DIR}" && "${GRPO_KL_COEFF}" != "0" && "${GRPO_KL_COEFF}" != "0.0" ]]; then
+        echo "GRPO_REFERENCE_CHECKPOINT_DIR is required when GRPO_KL_COEFF>0" >&2
+        exit 1
+    fi
+    cmd+=(
+        --grpo-interval "${GRPO_INTERVAL}"
+        --grpo-start-step "${GRPO_START_STEP}"
+        --grpo-group-size "${GRPO_GROUP_SIZE}"
+        --grpo-context-sampling "${GRPO_CONTEXT_SAMPLING}"
+        --grpo-context-seed "${GRPO_CONTEXT_SEED}"
+        --grpo-max-target-bytes "${GRPO_MAX_TARGET_BYTES}"
+        --grpo-temperature "${GRPO_TEMPERATURE}"
+        --grpo-top-k "${GRPO_TOP_K}"
+        --grpo-top-p "${GRPO_TOP_P}"
+        --grpo-kl-coeff "${GRPO_KL_COEFF}"
+        --grpo-psnr-cap "${GRPO_PSNR_CAP}"
+        --grpo-decode-failure-reward "${GRPO_DECODE_FAILURE_REWARD}"
+        --grpo-mu "${GRPO_MU}"
+        --grpo-clip-range "${GRPO_CLIP_RANGE}"
+        --grpo-generation-budget-multiplier "${GRPO_GENERATION_BUDGET_MULTIPLIER}"
+        --grpo-ar-prefix-frames "${GRPO_AR_PREFIX_FRAMES}"
+        --grpo-ar-cont-frames "${GRPO_AR_CONT_FRAMES}"
+        --grpo-ar-slice-layout "${GRPO_AR_SLICE_LAYOUT}"
+        --grpo-timeout-sec "${GRPO_TIMEOUT_SEC}"
+        --grpo-decode-workers "${GRPO_DECODE_WORKERS}"
+    )
+    if [[ -n "${GRPO_REFERENCE_CHECKPOINT_DIR}" ]]; then
+        cmd+=(--grpo-reference-checkpoint-dir "${GRPO_REFERENCE_CHECKPOINT_DIR}")
+    fi
+    if [[ "${GRPO_LEARNED_EOS}" == "1" ]]; then
+        cmd+=(--grpo-learned-eos)
+    fi
+fi
 
 COMPILE=${COMPILE:-1}
 if [[ "${COMPILE}" == "1" ]]; then
@@ -186,6 +258,9 @@ fi
 
 echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} patch=${BYTE_PATCH_SIZE} local=${MEGABYTE_LOCAL_LAYERS}L/${MEGABYTE_LOCAL_EMBD}D/${MEGABYTE_LOCAL_HEADS}H raw_byte_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE)) steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
 echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fixed_fim_holes_per_window=${FIXED_FIM_HOLES_PER_WINDOW} fim_format=${FIM_FORMAT} fim_loss_scope=${FIM_LOSS_SCOPE} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
+if [[ "${GRPO_INTERVAL}" != "0" ]]; then
+    echo "[grpo] interval=${GRPO_INTERVAL} start=${GRPO_START_STEP} group_per_rank=${GRPO_GROUP_SIZE} context_sampling=${GRPO_CONTEXT_SAMPLING} learned_eos=${GRPO_LEARNED_EOS} kl=${GRPO_KL_COEFF} initial=${INITIAL_CHECKPOINT_DIR} reference=${GRPO_REFERENCE_CHECKPOINT_DIR}"
+fi
 
 flock -n "${OUT_DIR}/.training.lock" srun --unbuffered "${cmd[@]}" || {
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2
