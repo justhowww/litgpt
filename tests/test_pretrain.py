@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from litgpt import pretrain
 from litgpt.args import EvalArgs, TrainArgs
+from litgpt.byte.grpo import GRPOConfig
 from litgpt.config import Config
 from litgpt.pretrain import initialize_weights
 from litgpt.utils import _RunIf
@@ -50,6 +51,16 @@ def test_optimizer_schedule_is_world_size_independent():
 
     assert one_gpu == (64, requested_steps, 3200)
     assert four_gpu == (16, requested_steps, 3200)
+
+
+def test_multi_gpu_grpo_selects_replicated_ddp():
+    grpo = GRPOConfig(interval=10, group_size=2)
+
+    assert pretrain._select_training_strategy(4, 1, grpo) == "ddp"
+    assert pretrain._select_training_strategy(1, 1, grpo) == "auto"
+    assert isinstance(
+        pretrain._select_training_strategy(4, 1, None), FSDPStrategy
+    )
 
 
 def test_resume_rebases_microiterations_from_optimizer_step():

@@ -73,6 +73,8 @@ class GRPOConfig:
 
     interval: int = 0
     start_step: int = 0
+    # Candidates per context and per DDP rank.  Each rank owns a different
+    # context; their independently normalized policy gradients are averaged.
     group_size: int = 64
     ar_pool_size: int = 16
     fim_pool_size: int = 16
@@ -630,13 +632,18 @@ def group_token_log_probabilities(
 ) -> Tensor:
     """Return per-token log-probs, shape ``(B, T, P)``.
 
+    Deliberately call the supplied wrapper rather than ``_unwrap_model``: during
+    multi-GPU GRPO this is the gradient-bearing DDP forward whose backward pass
+    must all-reduce policy gradients.  Rollout generation is inference-only and
+    may unwrap the replicated model; candidate scoring may not.
+
     Always scores over the same 257-way (256 bytes + EOS) slice used during
     learned-EOS sampling, remapping SEQ_EOS_ID targets to the extra column --
     a no-op for real byte targets and for the padding filler (byte 0), so
     this one path handles oracle-length, learned-EOS, and mixed-stopped
     groups uniformly without per-row branching.
     """
-    logits = _unwrap_model(model)(**inputs)
+    logits = model(**inputs)
     allowed_logits = torch.cat(
         (logits[..., :BYTE_VOCAB_SIZE], logits[..., SEQ_EOS_ID : SEQ_EOS_ID + 1]),
         dim=-1,

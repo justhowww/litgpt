@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from lightning import Fabric
+from lightning.fabric.strategies import FSDPStrategy
 from torch.utils.data import DataLoader
 
 from litgpt.byte.data import (
@@ -81,6 +82,8 @@ class ByteTrainingRuntime:
     grpo_fim_pool: list[ReconstructionSample] = field(default_factory=list)
     grpo_context_sampler: OnlineGRPOContextSampler | None = None
     grpo_context_log_path: Path | None = None
+    grpo_rank: int = 0
+    grpo_world_size: int = 1
     # Frozen initial-policy copy for the GRPO KL penalty. Populated by the
     # caller (litgpt.pretrain.main) once weights are loaded, since building it
     # requires the fully-materialized model -- prepare() runs before that.
@@ -171,9 +174,17 @@ class ByteTrainingRuntime:
         grpo_context_log_path: Path | None = None
         if grpo_config is not None and grpo_config.enabled:
             grpo_config.validate()
-            if fabric.world_size != 1:
-                raise ValueError("Online byte GRPO currently supports one device only")
-            grpo_context_log_path = out_dir / "grpo_contexts.jsonl"
+            if fabric.world_size > 1 and isinstance(
+                fabric.strategy, FSDPStrategy
+            ):
+                raise ValueError(
+                    "Multi-GPU byte GRPO requires replicated DDP, not FSDP"
+                )
+            grpo_context_log_path = out_dir / (
+                "grpo_contexts.jsonl"
+                if fabric.world_size == 1
+                else f"grpo_contexts_rank{fabric.global_rank:03d}.jsonl"
+            )
             if grpo_config.context_sampling == "online":
                 grpo_context_sampler = OnlineGRPOContextSampler.from_dataset(
                     train_dataset, grpo_config
@@ -182,6 +193,7 @@ class ByteTrainingRuntime:
                     "Online GRPO enabled with just-in-time contexts from "
                     f"{len(grpo_context_sampler.indices)} training windows "
                     f"(alternating AR/FIM), group_size={grpo_config.group_size} "
+                    f"per rank across {fabric.world_size} rank(s), "
                     f"every {grpo_config.interval} steps, "
                     f"kl_coeff={grpo_config.kl_coeff}"
                 )
@@ -220,7 +232,8 @@ class ByteTrainingRuntime:
                 fabric.print(
                     f"Online GRPO enabled: {len(grpo_ar_pool)} AR + "
                     f"{len(grpo_fim_pool)} FIM fixed contexts (alternating), "
-                    f"group_size={grpo_config.group_size} every "
+                    f"group_size={grpo_config.group_size} per rank across "
+                    f"{fabric.world_size} rank(s), every "
                     f"{grpo_config.interval} steps, kl_coeff={grpo_config.kl_coeff}"
                 )
 
@@ -261,6 +274,8 @@ class ByteTrainingRuntime:
             grpo_fim_pool=grpo_fim_pool,
             grpo_context_sampler=grpo_context_sampler,
             grpo_context_log_path=grpo_context_log_path,
+            grpo_rank=fabric.global_rank,
+            grpo_world_size=fabric.world_size,
         )
 
     def loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -308,6 +323,8 @@ class ByteTrainingRuntime:
                 self.grpo_config.context_sampling if self.grpo_config else "unknown"
             ),
             "status": status,
+            "rank": self.grpo_rank,
+            "world_size": self.grpo_world_size,
             "dataset_index": (
                 selection.dataset_index if selection is not None else None
             ),
@@ -333,6 +350,35 @@ class ByteTrainingRuntime:
         with self.grpo_context_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
+    @staticmethod
+    def _all_ranks_ready(fabric: Fabric, local_ready: bool) -> bool:
+        """Require every DDP rank to enter or skip the GRPO backward together."""
+        if fabric.world_size == 1:
+            return local_ready
+        ready = torch.tensor(
+            1.0 if local_ready else 0.0,
+            device=fabric.device,
+        )
+        ready = fabric.all_reduce(ready, reduce_op="min")
+        return bool(ready.item())
+
+    @staticmethod
+    def _distributed_mean_metrics(
+        fabric: Fabric,
+        values: dict[str, float],
+    ) -> dict[str, float]:
+        """Average a fixed set of scalar diagnostics across DDP ranks."""
+        if fabric.world_size == 1 or not values:
+            return values
+        keys = sorted(values)
+        packed = torch.tensor(
+            [values[key] for key in keys],
+            device=fabric.device,
+            dtype=torch.float32,
+        )
+        packed = fabric.all_reduce(packed, reduce_op="mean")
+        return {key: float(packed[i]) for i, key in enumerate(keys)}
+
     def run_grpo(
         self,
         fabric: Fabric,
@@ -357,52 +403,71 @@ class ByteTrainingRuntime:
             return None
         update_index = (next_step - config.start_step) // config.interval - 1
         pool_name = "ar" if update_index % 2 == 0 else "fim"
+        task_draw_index = update_index // 2
+        # Consecutive positions in the task's shuffled order are partitioned
+        # across ranks.  A four-rank update therefore trains on four contexts,
+        # while resume remains a pure function of step/rank/world-size.
+        context_draw_index = (
+            task_draw_index * fabric.world_size + fabric.global_rank
+        )
         selection: GRPOContextSelection | None = None
+        sample: FreeRunSample | ReconstructionSample | None = None
         if config.context_sampling == "online":
-            if self.grpo_context_sampler is None:
-                return None
-            selection = self.grpo_context_sampler.sample(
-                pool_name, update_index // 2
-            )
-            if selection is None:
-                self._log_grpo_context(
-                    next_step=next_step,
-                    update_index=update_index,
-                    task=pool_name,
-                    sample=None,
-                    selection=None,
-                    status="no_eligible_context",
+            if self.grpo_context_sampler is not None:
+                selection = self.grpo_context_sampler.sample(
+                    pool_name,
+                    context_draw_index,
+                    stride=fabric.world_size,
                 )
-                return {
-                    "grpo/skipped": 1.0,
-                    "grpo/pool": pool_name,
-                    "grpo/skip_reason": "no_eligible_context",
-                }
-            sample = selection.sample
+                sample = selection.sample if selection is not None else None
         else:
-            if not self.grpo_ar_pool or not self.grpo_fim_pool:
-                return None
-            pool = self.grpo_ar_pool if pool_name == "ar" else self.grpo_fim_pool
-            sample = pool[(update_index // 2) % len(pool)]
+            if self.grpo_ar_pool and self.grpo_fim_pool:
+                pool = self.grpo_ar_pool if pool_name == "ar" else self.grpo_fim_pool
+                sample = pool[context_draw_index % len(pool)]
 
-        if pool_name == "ar":
-            prepared = prepare_grpo_step_ar(model, sample, config, fabric.device)
-        else:
-            prepared = prepare_grpo_step(model, sample, config, fabric.device)
-        if prepared is None:
+        if not self._all_ranks_ready(fabric, sample is not None):
             self._log_grpo_context(
                 next_step=next_step,
                 update_index=update_index,
                 task=pool_name,
                 sample=sample,
                 selection=selection,
-                status="rollout_skipped",
+                status=(
+                    "no_eligible_context"
+                    if sample is None
+                    else "peer_has_no_eligible_context"
+                ),
             )
             return {
                 "grpo/skipped": 1.0,
                 "grpo/pool": pool_name,
-                "grpo/skip_reason": "rollout_skipped",
+                "grpo/skip_reason": "distributed_context_unavailable",
             }
+        assert sample is not None
+
+        if pool_name == "ar":
+            prepared = prepare_grpo_step_ar(model, sample, config, fabric.device)
+        else:
+            prepared = prepare_grpo_step(model, sample, config, fabric.device)
+        if not self._all_ranks_ready(fabric, prepared is not None):
+            self._log_grpo_context(
+                next_step=next_step,
+                update_index=update_index,
+                task=pool_name,
+                sample=sample,
+                selection=selection,
+                status=(
+                    "rollout_skipped"
+                    if prepared is None
+                    else "peer_rollout_skipped"
+                ),
+            )
+            return {
+                "grpo/skipped": 1.0,
+                "grpo/pool": pool_name,
+                "grpo/skip_reason": "distributed_rollout_skipped",
+            }
+        assert prepared is not None
         # prepare_grpo_step[_ar] run under torch.inference_mode() (correct,
         # faster than no_grad, for pure sampling/scoring with no gradient
         # ever needed there) -- but that permanently tags every tensor
@@ -456,30 +521,66 @@ class ByteTrainingRuntime:
             final_loss = float(loss.detach())
         optimizer.zero_grad()
 
-        metrics = {
+        mean_metrics = {
+            "grpo/mean_reward": prepared.mean_reward,
+            "grpo/reward_std": float(prepared.rewards.std(unbiased=False)),
+            "grpo/decode_rate": prepared.decode_rate,
+            f"grpo/{pool_name}/mean_reward": prepared.mean_reward,
+            f"grpo/{pool_name}/decode_rate": prepared.decode_rate,
+            "grpo/loss": final_loss,
+        }
+        mean_metrics.update(loss_metrics)
+        mean_metrics = self._distributed_mean_metrics(fabric, mean_metrics)
+
+        reward_min = torch.tensor(
+            float(prepared.rewards.min()), device=fabric.device
+        )
+        reward_max = torch.tensor(
+            float(prepared.rewards.max()), device=fabric.device
+        )
+        group_size = torch.tensor(
+            float(len(prepared.candidates)), device=fabric.device
+        )
+        if fabric.world_size > 1:
+            reward_min = fabric.all_reduce(reward_min, reduce_op="min")
+            reward_max = fabric.all_reduce(reward_max, reduce_op="max")
+            group_size = fabric.all_reduce(group_size, reduce_op="sum")
+
+        metrics: dict[str, float | str] = {
             "grpo/skipped": 0.0,
             "grpo/pool": pool_name,
             "grpo/task": prepared.task,
-            "grpo/mean_reward": prepared.mean_reward,
-            "grpo/reward_min": float(prepared.rewards.min()),
-            "grpo/reward_max": float(prepared.rewards.max()),
-            "grpo/reward_std": float(prepared.rewards.std(unbiased=False)),
-            "grpo/decode_rate": prepared.decode_rate,
-            "grpo/group_size": float(len(prepared.candidates)),
+            "grpo/reward_min": float(reward_min),
+            "grpo/reward_max": float(reward_max),
+            # Advantages are normalized within each rank's one-context group.
+            # Across ranks these are several independent groups, not one larger
+            # GRPO group, so preserve group_size's original local meaning.
+            "grpo/group_size": float(group_size) / fabric.world_size,
+            "grpo/rollouts_per_update": float(group_size),
+            "grpo/contexts_per_update": float(fabric.world_size),
             "grpo/mu": float(config.mu),
-            f"grpo/{pool_name}/mean_reward": prepared.mean_reward,
-            f"grpo/{pool_name}/decode_rate": prepared.decode_rate,
         }
+        metrics.update(mean_metrics)
+
         finite_psnrs = prepared.psnrs[torch.isfinite(prepared.psnrs)]
-        if finite_psnrs.numel() > 0:
-            metrics["grpo/psnr_mean"] = float(finite_psnrs.mean())
-        metrics.update(loss_metrics)
-        metrics["grpo/loss"] = final_loss
-        if selection is not None:
-            metrics["grpo/context_dataset_index"] = float(
+        psnr_stats = torch.tensor(
+            [
+                float(finite_psnrs.sum()) if finite_psnrs.numel() else 0.0,
+                float(finite_psnrs.numel()),
+            ],
+            device=fabric.device,
+        )
+        if fabric.world_size > 1:
+            psnr_stats = fabric.all_reduce(psnr_stats, reduce_op="sum")
+        if float(psnr_stats[1]) > 0:
+            metrics["grpo/psnr_mean"] = float(psnr_stats[0] / psnr_stats[1])
+        if selection is not None and fabric.global_rank == 0:
+            metrics["grpo/context_dataset_index_rank0"] = float(
                 selection.dataset_index
             )
-            metrics["grpo/context_selection_attempt"] = float(selection.attempt)
+            metrics["grpo/context_selection_attempt_rank0"] = float(
+                selection.attempt
+            )
         self._log_grpo_context(
             next_step=next_step,
             update_index=update_index,
@@ -494,6 +595,8 @@ class ByteTrainingRuntime:
     def log_grpo(
         self, fabric: Fabric, metrics: dict[str, float | str], step: int
     ) -> None:
+        if fabric.global_rank != 0:
+            return
         pool = metrics.get("grpo/pool", "?")
         if metrics.get("grpo/skipped"):
             fabric.log_dict(

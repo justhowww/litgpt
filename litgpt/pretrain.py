@@ -61,6 +61,29 @@ from litgpt.utils import (
 )
 
 
+def _select_training_strategy(
+    devices: int,
+    num_nodes: int,
+    grpo: GRPOConfig | None,
+):
+    """Choose replicated DDP for GRPO and FSDP for ordinary pretraining.
+
+    Byte GRPO unwraps the policy for autoregressive rollout generation.  That
+    is safe for DDP because every rank owns a complete replica, but not for an
+    FSDP model whose parameters are sharded.  The gradient-bearing candidate
+    scoring pass still uses the DDP wrapper and therefore synchronizes updates.
+    """
+    if devices * num_nodes <= 1:
+        return "auto"
+    if grpo is not None and grpo.enabled:
+        return "ddp"
+    return FSDPStrategy(
+        auto_wrap_policy={Block},
+        state_dict_type="full",
+        sharding_strategy="HYBRID_SHARD",
+    )
+
+
 def setup(
     model_name: str,
     model_config: Config | None = None,
@@ -168,10 +191,7 @@ def setup(
         log_args=asdict(log),
     )
 
-    if devices * num_nodes > 1:
-        strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
-    else:
-        strategy = "auto"
+    strategy = _select_training_strategy(devices, num_nodes, grpo)
 
     fabric = L.Fabric(devices=devices, num_nodes=num_nodes, strategy=strategy, precision=precision, loggers=[logger])
 

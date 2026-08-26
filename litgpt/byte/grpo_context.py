@@ -91,13 +91,21 @@ class OnlineGRPOContextSampler:
         self._order_cache[task] = (epoch, frozen)
         return frozen
 
-    def dataset_index(self, task: str, draw_index: int, attempt: int = 0) -> int:
+    def dataset_index(
+        self,
+        task: str,
+        draw_index: int,
+        attempt: int = 0,
+        stride: int = 1,
+    ) -> int:
         """Return the deterministic window index for one draw/attempt."""
         if task not in GRPO_CONTEXT_TASKS:
             raise ValueError(f"Unknown GRPO context task: {task}")
-        if draw_index < 0 or attempt < 0:
-            raise ValueError("GRPO context draw index and attempt must be non-negative")
-        position = draw_index + attempt
+        if draw_index < 0 or attempt < 0 or stride <= 0:
+            raise ValueError(
+                "GRPO context draw index/attempt must be non-negative and stride positive"
+            )
+        position = draw_index + attempt * stride
         epoch, slot = divmod(position, len(self.indices))
         return self._order(task, epoch)[slot]
 
@@ -118,11 +126,19 @@ class OnlineGRPOContextSampler:
             dataset_index, random.Random(hole_seed)
         )
 
-    def sample(self, task: str, draw_index: int) -> GRPOContextSelection | None:
+    def sample(
+        self,
+        task: str,
+        draw_index: int,
+        *,
+        stride: int = 1,
+    ) -> GRPOContextSelection | None:
         """Materialize one eligible context without retaining its prompt tensors."""
         attempts = min(MAX_CONTEXT_ATTEMPTS, len(self.indices))
         for attempt in range(attempts):
-            dataset_index = self.dataset_index(task, draw_index, attempt)
+            dataset_index = self.dataset_index(
+                task, draw_index, attempt, stride
+            )
             if task == "ar":
                 sample = build_free_run_sample(
                     self.dataset,
