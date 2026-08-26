@@ -541,6 +541,114 @@ def test_free_run_probe_strips_window_ar_eos(tmp_path, monkeypatch):
     assert all(0 <= token < 256 for token in samples[0].prompt_ids[1:].tolist())
 
 
+def test_single_context_builders_match_fixed_selectors(tmp_path, monkeypatch):
+    import random
+    import types
+
+    from litgpt.byte import free_run_eval as FR
+    from litgpt.byte.reconstruction import (
+        build_window_fim_sample,
+        select_reconstruction_samples,
+    )
+
+    class _OK:
+        status = FR.HS.ParseStatus.OK
+
+    monkeypatch.setattr(
+        FR.HS,
+        "parse_stream",
+        lambda *a, **k: types.SimpleNamespace(nals=[_OK()]),
+    )
+    ds, _ = _dataset(tmp_path, p_fim=1.0, use_eos=True)
+
+    ar_config = FR.FreeRunEvalConfig(
+        interval=1,
+        num_clips=1,
+        prefix_frames=1,
+        cont_frames=1,
+    )
+    ar_built = FR.build_free_run_sample(ds, 0, ar_config)
+    ar_selected = FR.prepare_free_run_samples(ds, ar_config)[0]
+    assert ar_built is not None
+    assert ar_built.h264_path == ar_selected.h264_path
+    assert torch.equal(ar_built.prompt_ids, ar_selected.prompt_ids)
+    assert ar_built.prefix_end_abs == ar_selected.prefix_end_abs
+    assert ar_built.gt_end_abs == ar_selected.gt_end_abs
+
+    sample = ds.samples[0]
+    data = sample.h264_path.read_bytes()
+    candidates = ds._fim_candidates(sample, data)
+    hole = ds._draw_hole_spec(candidates, random.Random(ds.seed))
+    fim_built = build_window_fim_sample(
+        ds,
+        0,
+        hole,
+        64,
+        force_eos_stopping=False,
+    )
+    fim_selected = select_reconstruction_samples(
+        ds,
+        num_samples=1,
+        max_target_bytes=64,
+        task="fim",
+    )[0]
+    assert fim_built is not None
+    assert fim_built.replacement_start == fim_selected.replacement_start
+    assert fim_built.replacement_end == fim_selected.replacement_end
+    assert torch.equal(fim_built.prompt_ids, fim_selected.prompt_ids)
+
+
+def test_online_grpo_contexts_are_resume_deterministic(tmp_path, monkeypatch):
+    import types
+
+    from torch.utils.data import Subset
+
+    from litgpt.byte import free_run_eval as FR
+    from litgpt.byte.grpo import GRPOConfig
+    from litgpt.byte.grpo_context import OnlineGRPOContextSampler
+
+    class _OK:
+        status = FR.HS.ParseStatus.OK
+
+    monkeypatch.setattr(
+        FR.HS,
+        "parse_stream",
+        lambda *a, **k: types.SimpleNamespace(nals=[_OK()]),
+    )
+    ds, _ = _dataset(tmp_path, p_fim=0.5, use_eos=True, resample_fim=True)
+    config = GRPOConfig(
+        interval=1,
+        group_size=2,
+        context_sampling="online",
+        context_seed=123,
+        max_target_bytes=64,
+        learned_eos=True,
+        ar_prefix_frames=1,
+        ar_cont_frames=1,
+    )
+    split = Subset(ds, [0])
+    first = OnlineGRPOContextSampler.from_dataset(split, config)
+    resumed = OnlineGRPOContextSampler.from_dataset(split, config)
+
+    ar_first = first.sample("ar", 7)
+    ar_resumed = resumed.sample("ar", 7)
+    assert ar_first is not None and ar_resumed is not None
+    assert ar_first.dataset_index == ar_resumed.dataset_index == 0
+    assert torch.equal(ar_first.sample.prompt_ids, ar_resumed.sample.prompt_ids)
+
+    fim_first = first.sample("fim", 7)
+    fim_resumed = resumed.sample("fim", 7)
+    assert fim_first is not None and fim_resumed is not None
+    assert fim_first.hole_spec == fim_resumed.hole_spec
+    assert torch.equal(fim_first.sample.prompt_ids, fim_resumed.sample.prompt_ids)
+
+    # One-window splits revisit that window every draw, but the hole changes.
+    fim_next = first.sample("fim", 8)
+    assert fim_next is not None
+    assert fim_next.dataset_index == 0
+    assert fim_next.hole_spec != fim_first.hole_spec
+
+
 def test_hole_spans_many_nals_on_a_per_mb_corpus(tmp_path):
     # Documents the (b)-corpus caveat concretely: a corruption-sized hole cannot be
     # sub-NAL here, so BSCV's "excise inside one slice payload, NAL header intact"

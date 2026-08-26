@@ -119,15 +119,19 @@ def _count_real_frames(nals: list, data: bytes, upto_index: int) -> int:
     return count
 
 
-def _select_window_fim_samples(
+def build_window_fim_sample(
     base_dataset: ByteStreamWindowDataset,
-    indices: list[int],
-    num_samples: int,
+    idx: int,
+    hole_spec: tuple[int, int, int, int],
     max_target_bytes: int,
     *,
     force_eos_stopping: bool,
-) -> list[ReconstructionSample]:
-    """Deterministic window-mode FIM samples, addressed into the source file.
+) -> ReconstructionSample | None:
+    """Build one window-mode FIM context from an explicit legal hole.
+
+    Index and hole selection deliberately live outside this function.  This is
+    the shared materializer for fixed evaluation samples and online GRPO, so an
+    audited ``(dataset index, hole_spec)`` always reconstructs the same prompt.
 
     ``ByteStreamWindowDataset``'s hole geometry (``frame_lo``/``frame_hi``/
     ``split``/``gap``) is WINDOW-relative -- offset 0 is the first byte of
@@ -148,54 +152,72 @@ def _select_window_fim_samples(
     """
     use_eos = bool(getattr(base_dataset, "use_eos", False))
     is_psm = base_dataset.fim_format == "psm"
+    frame_lo, frame_hi, split, gap = hole_spec
+    if gap <= 0 or gap > max_target_bytes:
+        return None
+
+    sample = base_dataset.samples[idx]
+    data = sample.h264_path.read_bytes()
+    item = base_dataset.fim_item_for_hole(idx, hole_spec)
+    # Marker layout from _build_fim_item's `pieces`: psm inserts FIM_BEGIN
+    # and FIM_HOLE (2 extra bytes) before middle_in; bridge inserts none.
+    prompt_end = (frame_hi - gap + 2) if is_psm else (frame_hi - gap)
+
+    nals = base_dataset.nal_index[str(sample.h264_path)]
+    window_start_abs = nals[sample.start_nal].start
+    cursor = 0
+    target_nal_index = sample.start_nal
+    for i in range(sample.start_nal, sample.end_nal):
+        if cursor == frame_lo:
+            target_nal_index = i
+            break
+        cursor += nals[i].end - nals[i].start
+    frame_index = _count_real_frames(nals, data, target_nal_index)
+
+    return ReconstructionSample(
+        h264_path=sample.h264_path,
+        target_start=window_start_abs,
+        target_end=window_start_abs + frame_hi,
+        target_nal_index=target_nal_index,
+        frame_index=frame_index,
+        prompt_ids=item["input_ids"][:prompt_end].clone(),
+        prompt_region_ids=item["region_ids"][:prompt_end].clone(),
+        prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
+        target_length=gap,
+        task="fim",
+        replacement_start=split,
+        replacement_end=split + gap,
+        generation_region_id=REGION_BRIDGE,
+        generation_offset_start=0,
+        stop_token=SEQ_EOS_ID if use_eos or force_eos_stopping else None,
+    )
+
+
+def _select_window_fim_samples(
+    base_dataset: ByteStreamWindowDataset,
+    indices: list[int],
+    num_samples: int,
+    max_target_bytes: int,
+    *,
+    force_eos_stopping: bool,
+) -> list[ReconstructionSample]:
+    """Select deterministic window-mode FIM samples for evaluation."""
     selected: list[ReconstructionSample] = []
     for idx in indices:
-        sample = base_dataset.samples[idx]
-        data = sample.h264_path.read_bytes()
-        candidates = base_dataset._fim_candidates(sample, data)
-        if not candidates:
-            continue
         rng = random.Random(base_dataset.seed + idx)
-        frame_lo, frame_hi, split, gap = base_dataset._draw_hole_spec(candidates, rng)
-        target_length = gap
-        if target_length <= 0 or target_length > max_target_bytes:
+        hole_spec = base_dataset.draw_fim_hole_spec(idx, rng)
+        if hole_spec is None:
             continue
-
-        item = base_dataset.fim_item_for_hole(idx, (frame_lo, frame_hi, split, gap))
-        # Marker layout from _build_fim_item's `pieces`: psm inserts FIM_BEGIN
-        # and FIM_HOLE (2 extra bytes) before middle_in; bridge inserts none.
-        prompt_end = (frame_hi - gap + 2) if is_psm else (frame_hi - gap)
-
-        nals = base_dataset.nal_index[str(sample.h264_path)]
-        window_start_abs = nals[sample.start_nal].start
-        cursor = 0
-        target_nal_index = sample.start_nal
-        for i in range(sample.start_nal, sample.end_nal):
-            if cursor == frame_lo:
-                target_nal_index = i
-                break
-            cursor += nals[i].end - nals[i].start
-        frame_index = _count_real_frames(nals, data, target_nal_index)
-
-        selected.append(
-            ReconstructionSample(
-                h264_path=sample.h264_path,
-                target_start=window_start_abs,
-                target_end=window_start_abs + frame_hi,
-                target_nal_index=target_nal_index,
-                frame_index=frame_index,
-                prompt_ids=item["input_ids"][:prompt_end].clone(),
-                prompt_region_ids=item["region_ids"][:prompt_end].clone(),
-                prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
-                target_length=target_length,
-                task="fim",
-                replacement_start=split,
-                replacement_end=split + gap,
-                generation_region_id=REGION_BRIDGE,
-                generation_offset_start=0,
-                stop_token=SEQ_EOS_ID if use_eos or force_eos_stopping else None,
-            )
+        built = build_window_fim_sample(
+            base_dataset,
+            idx,
+            hole_spec,
+            max_target_bytes,
+            force_eos_stopping=force_eos_stopping,
         )
+        if built is None:
+            continue
+        selected.append(built)
         if len(selected) >= num_samples:
             break
     return selected

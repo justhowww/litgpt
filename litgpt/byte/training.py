@@ -6,6 +6,7 @@ and reconstruction logging from LitGPT's generic pretraining orchestration.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,10 @@ from litgpt.byte.grpo import (
     prepare_grpo_step,
     prepare_grpo_step_ar,
     should_run_grpo as _should_run_grpo,
+)
+from litgpt.byte.grpo_context import (
+    GRPOContextSelection,
+    OnlineGRPOContextSampler,
 )
 from litgpt.byte.mrt import (
     MRTConfig,
@@ -74,6 +79,8 @@ class ByteTrainingRuntime:
     grpo_config: GRPOConfig | None = None
     grpo_ar_pool: list[FreeRunSample] = field(default_factory=list)
     grpo_fim_pool: list[ReconstructionSample] = field(default_factory=list)
+    grpo_context_sampler: OnlineGRPOContextSampler | None = None
+    grpo_context_log_path: Path | None = None
     # Frozen initial-policy copy for the GRPO KL penalty. Populated by the
     # caller (litgpt.pretrain.main) once weights are loaded, since building it
     # requires the fully-materialized model -- prepare() runs before that.
@@ -96,7 +103,7 @@ class ByteTrainingRuntime:
         free_run_config: FreeRunEvalConfig | None = None,
         grpo_config: GRPOConfig | None = None,
     ) -> "ByteTrainingRuntime":
-        """Select fixed probe/MRT contexts once before distributed wrapping."""
+        """Prepare byte probes and online-training context sources."""
         reconstruction_samples: dict[str, list[ReconstructionSample]] = {}
         if reconstruction_config is not None:
             tasks = (
@@ -160,47 +167,62 @@ class ByteTrainingRuntime:
 
         grpo_ar_pool: list[FreeRunSample] = []
         grpo_fim_pool: list[ReconstructionSample] = []
+        grpo_context_sampler: OnlineGRPOContextSampler | None = None
+        grpo_context_log_path: Path | None = None
         if grpo_config is not None and grpo_config.enabled:
             grpo_config.validate()
             if fabric.world_size != 1:
                 raise ValueError("Online byte GRPO currently supports one device only")
-            # AR reuses free_run_eval's clip selection (prefix_frames/cont_frames/
-            # slice_layout mirror FreeRunEvalConfig's own defaults); only its
-            # interval/num_clips fields are read here, purely as a pool-building
-            # utility -- the resulting samples are scored via
-            # litgpt.byte.grpo.prepare_grpo_step_ar, not the free-run probe.
-            grpo_ar_pool = prepare_free_run_samples(
-                train_dataset,
-                FreeRunEvalConfig(
-                    interval=1,
-                    num_clips=grpo_config.ar_pool_size,
-                    prefix_frames=grpo_config.ar_prefix_frames,
-                    cont_frames=grpo_config.ar_cont_frames,
-                    slice_layout=grpo_config.ar_slice_layout,
-                ),
-            )
-            grpo_fim_pool = select_reconstruction_samples(
-                train_dataset,
-                grpo_config.fim_pool_size,
-                grpo_config.max_target_bytes,
-                "fim",
-            )
-            if not grpo_ar_pool or not grpo_fim_pool:
-                raise ValueError(
-                    "GRPO is enabled but no eligible AR and/or FIM samples were found"
+            grpo_context_log_path = out_dir / "grpo_contexts.jsonl"
+            if grpo_config.context_sampling == "online":
+                grpo_context_sampler = OnlineGRPOContextSampler.from_dataset(
+                    train_dataset, grpo_config
                 )
-            if fabric.global_rank == 0:
-                # AR pool has no ReconstructionSample-shaped manifest writer
-                # (FreeRunSample's fields don't match); FIM pool keeps its
-                # existing manifest for debuggability.
-                save_reconstruction_sample_manifest(
-                    grpo_fim_pool, out_dir / "grpo_training_samples_fim.json"
+                fabric.print(
+                    "Online GRPO enabled with just-in-time contexts from "
+                    f"{len(grpo_context_sampler.indices)} training windows "
+                    f"(alternating AR/FIM), group_size={grpo_config.group_size} "
+                    f"every {grpo_config.interval} steps, "
+                    f"kl_coeff={grpo_config.kl_coeff}"
                 )
-            fabric.print(
-                f"Online GRPO enabled: {len(grpo_ar_pool)} AR + {len(grpo_fim_pool)} FIM "
-                f"contexts (alternating), group_size={grpo_config.group_size} every "
-                f"{grpo_config.interval} steps, kl_coeff={grpo_config.kl_coeff}"
-            )
+            else:
+                # AR reuses free_run_eval's clip selection (prefix_frames/
+                # cont_frames/slice_layout mirror FreeRunEvalConfig).  The
+                # resulting samples are scored by prepare_grpo_step_ar, not by
+                # the free-run probe itself.
+                grpo_ar_pool = prepare_free_run_samples(
+                    train_dataset,
+                    FreeRunEvalConfig(
+                        interval=1,
+                        num_clips=grpo_config.ar_pool_size,
+                        prefix_frames=grpo_config.ar_prefix_frames,
+                        cont_frames=grpo_config.ar_cont_frames,
+                        slice_layout=grpo_config.ar_slice_layout,
+                    ),
+                )
+                grpo_fim_pool = select_reconstruction_samples(
+                    train_dataset,
+                    grpo_config.fim_pool_size,
+                    grpo_config.max_target_bytes,
+                    "fim",
+                    force_eos_stopping=grpo_config.learned_eos,
+                )
+                if not grpo_ar_pool or not grpo_fim_pool:
+                    raise ValueError(
+                        "GRPO is enabled but no eligible AR and/or FIM samples "
+                        "were found"
+                    )
+                if fabric.global_rank == 0:
+                    # AR pool has no ReconstructionSample-shaped manifest writer.
+                    save_reconstruction_sample_manifest(
+                        grpo_fim_pool, out_dir / "grpo_training_samples_fim.json"
+                    )
+                fabric.print(
+                    f"Online GRPO enabled: {len(grpo_ar_pool)} AR + "
+                    f"{len(grpo_fim_pool)} FIM fixed contexts (alternating), "
+                    f"group_size={grpo_config.group_size} every "
+                    f"{grpo_config.interval} steps, kl_coeff={grpo_config.kl_coeff}"
+                )
 
         free_run_samples: list[FreeRunSample] = []
         if free_run_config is not None and free_run_config.enabled:
@@ -237,6 +259,8 @@ class ByteTrainingRuntime:
             grpo_config=grpo_config,
             grpo_ar_pool=grpo_ar_pool,
             grpo_fim_pool=grpo_fim_pool,
+            grpo_context_sampler=grpo_context_sampler,
+            grpo_context_log_path=grpo_context_log_path,
         )
 
     def loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -262,6 +286,53 @@ class ByteTrainingRuntime:
             and _should_run_grpo(next_step, self.grpo_config)
         )
 
+    def _log_grpo_context(
+        self,
+        *,
+        next_step: int,
+        update_index: int,
+        task: str,
+        sample: FreeRunSample | ReconstructionSample | None,
+        selection: GRPOContextSelection | None,
+        status: str,
+        prepared=None,
+    ) -> None:
+        """Append a reproducibility record for one GRPO context draw."""
+        if self.grpo_context_log_path is None:
+            return
+        record = {
+            "step": next_step,
+            "update_index": update_index,
+            "task": task,
+            "sampling": (
+                self.grpo_config.context_sampling if self.grpo_config else "unknown"
+            ),
+            "status": status,
+            "dataset_index": (
+                selection.dataset_index if selection is not None else None
+            ),
+            "draw_index": selection.draw_index if selection is not None else None,
+            "selection_attempt": selection.attempt if selection is not None else None,
+            "hole_spec": (
+                list(selection.hole_spec)
+                if selection is not None and selection.hole_spec is not None
+                else None
+            ),
+            "h264_path": str(sample.h264_path) if sample is not None else None,
+        }
+        if prepared is not None:
+            record.update(
+                {
+                    "mean_reward": prepared.mean_reward,
+                    "reward_min": float(prepared.rewards.min()),
+                    "reward_max": float(prepared.rewards.max()),
+                    "decode_rate": prepared.decode_rate,
+                    "group_size": len(prepared.candidates),
+                }
+            )
+        with self.grpo_context_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
     def run_grpo(
         self,
         fabric: Fabric,
@@ -269,7 +340,7 @@ class ByteTrainingRuntime:
         model: nn.Module,
         max_norm: float,
         next_step: int,
-    ) -> dict[str, float] | None:
+    ) -> dict[str, float | str] | None:
         """Sample one group and run mu clipped-surrogate gradient steps on it.
 
         Self-contained: owns its own zero_grad/backward/clip/step cycle,
@@ -278,23 +349,60 @@ class ByteTrainingRuntime:
         call site in litgpt.pretrain.fit) so it starts from a clean gradient
         slate and doesn't clobber CE's accumulated gradient.
 
-        Alternates between the AR and FIM context pools each call, so
-        AR-only and FIM-only reward trends stay separately loggable.
+        Alternates between AR and FIM each call. Contexts come either from the
+        legacy fixed pools or from the deterministic just-in-time sampler.
         """
         config = self.grpo_config
-        if config is None or not self.grpo_ar_pool or not self.grpo_fim_pool:
+        if config is None:
             return None
         update_index = (next_step - config.start_step) // config.interval - 1
-        pool = self.grpo_ar_pool if update_index % 2 == 0 else self.grpo_fim_pool
         pool_name = "ar" if update_index % 2 == 0 else "fim"
-        sample = pool[(update_index // 2) % len(pool)]
+        selection: GRPOContextSelection | None = None
+        if config.context_sampling == "online":
+            if self.grpo_context_sampler is None:
+                return None
+            selection = self.grpo_context_sampler.sample(
+                pool_name, update_index // 2
+            )
+            if selection is None:
+                self._log_grpo_context(
+                    next_step=next_step,
+                    update_index=update_index,
+                    task=pool_name,
+                    sample=None,
+                    selection=None,
+                    status="no_eligible_context",
+                )
+                return {
+                    "grpo/skipped": 1.0,
+                    "grpo/pool": pool_name,
+                    "grpo/skip_reason": "no_eligible_context",
+                }
+            sample = selection.sample
+        else:
+            if not self.grpo_ar_pool or not self.grpo_fim_pool:
+                return None
+            pool = self.grpo_ar_pool if pool_name == "ar" else self.grpo_fim_pool
+            sample = pool[(update_index // 2) % len(pool)]
 
         if pool_name == "ar":
             prepared = prepare_grpo_step_ar(model, sample, config, fabric.device)
         else:
             prepared = prepare_grpo_step(model, sample, config, fabric.device)
         if prepared is None:
-            return {"grpo/skipped": 1.0, "grpo/pool": pool_name}
+            self._log_grpo_context(
+                next_step=next_step,
+                update_index=update_index,
+                task=pool_name,
+                sample=sample,
+                selection=selection,
+                status="rollout_skipped",
+            )
+            return {
+                "grpo/skipped": 1.0,
+                "grpo/pool": pool_name,
+                "grpo/skip_reason": "rollout_skipped",
+            }
         # prepare_grpo_step[_ar] run under torch.inference_mode() (correct,
         # faster than no_grad, for pure sampling/scoring with no gradient
         # ever needed there) -- but that permanently tags every tensor
@@ -367,15 +475,32 @@ class ByteTrainingRuntime:
             metrics["grpo/psnr_mean"] = float(finite_psnrs.mean())
         metrics.update(loss_metrics)
         metrics["grpo/loss"] = final_loss
+        if selection is not None:
+            metrics["grpo/context_dataset_index"] = float(
+                selection.dataset_index
+            )
+            metrics["grpo/context_selection_attempt"] = float(selection.attempt)
+        self._log_grpo_context(
+            next_step=next_step,
+            update_index=update_index,
+            task=pool_name,
+            sample=sample,
+            selection=selection,
+            status="updated",
+            prepared=prepared,
+        )
         return metrics
 
-    def log_grpo(self, fabric: Fabric, metrics: dict[str, float], step: int) -> None:
+    def log_grpo(
+        self, fabric: Fabric, metrics: dict[str, float | str], step: int
+    ) -> None:
         pool = metrics.get("grpo/pool", "?")
         if metrics.get("grpo/skipped"):
             fabric.log_dict(
                 {k: v for k, v in metrics.items() if isinstance(v, (int, float))}, step=step
             )
-            fabric.print(f"GRPO step {step} [{pool}] skipped: reference frame did not decode strictly")
+            reason = metrics.get("grpo/skip_reason", "rollout_skipped")
+            fabric.print(f"GRPO step {step} [{pool}] skipped: {reason}")
             return
         # fabric.log_dict requires scalar values; string fields (pool/task) are
         # print-only diagnostics, not logged as metrics.

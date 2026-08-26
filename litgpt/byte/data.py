@@ -1426,6 +1426,24 @@ class ByteStreamWindowDataset(Dataset):
             ),
         )
 
+    def draw_fim_hole_spec(
+        self,
+        idx: int,
+        rng: random.Random,
+    ) -> tuple[int, int, int, int] | None:
+        """Draw one legal FIM hole for a window using the caller-owned RNG.
+
+        Online consumers provide their own deterministic seed so selection can
+        be reproduced across checkpoint resume without depending on DataLoader
+        worker RNG state.
+        """
+        sample = self.samples[idx]
+        data = sample.h264_path.read_bytes()
+        candidates = self._fim_candidates(sample, data)
+        if not candidates:
+            return None
+        return self._draw_hole_spec(candidates, rng)
+
     def fim_item_for_hole(
         self,
         idx: int,

@@ -341,6 +341,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grpo-group-size", type=int, default=64)
     parser.add_argument("--grpo-ar-pool-size", type=int, default=16)
     parser.add_argument("--grpo-fim-pool-size", type=int, default=16)
+    parser.add_argument(
+        "--grpo-context-sampling",
+        choices=("fixed", "online"),
+        default="fixed",
+        help=(
+            "fixed cycles through materialized AR/FIM pools; online visits the "
+            "whole train split in reproducible shuffled epochs and builds one "
+            "context just in time"
+        ),
+    )
+    parser.add_argument(
+        "--grpo-context-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed for online GRPO window order and FIM-hole sampling; defaults "
+            "to --seed"
+        ),
+    )
     parser.add_argument("--grpo-max-target-bytes", type=int, default=2048)
     parser.add_argument("--grpo-temperature", type=float, default=1.0)
     parser.add_argument("--grpo-top-k", type=int, default=0)
@@ -662,6 +681,10 @@ def main() -> None:
         group_size=args.grpo_group_size,
         ar_pool_size=args.grpo_ar_pool_size,
         fim_pool_size=args.grpo_fim_pool_size,
+        context_sampling=args.grpo_context_sampling,
+        context_seed=(
+            args.seed if args.grpo_context_seed is None else args.grpo_context_seed
+        ),
         max_target_bytes=args.grpo_max_target_bytes,
         temperature=args.grpo_temperature,
         top_k=args.grpo_top_k,

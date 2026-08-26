@@ -76,6 +76,11 @@ class GRPOConfig:
     group_size: int = 64
     ar_pool_size: int = 16
     fim_pool_size: int = 16
+    # ``fixed`` preserves the original materialized context pools. ``online``
+    # visits the complete training split in deterministic shuffled epochs and
+    # builds only the current prompt, drawing a fresh FIM hole on every revisit.
+    context_sampling: str = "fixed"
+    context_seed: int = 42
     max_target_bytes: int = 2048
     temperature: float = 1.0
     top_k: int = 0
@@ -119,7 +124,14 @@ class GRPOConfig:
             raise ValueError("GRPO start step must be non-negative")
         if self.group_size < 2:
             raise ValueError("GRPO requires at least two candidates per group")
-        if self.ar_pool_size <= 0 or self.fim_pool_size <= 0:
+        if self.context_sampling not in {"fixed", "online"}:
+            raise ValueError("GRPO context sampling must be 'fixed' or 'online'")
+        if self.context_seed < 0:
+            raise ValueError("GRPO context seed must be non-negative")
+        if (
+            self.context_sampling == "fixed"
+            and (self.ar_pool_size <= 0 or self.fim_pool_size <= 0)
+        ):
             raise ValueError("GRPO AR and FIM pool sizes must be positive")
         if self.max_target_bytes <= 0:
             raise ValueError("GRPO max target bytes must be positive")
