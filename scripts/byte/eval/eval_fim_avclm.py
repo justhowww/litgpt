@@ -121,11 +121,27 @@ class WindowFimSample:
         """The decoder input with the sampled FIM span physically removed."""
         return self.bytes_before_hole + self.bytes_after_hole
 
+    @property
+    def corrupted_full_stream(self) -> bytes:
+        """The full sampled window with the FIM span physically removed."""
+        return (
+            self.window_bytes[: self.split]
+            + self.window_bytes[self.split + self.gap :]
+        )
+
     def repaired_stream(self, generated: bytes) -> bytes:
         return (
             self.window_bytes[: self.split]
             + generated
             + self.window_bytes[self.split + self.gap : self.frame_hi]
+        )
+
+    def repaired_full_stream(self, generated: bytes) -> bytes:
+        """The full sampled window with ``generated`` inserted into the hole."""
+        return (
+            self.window_bytes[: self.split]
+            + generated
+            + self.window_bytes[self.split + self.gap :]
         )
 
 
@@ -191,7 +207,10 @@ def parse_args() -> argparse.Namespace:
         "--num-visualizations",
         type=int,
         default=8,
-        help="Number of synchronized GT/corrupted/repaired MP4s to save.",
+        help=(
+            "Number of synchronized full-window GT/corrupted-strict/"
+            "corrupted-concealed/repaired-strict MP4s to save."
+        ),
     )
     parser.add_argument("--viz-fps", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
@@ -1197,21 +1216,27 @@ def save_fim_videos(
     if not viz:
         return
     print(
-        f"Saving {len(viz)} FIM GT/corrupted/repaired videos for "
+        f"Saving {len(viz)} four-panel full-window FIM videos for "
         f"{checkpoint_name}/{stop_mode}",
         flush=True,
     )
     for sample_id, item in viz.items():
         out_path = frame_dir / f"sample_{sample_id:04d}_{stop_mode}.mp4"
         saved = save_comparison_video(
-            reference_frames=item["gt_frames"],
-            middle_frames=item["corrupted_frames"],
-            result_frames=item["model_frames"],
+            reference_frames=item["gt_full_frames"],
+            middle_frames=item["corrupted_strict_frames"],
+            second_middle_frames=item["corrupted_concealed_frames"],
+            result_frames=item["repaired_full_frames"],
             out_path=out_path,
             ffmpeg_binary=args.ffmpeg_binary,
             fps=args.viz_fps,
             timeout_sec=args.timeout_sec,
-            columns=("clean GT", "corrupted input", "repaired output"),
+            columns=(
+                "clean GT (strict)",
+                "corrupted input (strict)",
+                "corrupted input (concealed)",
+                "repaired output (strict)",
+            ),
             border_changes_at=item["target_frame"],
             thumbnail_frame=item["target_frame"],
             metadata={
@@ -1219,10 +1244,37 @@ def save_fim_videos(
                 "sample_id": sample_id,
                 "stop_mode": stop_mode,
                 "target_frame": item["target_frame"],
-                "corrupted_strict_decode_status": item[
-                    "corrupted_strict_decode_status"
+                "gt_full_strict_decode_status": item[
+                    "gt_full_strict_decode_status"
                 ],
-                "corrupted_ffmpeg_decode": item["corrupted_ffmpeg_decode"],
+                "gt_full_ffmpeg_decode": item["gt_full_ffmpeg_decode"],
+                "corrupted_strict_decode_status": item["corrupted_strict_status"],
+                "corrupted_strict_ffmpeg_decode": item[
+                    "corrupted_strict_decode"
+                ],
+                "corrupted_concealed_decode_status": item[
+                    "corrupted_concealed_status"
+                ],
+                "corrupted_concealed_ffmpeg_decode": item[
+                    "corrupted_concealed_decode"
+                ],
+                "repaired_full_strict_decode_status": item[
+                    "repaired_full_strict_status"
+                ],
+                "repaired_full_ffmpeg_decode": item[
+                    "repaired_full_strict_decode"
+                ],
+                "panel_frame_counts": {
+                    "clean_gt_strict": len(item["gt_full_frames"]),
+                    "corrupted_strict": len(item["corrupted_strict_frames"]),
+                    "corrupted_concealed": len(
+                        item["corrupted_concealed_frames"]
+                    ),
+                    "repaired_strict": len(item["repaired_full_frames"]),
+                },
+                "panel_stream_bytes": item["panel_stream_bytes"],
+                "visualization_stream_scope": "full sampled window",
+                "corrupted_concealed_is_metric": False,
                 "strict_valid": item["strict_valid"],
                 "h264_path": item["h264_path"],
             },
@@ -1585,12 +1637,23 @@ def main() -> None:
                 )
             else:
                 gt_cache.append(([], "not_run", {}))
-        # The deleted-span input is checkpoint- and stopping-mode-independent. Decode
-        # it lazily only for requested visualizations, and retain any complete PPM
-        # frames emitted before strict FFmpeg reports the corruption. This uses the
-        # same strict command as scoring; it does not enable error concealment.
-        corrupted_viz_cache: dict[
-            int, tuple[list[Tensor], str, dict[str, Any]]
+        # Full-window GT and deleted-span inputs are checkpoint- and stopping-mode-
+        # independent. Decode them lazily for visualization. The strict corrupted
+        # view preserves complete frames emitted before failure; the concealed view
+        # deliberately uses FFmpeg defaults to match BSCV's visible-corruption path.
+        fim_viz_input_cache: dict[
+            int,
+            tuple[
+                list[Tensor],
+                str,
+                dict[str, Any],
+                list[Tensor],
+                str,
+                dict[str, Any],
+                list[Tensor],
+                str,
+                dict[str, Any],
+            ],
         ] = {}
         for stop_mode in args.stop_modes:
             print(f"[{ckpt_name}] FIM AVC-LM stop_mode={stop_mode}", flush=True)
@@ -1771,19 +1834,54 @@ def main() -> None:
                                 model_frames[target_index - 1],
                             )
                     if sample_id < args.num_visualizations:
-                        if sample_id not in corrupted_viz_cache:
-                            corrupted_viz_cache[sample_id] = AR.decode_h264(
-                                sample.corrupted_stream,
+                        if sample_id not in fim_viz_input_cache:
+                            gt_full = AR.decode_h264(
+                                sample.window_bytes,
+                                args,
+                                strict=True,
+                                max_frames=None,
+                            )
+                            corrupted_strict = AR.decode_h264(
+                                sample.corrupted_full_stream,
                                 args,
                                 strict=True,
                                 max_frames=None,
                                 keep_partial_on_error=True,
                             )
+                            corrupted_concealed = AR.decode_h264(
+                                sample.corrupted_full_stream,
+                                args,
+                                strict=False,
+                                max_frames=None,
+                                keep_partial_on_error=True,
+                            )
+                            fim_viz_input_cache[sample_id] = (
+                                *gt_full,
+                                *corrupted_strict,
+                                *corrupted_concealed,
+                            )
                         (
-                            corrupted_frames,
-                            corrupted_status,
-                            corrupted_decode,
-                        ) = corrupted_viz_cache[sample_id]
+                            gt_full_frames,
+                            gt_full_status,
+                            gt_full_decode,
+                            corrupted_strict_frames,
+                            corrupted_strict_status,
+                            corrupted_strict_decode,
+                            corrupted_concealed_frames,
+                            corrupted_concealed_status,
+                            corrupted_concealed_decode,
+                        ) = fim_viz_input_cache[sample_id]
+                        (
+                            repaired_full_frames,
+                            repaired_full_strict_status,
+                            repaired_full_strict_decode,
+                        ) = AR.decode_h264(
+                            sample.repaired_full_stream(result.data),
+                            args,
+                            strict=True,
+                            max_frames=None,
+                            keep_partial_on_error=True,
+                        )
                         comparison_path = (
                             args.out_dir
                             / "frames"
@@ -1791,14 +1889,42 @@ def main() -> None:
                             / f"sample_{sample_id:04d}_{stop_mode}.mp4"
                         )
                         viz[sample_id] = {
-                            "gt_frames": [frame.cpu() for frame in gt_frames],
-                            "corrupted_frames": [
-                                frame.cpu() for frame in corrupted_frames
+                            "gt_full_frames": [
+                                frame.cpu() for frame in gt_full_frames
                             ],
-                            "model_frames": [frame.cpu() for frame in model_frames],
+                            "corrupted_strict_frames": [
+                                frame.cpu() for frame in corrupted_strict_frames
+                            ],
+                            "corrupted_concealed_frames": [
+                                frame.cpu() for frame in corrupted_concealed_frames
+                            ],
+                            "repaired_full_frames": [
+                                frame.cpu() for frame in repaired_full_frames
+                            ],
                             "target_frame": prefix_frames,
-                            "corrupted_strict_decode_status": corrupted_status,
-                            "corrupted_ffmpeg_decode": corrupted_decode,
+                            "gt_full_strict_decode_status": gt_full_status,
+                            "gt_full_ffmpeg_decode": gt_full_decode,
+                            "corrupted_strict_status": corrupted_strict_status,
+                            "corrupted_strict_decode": corrupted_strict_decode,
+                            "corrupted_concealed_status": (
+                                corrupted_concealed_status
+                            ),
+                            "corrupted_concealed_decode": (
+                                corrupted_concealed_decode
+                            ),
+                            "repaired_full_strict_status": (
+                                repaired_full_strict_status
+                            ),
+                            "repaired_full_strict_decode": (
+                                repaired_full_strict_decode
+                            ),
+                            "panel_stream_bytes": {
+                                "clean_gt": len(sample.window_bytes),
+                                "corrupted": len(sample.corrupted_full_stream),
+                                "repaired": len(
+                                    sample.repaired_full_stream(result.data)
+                                ),
+                            },
                             "strict_valid": strict_valid,
                             "h264_path": str(sample.h264_path),
                         }

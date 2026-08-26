@@ -39,6 +39,7 @@ def save_comparison_video(
     reference_frames: list[Tensor],
     result_frames: list[Tensor],
     middle_frames: list[Tensor] | None = None,
+    second_middle_frames: list[Tensor] | None = None,
     out_path: Path,
     ffmpeg_binary: str,
     fps: int,
@@ -50,18 +51,23 @@ def save_comparison_video(
     thumbnail_frame: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
-    """Write a two- or three-column video aligned to the reference timeline.
+    """Write a two-, three-, or four-column aligned comparison video.
 
     ``left_blank_from`` or ``middle_blank_from`` turns that panel into an AR-input
     view: observed prefix frames remain visible and unknown continuation frames are
     black. ``border_changes_at`` draws green borders before the task boundary and
     red borders from the first target frame onward on every panel. Passing
-    ``middle_frames`` produces ``reference | input | result``; omitted preserves a
-    two-column ``reference | result`` layout.
+    ``middle_frames`` produces ``reference | input | result``.
+    ``second_middle_frames`` adds a second view of that input before the result,
+    as used for strict-versus-concealed FIM corruption decoding.
     """
     if not reference_frames:
         return False
-    expected_columns = 3 if middle_frames is not None else 2
+    if second_middle_frames is not None and middle_frames is None:
+        raise ValueError("second_middle_frames requires middle_frames")
+    expected_columns = 2 + int(middle_frames is not None) + int(
+        second_middle_frames is not None
+    )
     if len(columns) != expected_columns:
         raise ValueError(
             f"Expected {expected_columns} column labels, received {len(columns)}"
@@ -99,6 +105,14 @@ def save_comparison_video(
                     else failed
                 )
             )
+        second_middle = None
+        if second_middle_frames is not None:
+            second_middle = (
+                second_middle_frames[frame_index]
+                if frame_index < len(second_middle_frames)
+                and second_middle_frames[frame_index].shape == gt_frame.shape
+                else failed
+            )
         if border_changes_at is not None:
             color = (
                 (0.0, 0.85, 0.0) if frame_index < border_changes_at else (1.0, 0.0, 0.0)
@@ -106,11 +120,25 @@ def save_comparison_video(
             left = _border(left, color)
             if middle is not None:
                 middle = _border(middle, color)
+            if second_middle is not None:
+                second_middle = _border(second_middle, color)
             right = _border(right, color)
         row = (
-            (left, separator, middle, separator, right)
-            if middle is not None
-            else (left, separator, right)
+            (
+                left,
+                separator,
+                middle,
+                separator,
+                second_middle,
+                separator,
+                right,
+            )
+            if second_middle is not None
+            else (
+                (left, separator, middle, separator, right)
+                if middle is not None
+                else (left, separator, right)
+            )
         )
         panels.append(torch.cat(row, dim=1).clamp(0, 1))
 
