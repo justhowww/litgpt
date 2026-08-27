@@ -84,6 +84,34 @@ def _select_training_strategy(
     )
 
 
+def _freeze_inactive_megabyte_ddp_parameters(
+    model: GPT,
+    *,
+    world_size: int,
+    grpo: GRPOConfig | None,
+) -> None:
+    """Exclude permanently dormant MEGABYTE weights from GRPO's DDP reducer.
+
+    Patched-byte models use ``megabyte_global_wte`` for global input and the
+    tied ``megabyte_local.wte`` matrix for local input/output.  The ordinary
+    byte ``transformer.wte`` and ``lm_head`` remain in checkpoints for format
+    compatibility but never participate in a patch-8 forward.  DDP otherwise
+    expects gradients for them and fails at the next forward.
+
+    Scope this to multi-rank GRPO so ordinary FSDP pretraining keeps its
+    existing parameter layout and checkpoint/resume behavior.
+    """
+    if (
+        world_size <= 1
+        or grpo is None
+        or not grpo.enabled
+        or model.config.byte_patch_size <= 1
+    ):
+        return
+    model.lm_head.requires_grad_(False)
+    model.transformer.wte.requires_grad_(False)
+
+
 def setup(
     model_name: str,
     model_config: Config | None = None,
@@ -275,6 +303,11 @@ def main(
 
     if train.tie_embeddings:
         model.transformer.wte.weight = model.lm_head.weight
+    _freeze_inactive_megabyte_ddp_parameters(
+        model,
+        world_size=devices * num_nodes,
+        grpo=grpo,
+    )
     if train.max_seq_length:
         model.max_seq_length = train.max_seq_length
 

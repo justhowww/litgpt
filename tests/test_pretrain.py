@@ -15,6 +15,7 @@ from litgpt import pretrain
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.byte.grpo import GRPOConfig
 from litgpt.config import Config
+from litgpt.model import GPT
 from litgpt.pretrain import initialize_weights
 from litgpt.utils import _RunIf
 
@@ -61,6 +62,58 @@ def test_multi_gpu_grpo_selects_replicated_ddp():
     assert isinstance(
         pretrain._select_training_strategy(4, 1, None), FSDPStrategy
     )
+
+
+def test_multi_gpu_grpo_freezes_only_inactive_megabyte_parameters():
+    config = Config(
+        block_size=4,
+        n_layer=1,
+        n_embd=16,
+        n_head=4,
+        vocab_size=264,
+        padding_multiple=8,
+        byte_patch_size=4,
+        megabyte_local_n_layer=1,
+        megabyte_local_n_embd=16,
+        megabyte_local_n_head=4,
+    )
+    model = GPT(config)
+
+    pretrain._freeze_inactive_megabyte_ddp_parameters(
+        model,
+        world_size=4,
+        grpo=GRPOConfig(interval=1, group_size=2),
+    )
+
+    assert not model.lm_head.weight.requires_grad
+    assert not model.transformer.wte.weight.requires_grad
+    assert model.megabyte_global_wte.weight.requires_grad
+    assert model.megabyte_local.wte.weight.requires_grad
+
+
+def test_megabyte_parameters_remain_unchanged_outside_multi_gpu_grpo():
+    config = Config(
+        block_size=4,
+        n_layer=1,
+        n_embd=16,
+        n_head=4,
+        vocab_size=264,
+        padding_multiple=8,
+        byte_patch_size=4,
+        megabyte_local_n_layer=1,
+        megabyte_local_n_embd=16,
+        megabyte_local_n_head=4,
+    )
+    model = GPT(config)
+
+    pretrain._freeze_inactive_megabyte_ddp_parameters(
+        model,
+        world_size=1,
+        grpo=GRPOConfig(interval=1, group_size=2),
+    )
+
+    assert model.lm_head.weight.requires_grad
+    assert model.transformer.wte.weight.requires_grad
 
 
 def test_resume_rebases_microiterations_from_optimizer_step():
