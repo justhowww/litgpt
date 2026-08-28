@@ -70,6 +70,7 @@ class ByteTrainingRuntime:
     ce_byte_only: bool = False
     eos_loss_weight: float = 1.0
     eos_aux_loss_weight: float = 0.0
+    fim_span_loss_weight: float = 0.0
     reconstruction_config: ReconstructionEvalConfig | None = None
     reconstruction_samples: dict[str, list[ReconstructionSample]] = field(
         default_factory=dict
@@ -102,6 +103,7 @@ class ByteTrainingRuntime:
         ce_byte_only: bool,
         eos_loss_weight: float,
         eos_aux_loss_weight: float,
+        fim_span_loss_weight: float,
         reconstruction_config: ReconstructionEvalConfig | None,
         mrt_config: MRTConfig | None,
         free_run_config: FreeRunEvalConfig | None = None,
@@ -259,11 +261,14 @@ class ByteTrainingRuntime:
 
         if ce_loss_weight < 0:
             raise ValueError("CE loss weight must be non-negative")
+        if fim_span_loss_weight < 0:
+            raise ValueError("FIM span loss weight must be non-negative")
         return cls(
             ce_loss_weight=ce_loss_weight,
             ce_byte_only=ce_byte_only,
             eos_loss_weight=eos_loss_weight,
             eos_aux_loss_weight=eos_aux_loss_weight,
+            fim_span_loss_weight=fim_span_loss_weight,
             reconstruction_config=reconstruction_config,
             reconstruction_samples=reconstruction_samples,
             mrt_config=mrt_config,
@@ -279,13 +284,28 @@ class ByteTrainingRuntime:
             grpo_world_size=fabric.world_size,
         )
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return byte_training_loss(
+    def loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        target_region_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.loss_terms(logits, targets, target_region_ids)["objective"]
+
+    def loss_terms(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        target_region_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return byte_training_loss_terms(
             logits,
             targets,
             ce_byte_only=self.ce_byte_only,
             eos_loss_weight=self.eos_loss_weight,
             eos_aux_loss_weight=self.eos_aux_loss_weight,
+            target_region_ids=target_region_ids,
+            fim_span_loss_weight=self.fim_span_loss_weight,
         )
 
     def should_run_mrt(self, next_step: int, is_accumulating: bool) -> bool:
@@ -1180,6 +1200,41 @@ def balanced_eos_auxiliary_loss(
     return 0.5 * (positive_loss + negative_loss)
 
 
+def fim_span_byte_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    target_region_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Mean CE over missing FIM bytes, excluding EOS and control tokens.
+
+    ``target_region_ids`` must be aligned with the targets rather than the
+    model inputs.  This distinction matters for patched-byte training, where
+    the completed target patch is shifted into the next global position.
+    Returning a differentiable zero for AR-only batches keeps mixed AR/FIM
+    training well-defined without changing their ordinary full-sequence CE.
+    """
+    if target_region_ids.shape != targets.shape:
+        raise ValueError("target_region_ids must have the same shape as targets")
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    selected = (
+        (target_region_ids.reshape(-1) == REGION_BRIDGE)
+        & (flat_targets != IGNORE_INDEX)
+        & (flat_targets >= 0)
+        & (flat_targets < BYTE_VOCAB_SIZE)
+    )
+    # A masked reduction avoids data-dependent indexing and host synchronization,
+    # keeping the loss compatible with torch.compile and AR-only mixed batches.
+    losses = torch.nn.functional.cross_entropy(
+        flat_logits,
+        flat_targets,
+        ignore_index=IGNORE_INDEX,
+        reduction="none",
+    )
+    selected_float = selected.to(losses.dtype)
+    return (losses * selected_float).sum() / selected_float.sum().clamp_min(1)
+
+
 def byte_training_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -1187,10 +1242,36 @@ def byte_training_loss(
     ce_byte_only: bool = False,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
+    target_region_ids: torch.Tensor | None = None,
+    fim_span_loss_weight: float = 0.0,
 ) -> torch.Tensor:
-    """Combine byte CE with an optional balanced EOS calibration objective."""
+    """Combine full CE with optional normalized FIM-span and EOS objectives."""
+    return byte_training_loss_terms(
+        logits,
+        targets,
+        ce_byte_only=ce_byte_only,
+        eos_loss_weight=eos_loss_weight,
+        eos_aux_loss_weight=eos_aux_loss_weight,
+        target_region_ids=target_region_ids,
+        fim_span_loss_weight=fim_span_loss_weight,
+    )["objective"]
+
+
+def byte_training_loss_terms(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    ce_byte_only: bool = False,
+    eos_loss_weight: float = 1.0,
+    eos_aux_loss_weight: float = 0.0,
+    target_region_ids: torch.Tensor | None = None,
+    fim_span_loss_weight: float = 0.0,
+) -> dict[str, torch.Tensor]:
+    """Return raw loss terms and their weighted training objective."""
     if eos_aux_loss_weight < 0:
         raise ValueError("eos_aux_loss_weight must be non-negative")
+    if fim_span_loss_weight < 0:
+        raise ValueError("fim_span_loss_weight must be non-negative")
     if ce_byte_only:
         supervised_targets = targets[targets != IGNORE_INDEX]
         if bool((supervised_targets >= BYTE_VOCAB_SIZE).any()):
@@ -1200,10 +1281,31 @@ def byte_training_loss(
         # Exclude EOS and all structural/control tokens from CE normalization.
         # This gives their logits zero CE gradient in oracle-length ablations.
         logits = logits[..., :BYTE_VOCAB_SIZE]
-    loss = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
-    if eos_aux_loss_weight == 0:
-        return loss
-    return loss + eos_aux_loss_weight * balanced_eos_auxiliary_loss(logits, targets)
+    full_ce = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
+    zero = logits.sum() * 0.0
+    fim_span_ce = zero
+    if fim_span_loss_weight > 0:
+        if target_region_ids is None:
+            raise ValueError(
+                "target_region_ids are required when fim_span_loss_weight is positive"
+            )
+        fim_span_ce = fim_span_byte_cross_entropy(
+            logits, targets, target_region_ids
+        )
+    eos_aux = zero
+    if eos_aux_loss_weight > 0:
+        eos_aux = balanced_eos_auxiliary_loss(logits, targets)
+    objective = (
+        full_ce
+        + fim_span_loss_weight * fim_span_ce
+        + eos_aux_loss_weight * eos_aux
+    )
+    return {
+        "full_ce": full_ce,
+        "fim_span_ce": fim_span_ce,
+        "eos_aux": eos_aux,
+        "objective": objective,
+    }
 
 
 def namespace_reconstruction_metrics(

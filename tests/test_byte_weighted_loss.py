@@ -3,10 +3,12 @@ import torch
 import torch.nn.functional as F
 
 from litgpt.data.byte_data import IGNORE_INDEX, SEQ_EOS_ID
+from litgpt.byte.data import REGION_BRIDGE, REGION_PREFIX
 from litgpt.pretrain import (
     balanced_eos_auxiliary_loss,
     byte_training_loss,
     byte_weighted_cross_entropy,
+    fim_span_byte_cross_entropy,
 )
 
 
@@ -88,6 +90,38 @@ def test_byte_training_loss_adds_balanced_eos_objective():
     )
 
     assert torch.allclose(actual, byte_ce + 0.5 * eos_aux)  # The coefficient controls only EOS calibration.
+
+
+def test_fim_span_loss_selects_bridge_bytes_and_excludes_eos():
+    logits = torch.randn(1, 4, SEQ_EOS_ID + 1)
+    targets = torch.tensor([[11, 12, SEQ_EOS_ID, 13]])
+    regions = torch.tensor(
+        [[REGION_PREFIX, REGION_BRIDGE, REGION_BRIDGE, REGION_BRIDGE]]
+    )
+
+    expected = F.cross_entropy(logits[0, [1, 3]], targets[0, [1, 3]])
+    actual = fim_span_byte_cross_entropy(logits, targets, regions)
+
+    assert torch.allclose(actual, expected)
+
+
+def test_byte_training_loss_adds_normalized_fim_span_objective():
+    logits = torch.randn(1, 4, SEQ_EOS_ID + 1)
+    targets = torch.tensor([[11, 12, SEQ_EOS_ID, 13]])
+    regions = torch.tensor(
+        [[REGION_PREFIX, REGION_BRIDGE, REGION_BRIDGE, REGION_BRIDGE]]
+    )
+    full_ce = byte_weighted_cross_entropy(logits, targets)
+    span_ce = fim_span_byte_cross_entropy(logits, targets, regions)
+
+    actual = byte_training_loss(
+        logits,
+        targets,
+        target_region_ids=regions,
+        fim_span_loss_weight=0.5,
+    )
+
+    assert torch.allclose(actual, full_ce + 0.5 * span_ce)
 
 
 def test_byte_only_ce_excludes_eos_and_control_logits():

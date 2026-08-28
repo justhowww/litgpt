@@ -255,6 +255,18 @@ def parse_args() -> argparse.Namespace:
             "Requires --use-eos when positive."
         ),
     )
+    parser.add_argument(
+        "--fim-span-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for a separately normalized CE over missing FIM byte targets. "
+            "Use with --fim-loss-scope full to retain complete causal-FIM "
+            "supervision without letting a short repair span be buried by its "
+            "surrounding context. EOS is excluded; calibrate it independently "
+            "with --eos-aux-loss-weight."
+        ),
+    )
     parser.add_argument("--fim-min-gap", type=int, default=64)
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
@@ -465,6 +477,14 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight must be non-negative")
     if args.eos_aux_loss_weight > 0 and not args.use_eos:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
+    if args.fim_span_loss_weight < 0:
+        raise ValueError("--fim-span-loss-weight must be non-negative")
+    if args.fim_span_loss_weight > 0 and (
+        args.p_fim <= 0 or args.fim_loss_scope != "full"
+    ):
+        raise ValueError(
+            "--fim-span-loss-weight requires --p-fim > 0 and --fim-loss-scope full"
+        )
     if args.ce_byte_only and args.use_eos:
         raise ValueError("--ce-byte-only cannot train supervised EOS targets")
     if args.fixed_fim_holes_per_window > 0 and (
@@ -728,6 +748,7 @@ def main() -> None:
         ce_byte_only=args.ce_byte_only,
         eos_loss_weight=args.eos_loss_weight,
         eos_aux_loss_weight=args.eos_aux_loss_weight,
+        fim_span_loss_weight=args.fim_span_loss_weight,
         mrt=mrt,
         free_run_eval=free_run_eval,
         grpo=grpo,

@@ -71,6 +71,12 @@ FIM_FORMAT=${FIM_FORMAT:-psm}
 # span = repair-only target (legacy); full = causal next-token loss across the
 # complete reordered FIM sequence, matching standard FIM pretraining.
 FIM_LOSS_SCOPE=${FIM_LOSS_SCOPE:-span}
+# Optional auxiliary objectives.  The span term is normalized over missing raw
+# bytes only, so its strength is independent of the surrounding window length.
+# EOS remains separate because it is one boundary decision, not a content byte.
+FIM_SPAN_LOSS_WEIGHT=${FIM_SPAN_LOSS_WEIGHT:-0.0}
+EOS_LOSS_WEIGHT=${EOS_LOSS_WEIGHT:-1.0}
+EOS_AUX_LOSS_WEIGHT=${EOS_AUX_LOSS_WEIGHT:-0.0}
 # On by default: train a terminator (SEQ_EOS after f_middle) rather than relying on
 # an oracle-supplied span length, which is a training-time convenience a real
 # deployment wouldn't have. Lifts the vocab (vocab_size_for_fim_format); phase 1
@@ -162,6 +168,9 @@ cmd=(
     --p-fim "${P_FIM}"
     --fim-format "${FIM_FORMAT}"
     --fim-loss-scope "${FIM_LOSS_SCOPE}"
+    --fim-span-loss-weight "${FIM_SPAN_LOSS_WEIGHT}"
+    --eos-loss-weight "${EOS_LOSS_WEIGHT}"
+    --eos-aux-loss-weight "${EOS_AUX_LOSS_WEIGHT}"
     --fim-min-gap "${FIM_MIN_GAP}"
     --fim-max-gap "${FIM_MAX_GAP}"
     --slice-header-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"
@@ -275,7 +284,7 @@ if [[ "${COMPILE}" == "1" ]]; then
 fi
 
 echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} patch=${BYTE_PATCH_SIZE} local=${MEGABYTE_LOCAL_LAYERS}L/${MEGABYTE_LOCAL_EMBD}D/${MEGABYTE_LOCAL_HEADS}H raw_byte_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE)) steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
-echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fixed_fim_holes_per_window=${FIXED_FIM_HOLES_PER_WINDOW} fim_format=${FIM_FORMAT} fim_loss_scope=${FIM_LOSS_SCOPE} use_eos=${USE_EOS} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
+echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fixed_fim_holes_per_window=${FIXED_FIM_HOLES_PER_WINDOW} fim_format=${FIM_FORMAT} fim_loss_scope=${FIM_LOSS_SCOPE} fim_span_loss_weight=${FIM_SPAN_LOSS_WEIGHT} use_eos=${USE_EOS} eos_loss_weight=${EOS_LOSS_WEIGHT} eos_aux_loss_weight=${EOS_AUX_LOSS_WEIGHT} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
 if [[ "${GRPO_INTERVAL}" != "0" ]]; then
     echo "[grpo] interval=${GRPO_INTERVAL} start=${GRPO_START_STEP} group_per_rank=${GRPO_GROUP_SIZE} context_sampling=${GRPO_CONTEXT_SAMPLING} learned_eos=${GRPO_LEARNED_EOS} kl=${GRPO_KL_COEFF} ffmpeg=$(command -v "${GRPO_FFMPEG_BINARY}") initial=${INITIAL_CHECKPOINT_DIR} reference=${GRPO_REFERENCE_CHECKPOINT_DIR}"
 fi

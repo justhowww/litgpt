@@ -145,6 +145,7 @@ def setup(
     ce_byte_only: bool = False,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
+    fim_span_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
     free_run_eval: FreeRunEvalConfig | None = None,
     grpo: GRPOConfig | None = None,
@@ -254,6 +255,7 @@ def setup(
         ce_byte_only=ce_byte_only,
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
+        fim_span_loss_weight=fim_span_loss_weight,
         mrt=mrt,
         free_run_eval=free_run_eval,
         grpo=grpo,
@@ -283,6 +285,7 @@ def main(
     ce_byte_only: bool = False,
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
+    fim_span_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
     free_run_eval: FreeRunEvalConfig | None = None,
     grpo: GRPOConfig | None = None,
@@ -334,6 +337,7 @@ def main(
         ce_byte_only=ce_byte_only,
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
+        fim_span_loss_weight=fim_span_loss_weight,
         reconstruction_config=reconstruction_eval,
         mrt_config=mrt,
         free_run_config=free_run_eval,
@@ -576,6 +580,15 @@ def fit(
     running_loss = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(
         fabric.device
     )
+    running_full_ce = RunningMean(
+        window=gradient_accumulation_iters, sync_on_compute=False
+    ).to(fabric.device)
+    running_fim_span_ce = RunningMean(
+        window=gradient_accumulation_iters, sync_on_compute=False
+    ).to(fabric.device)
+    running_eos_aux = RunningMean(
+        window=gradient_accumulation_iters, sync_on_compute=False
+    ).to(fabric.device)
     # Track the CE represented by one optimizer step. MRT is applied only at
     # the accumulation boundary, so a single final microbatch is not a fair
     # scalar comparison with its decoder-risk update.
@@ -615,7 +628,19 @@ def fit(
         )
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(**model_inputs)
-            loss = byte_runtime.loss(logits, targets)
+            target_region_ids = None
+            if isinstance(train_data, dict):
+                target_region_ids = train_data.get("target_region_ids")
+                if target_region_ids is None:
+                    target_region_ids = train_data.get("region_ids")
+                if isinstance(target_region_ids, torch.Tensor):
+                    target_region_ids = target_region_ids[
+                        :, : model.max_seq_length
+                    ].contiguous().long()
+            loss_terms = byte_runtime.loss_terms(
+                logits, targets, target_region_ids
+            )
+            loss = loss_terms["objective"]
             # Byte-domain experiments may make decoder risk the primary
             # objective while retaining a small CE syntax regularizer.
             fabric.backward(
@@ -656,6 +681,9 @@ def fit(
         run_grpo = byte_runtime.should_run_grpo(state["step_count"] + 1, is_accumulating)
 
         running_loss.update(loss.detach())
+        running_full_ce.update(loss_terms["full_ce"].detach())
+        running_fim_span_ce.update(loss_terms["fim_span_ce"].detach())
+        running_eos_aux.update(loss_terms["eos_aux"].detach())
 
         if not is_accumulating:
             fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
@@ -698,6 +726,10 @@ def fit(
             elapsed_steps = completed_steps - initial_step
             metrics = {
                 "loss": loss,
+                "training/full_ce": running_full_ce.compute().item(),
+                "training/fim_span_ce": running_fim_span_ce.compute().item(),
+                "training/eos_aux_loss": running_eos_aux.compute().item(),
+                "training/objective": loss,
                 "iter": state["iter_num"],
                 "step": completed_steps,
                 "epoch": train_iterator.epoch,
@@ -728,9 +760,20 @@ def fit(
                 metrics["gpu_mem_alloc_gb"] = torch.cuda.max_memory_allocated() / 1e9
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
+            objective_detail = ""
+            if (
+                byte_runtime.fim_span_loss_weight > 0
+                or byte_runtime.eos_aux_loss_weight > 0
+            ):
+                objective_detail = (
+                    f" full: {metrics['training/full_ce']:.3f},"
+                    f" span: {metrics['training/fim_span_ce']:.3f},"
+                    f" eos_aux: {metrics['training/eos_aux_loss']:.3f},"
+                )
             fabric.print(
                 f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
                 f" loss train: {metrics['loss']:.3f},"
+                f"{objective_detail}"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
