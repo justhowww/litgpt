@@ -25,6 +25,7 @@ from litgpt.byte.data import (
 )
 from litgpt.byte.grpo import (
     GRPOConfig,
+    GRPOPreparationResult,
     build_group_patch_inputs,
     group_token_log_probabilities,
     grpo_clipped_loss,
@@ -310,6 +311,7 @@ class ByteTrainingRuntime:
         sample: FreeRunSample | ReconstructionSample | None,
         selection: GRPOContextSelection | None,
         status: str,
+        preparation: GRPOPreparationResult | None = None,
         prepared=None,
     ) -> None:
         """Append a reproducibility record for one GRPO context draw."""
@@ -337,6 +339,29 @@ class ByteTrainingRuntime:
             ),
             "h264_path": str(sample.h264_path) if sample is not None else None,
         }
+        if preparation is not None:
+            record.update(
+                {
+                    "preparation_status": preparation.status,
+                    "candidate_count": preparation.candidate_count,
+                    "stopped_count": preparation.stopped_count,
+                    "not_stopped_count": (
+                        preparation.candidate_count - preparation.stopped_count
+                    ),
+                    "decoded_count": preparation.decoded_count,
+                    "decode_failed_after_stop_count": (
+                        preparation.stopped_count - preparation.decoded_count
+                    ),
+                    "reward_std": preparation.reward_std,
+                    "has_policy_signal": preparation.has_policy_signal,
+                    "eos_emitted_count": (
+                        preparation.stopped_count if task == "fim" else None
+                    ),
+                    "frame_target_stopped_count": (
+                        preparation.stopped_count if task == "ar" else None
+                    ),
+                }
+            )
         if prepared is not None:
             record.update(
                 {
@@ -361,6 +386,43 @@ class ByteTrainingRuntime:
         )
         ready = fabric.all_reduce(ready, reduce_op="min")
         return bool(ready.item())
+
+    @staticmethod
+    def _distributed_grpo_preparation_metrics(
+        fabric: Fabric,
+        preparation: GRPOPreparationResult,
+    ) -> dict[str, float]:
+        """Sum fixed rollout diagnostics across ranks before DDP backward."""
+        values = torch.tensor(
+            [
+                float(preparation.prepared is not None),
+                float(preparation.has_policy_signal),
+                float(preparation.status == "zero_reward_variance"),
+                float(preparation.status == "reference_decode_failed"),
+                float(preparation.status == "generation_failed"),
+                float(preparation.candidate_count),
+                float(preparation.stopped_count),
+                float(preparation.candidate_count - preparation.stopped_count),
+                float(preparation.decoded_count),
+                float(preparation.stopped_count - preparation.decoded_count),
+            ],
+            device=fabric.device,
+        )
+        if fabric.world_size > 1:
+            values = fabric.all_reduce(values, reduce_op="sum")
+        keys = (
+            "grpo/prepared_contexts",
+            "grpo/contexts_with_policy_signal",
+            "grpo/contexts_zero_reward_variance",
+            "grpo/reference_decode_failed_contexts",
+            "grpo/generation_failed_contexts",
+            "grpo/candidates_total",
+            "grpo/candidates_stopped",
+            "grpo/candidates_not_stopped",
+            "grpo/candidates_decoded",
+            "grpo/candidates_decode_failed_after_stop",
+        )
+        return {key: float(values[i]) for i, key in enumerate(keys)}
 
     @staticmethod
     def _distributed_mean_metrics(
@@ -446,10 +508,22 @@ class ByteTrainingRuntime:
         assert sample is not None
 
         if pool_name == "ar":
-            prepared = prepare_grpo_step_ar(model, sample, config, fabric.device)
+            preparation = prepare_grpo_step_ar(
+                model, sample, config, fabric.device
+            )
         else:
-            prepared = prepare_grpo_step(model, sample, config, fabric.device)
-        if not self._all_ranks_ready(fabric, prepared is not None):
+            preparation = prepare_grpo_step(
+                model, sample, config, fabric.device
+            )
+        preparation_metrics = self._distributed_grpo_preparation_metrics(
+            fabric, preparation
+        )
+        prepared = preparation.prepared
+        unavailable_contexts = (
+            preparation_metrics["grpo/reference_decode_failed_contexts"]
+            + preparation_metrics["grpo/generation_failed_contexts"]
+        )
+        if unavailable_contexts:
             self._log_grpo_context(
                 next_step=next_step,
                 update_index=update_index,
@@ -457,17 +531,49 @@ class ByteTrainingRuntime:
                 sample=sample,
                 selection=selection,
                 status=(
-                    "rollout_skipped"
+                    "rollout_unavailable"
                     if prepared is None
-                    else "peer_rollout_skipped"
+                    else "peer_rollout_unavailable"
                 ),
+                preparation=preparation,
             )
-            return {
+            metrics: dict[str, float | str] = {
                 "grpo/skipped": 1.0,
                 "grpo/pool": pool_name,
-                "grpo/skip_reason": "distributed_rollout_skipped",
+                "grpo/skip_reason": (
+                    "distributed_rollout_unavailable"
+                    f"(reference_decode_failed="
+                    f"{int(preparation_metrics['grpo/reference_decode_failed_contexts'])},"
+                    f"generation_failed="
+                    f"{int(preparation_metrics['grpo/generation_failed_contexts'])})"
+                ),
             }
+            metrics.update(preparation_metrics)
+            return metrics
         assert prepared is not None
+
+        active_contexts = preparation_metrics[
+            "grpo/contexts_with_policy_signal"
+        ]
+        if active_contexts == 0:
+            self._log_grpo_context(
+                next_step=next_step,
+                update_index=update_index,
+                task=pool_name,
+                sample=sample,
+                selection=selection,
+                status="no_policy_signal",
+                preparation=preparation,
+                prepared=prepared,
+            )
+            metrics = {
+                "grpo/skipped": 1.0,
+                "grpo/pool": pool_name,
+                "grpo/skip_reason": "zero_reward_variance_on_all_ranks",
+            }
+            metrics.update(preparation_metrics)
+            return metrics
+
         # prepare_grpo_step[_ar] run under torch.inference_mode() (correct,
         # faster than no_grad, for pure sampling/scoring with no gradient
         # ever needed there) -- but that permanently tags every tensor
@@ -478,6 +584,11 @@ class ByteTrainingRuntime:
         # cloning inside prepare_grpo_step[_ar] itself would not help, since
         # the clone would still happen while inference-mode is active.
         advantages = prepared.advantages.clone()
+        # DDP averages gradients across every rank.  Compensate for ranks with
+        # zero-variance groups so the policy gradient remains the mean over
+        # contexts that actually contain a preference signal.  Degenerate
+        # ranks retain all-zero advantages and still enter the same backward.
+        advantages.mul_(fabric.world_size / active_contexts)
 
         raw_model = _unwrap_model(model)
         patch_size = int(raw_model.config.byte_patch_size)
@@ -561,6 +672,15 @@ class ByteTrainingRuntime:
             "grpo/mu": float(config.mu),
         }
         metrics.update(mean_metrics)
+        metrics.update(preparation_metrics)
+        if pool_name == "fim":
+            metrics["grpo/eos_emitted_candidates"] = preparation_metrics[
+                "grpo/candidates_stopped"
+            ]
+        else:
+            metrics["grpo/frame_target_stopped_candidates"] = preparation_metrics[
+                "grpo/candidates_stopped"
+            ]
 
         finite_psnrs = prepared.psnrs[torch.isfinite(prepared.psnrs)]
         psnr_stats = torch.tensor(
@@ -587,7 +707,12 @@ class ByteTrainingRuntime:
             task=pool_name,
             sample=sample,
             selection=selection,
-            status="updated",
+            status=(
+                "updated"
+                if preparation.has_policy_signal
+                else "updated_zero_policy_advantage"
+            ),
+            preparation=preparation,
             prepared=prepared,
         )
         return metrics
@@ -603,7 +728,16 @@ class ByteTrainingRuntime:
                 {k: v for k, v in metrics.items() if isinstance(v, (int, float))}, step=step
             )
             reason = metrics.get("grpo/skip_reason", "rollout_skipped")
-            fabric.print(f"GRPO step {step} [{pool}] skipped: {reason}")
+            fabric.print(
+                f"GRPO step {step} [{pool}] skipped: {reason}; "
+                f"signal_ctx="
+                f"{int(metrics.get('grpo/contexts_with_policy_signal', 0))}/"
+                f"{int(metrics.get('grpo/prepared_contexts', 0))}, "
+                f"stopped={int(metrics.get('grpo/candidates_stopped', 0))}/"
+                f"{int(metrics.get('grpo/candidates_total', 0))}, "
+                f"decoded={int(metrics.get('grpo/candidates_decoded', 0))}/"
+                f"{int(metrics.get('grpo/candidates_total', 0))}"
+            )
             return
         # fabric.log_dict requires scalar values; string fields (pool/task) are
         # print-only diagnostics, not logged as metrics.
@@ -616,7 +750,14 @@ class ByteTrainingRuntime:
             f"decode: {metrics['grpo/decode_rate']:.1%}, "
             f"loss: {metrics['grpo/loss']:.4f}, "
             f"mu: {int(metrics.get('grpo/mu', 1))}, "
-            f"clip_frac: {metrics.get('grpo/clip_fraction', 0.0):.3f}"
+            f"clip_frac: {metrics.get('grpo/clip_fraction', 0.0):.3f}, "
+            f"signal_ctx: "
+            f"{int(metrics.get('grpo/contexts_with_policy_signal', 0))}/"
+            f"{int(metrics.get('grpo/contexts_per_update', 1))}, "
+            f"stopped: {int(metrics.get('grpo/candidates_stopped', 0))}/"
+            f"{int(metrics.get('grpo/candidates_total', 0))}, "
+            f"decoded: {int(metrics.get('grpo/candidates_decoded', 0))}/"
+            f"{int(metrics.get('grpo/candidates_total', 0))}"
             + (
                 f", kl: {metrics['grpo/kl_to_reference']:.4f}"
                 if "grpo/kl_to_reference" in metrics

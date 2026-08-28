@@ -4,8 +4,14 @@ import torch
 from torch import nn
 
 from litgpt.byte.data import SEQ_EOS_ID
-from litgpt.byte.grpo import GRPOConfig, group_token_log_probabilities
+from litgpt.byte.grpo import (
+    GRPOConfig,
+    GRPOPreparationResult,
+    _scored_preparation,
+    group_token_log_probabilities,
+)
 from litgpt.byte.grpo_context import OnlineGRPOContextSampler
+from litgpt.byte.megabyte_inference import GeneratedCandidate
 from litgpt.byte.training import ByteTrainingRuntime
 
 
@@ -80,3 +86,66 @@ def test_grpo_skips_collectively_when_any_rank_is_not_ready():
 
     assert ByteTrainingRuntime._all_ranks_ready(all_ready, True)
     assert not ByteTrainingRuntime._all_ranks_ready(peer_failed, True)
+
+
+def test_zero_variance_group_keeps_candidates_with_zero_advantages():
+    candidates = [
+        GeneratedCandidate(data=bytes([i]), stopped=False) for i in range(4)
+    ]
+
+    result = _scored_preparation(
+        sample=object(),
+        task="fim",
+        candidates=candidates,
+        results=[(-1.0, False, None)] * 4,
+        device=torch.device("cpu"),
+    )
+
+    assert result.status == "zero_reward_variance"
+    assert not result.has_policy_signal
+    assert result.prepared is not None
+    assert torch.equal(
+        result.prepared.advantages, torch.zeros_like(result.prepared.advantages)
+    )
+    assert result.candidate_count == 4
+    assert result.stopped_count == 0
+    assert result.decoded_count == 0
+
+
+class _PreparationSumFabric:
+    world_size = 4
+    device = torch.device("cpu")
+
+    def all_reduce(self, tensor, reduce_op):
+        assert reduce_op == "sum"
+        # Three peer ranks are ready and have policy signal.  Each contributes
+        # four stopped candidates, three of which decode.
+        peer_totals = tensor.new_tensor(
+            [3, 3, 0, 0, 0, 12, 12, 0, 9, 3]
+        )
+        return tensor + peer_totals
+
+
+def test_distributed_preparation_metrics_preserve_zero_variance_rank():
+    local = GRPOPreparationResult(
+        status="zero_reward_variance",
+        prepared=object(),
+        candidate_count=4,
+        stopped_count=0,
+        decoded_count=0,
+        reward_std=0.0,
+        has_policy_signal=False,
+    )
+
+    metrics = ByteTrainingRuntime._distributed_grpo_preparation_metrics(
+        _PreparationSumFabric(), local
+    )
+
+    assert metrics["grpo/prepared_contexts"] == 4
+    assert metrics["grpo/contexts_with_policy_signal"] == 3
+    assert metrics["grpo/contexts_zero_reward_variance"] == 1
+    assert metrics["grpo/candidates_total"] == 16
+    assert metrics["grpo/candidates_stopped"] == 12
+    assert metrics["grpo/candidates_not_stopped"] == 4
+    assert metrics["grpo/candidates_decoded"] == 9
+    assert metrics["grpo/candidates_decode_failed_after_stop"] == 3

@@ -172,6 +172,75 @@ class PreparedGRPOStep:
     mean_reward: float
 
 
+@dataclass(frozen=True)
+class GRPOPreparationResult:
+    """One rank's rollout preparation outcome and diagnostics.
+
+    ``prepared`` remains available for a zero-variance group so the rank can
+    enter DDP backward with zero policy advantage while useful peer ranks
+    still update.  It is ``None`` only when scoring cannot be constructed at
+    all, for example when the reference frame or candidate generation fails.
+    """
+
+    status: str
+    prepared: PreparedGRPOStep | None = None
+    candidate_count: int = 0
+    stopped_count: int = 0
+    decoded_count: int = 0
+    reward_std: float | None = None
+    has_policy_signal: bool = False
+
+
+def _scored_preparation(
+    *,
+    sample: ReconstructionSample | FreeRunSample,
+    task: str,
+    candidates: list[GeneratedCandidate],
+    results: list[tuple[float, bool, float | None]],
+    device: torch.device,
+) -> GRPOPreparationResult:
+    """Package scored candidates without discarding zero-variance groups."""
+    if len(results) != len(candidates):
+        raise ValueError("GRPO candidate/result count mismatch")
+    rewards = torch.tensor([reward for reward, _, _ in results], device=device)
+    decoded = torch.tensor(
+        [ok for _, ok, _ in results], dtype=torch.bool, device=device
+    )
+    psnrs = torch.tensor(
+        [float("nan") if psnr is None else psnr for _, _, psnr in results],
+        device=device,
+    )
+    reward_std = float(rewards.std(unbiased=False))
+    has_policy_signal = reward_std >= GRPO_EPS
+    stopped_count = sum(int(candidate.stopped) for candidate in candidates)
+    decoded_count = int(decoded.sum())
+    if decoded_count > stopped_count:
+        raise RuntimeError(
+            "GRPO invariant violated: a candidate decoded before satisfying its "
+            "task stopping condition"
+        )
+    prepared = PreparedGRPOStep(
+        sample=sample,
+        task=task,
+        candidates=candidates,
+        rewards=rewards,
+        advantages=grpo_advantages(rewards),
+        decoded=decoded,
+        psnrs=psnrs,
+        decode_rate=float(decoded.float().mean()),
+        mean_reward=float(rewards.mean()),
+    )
+    return GRPOPreparationResult(
+        status="ready" if has_policy_signal else "zero_reward_variance",
+        prepared=prepared,
+        candidate_count=len(candidates),
+        stopped_count=stopped_count,
+        decoded_count=decoded_count,
+        reward_std=reward_std,
+        has_policy_signal=has_policy_signal,
+    )
+
+
 def should_run_grpo(next_step: int, config: GRPOConfig) -> bool:
     """Return whether the upcoming optimizer step includes a GRPO update."""
     return (
@@ -234,13 +303,12 @@ def prepare_grpo_step(
     sample: ReconstructionSample,
     config: GRPOConfig,
     device: torch.device,
-) -> PreparedGRPOStep | None:
+) -> GRPOPreparationResult:
     """Sample a group, decode-score every candidate, and compute advantages.
 
-    Returns ``None`` if the reference frame fails to decode, the prompt/
-    target doesn't fit the model, or the group is degenerate (every
-    candidate scored identically, so the advantage z-score is undefined and
-    there's no gradient signal worth a backward pass).
+    A zero-variance group is returned with zero advantages rather than being
+    discarded.  This is important under DDP: the local rank can contribute a
+    zero policy gradient without cancelling useful peer-rank groups.
     """
     raw_model = _unwrap_model(model)
     stream = sample.h264_path.read_bytes()
@@ -252,7 +320,7 @@ def prepare_grpo_step(
         strict_syntax=True,
     )
     if reference is None:
-        return None
+        return GRPOPreparationResult(status="reference_decode_failed")
 
     was_training = raw_model.training
     raw_model.eval()
@@ -286,7 +354,7 @@ def prepare_grpo_step(
     finally:
         raw_model.train(was_training)
     if not candidates:
-        return None
+        return GRPOPreparationResult(status="generation_failed")
 
     with ThreadPoolExecutor(max_workers=config.decode_workers) as executor:
         results = list(
@@ -295,24 +363,12 @@ def prepare_grpo_step(
                 candidates,
             )
         )
-    rewards = torch.tensor([reward for reward, _, _ in results], device=device)
-    decoded = torch.tensor([ok for _, ok, _ in results], dtype=torch.bool, device=device)
-    psnrs = torch.tensor(
-        [float("nan") if psnr is None else psnr for _, _, psnr in results], device=device
-    )
-    if float(rewards.std(unbiased=False)) < GRPO_EPS:
-        return None
-
-    return PreparedGRPOStep(
+    return _scored_preparation(
         sample=sample,
         task=sample.task,
         candidates=candidates,
-        rewards=rewards,
-        advantages=grpo_advantages(rewards),
-        decoded=decoded,
-        psnrs=psnrs,
-        decode_rate=float(decoded.float().mean()),
-        mean_reward=float(rewards.mean()),
+        results=results,
+        device=device,
     )
 
 
@@ -376,7 +432,7 @@ def prepare_grpo_step_ar(
     sample: FreeRunSample,
     config: GRPOConfig,
     device: torch.device,
-) -> PreparedGRPOStep | None:
+) -> GRPOPreparationResult:
     """Sample an AR group, decode-score every candidate, and compute advantages.
 
     Mirrors ``prepare_grpo_step``'s shape. Ground-truth reference frames are
@@ -397,7 +453,7 @@ def prepare_grpo_step_ar(
         )
         references.append(frame)
     if references[0] is None:
-        return None
+        return GRPOPreparationResult(status="reference_decode_failed")
 
     was_training = raw_model.training
     raw_model.eval()
@@ -417,7 +473,7 @@ def prepare_grpo_step_ar(
     finally:
         raw_model.train(was_training)
     if not candidates:
-        return None
+        return GRPOPreparationResult(status="generation_failed")
 
     with ThreadPoolExecutor(max_workers=config.decode_workers) as executor:
         results = list(
@@ -426,24 +482,12 @@ def prepare_grpo_step_ar(
                 candidates,
             )
         )
-    rewards = torch.tensor([reward for reward, _, _ in results], device=device)
-    decoded = torch.tensor([ok for _, ok, _ in results], dtype=torch.bool, device=device)
-    psnrs = torch.tensor(
-        [float("nan") if psnr is None else psnr for _, _, psnr in results], device=device
-    )
-    if float(rewards.std(unbiased=False)) < GRPO_EPS:
-        return None
-
-    return PreparedGRPOStep(
+    return _scored_preparation(
         sample=sample,
         task="ar",
         candidates=candidates,
-        rewards=rewards,
-        advantages=grpo_advantages(rewards),
-        decoded=decoded,
-        psnrs=psnrs,
-        decode_rate=float(decoded.float().mean()),
-        mean_reward=float(rewards.mean()),
+        results=results,
+        device=device,
     )
 
 
