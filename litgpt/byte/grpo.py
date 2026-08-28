@@ -672,7 +672,11 @@ def build_group_patch_inputs(
 
 
 def group_token_log_probabilities(
-    model: nn.Module, inputs: dict[str, Tensor], labels: Tensor
+    model: nn.Module,
+    inputs: dict[str, Tensor],
+    labels: Tensor,
+    *,
+    include_eos: bool = True,
 ) -> Tensor:
     """Return per-token log-probs, shape ``(B, T, P)``.
 
@@ -681,18 +685,28 @@ def group_token_log_probabilities(
     must all-reduce policy gradients.  Rollout generation is inference-only and
     may unwrap the replicated model; candidate scoring may not.
 
-    Always scores over the same 257-way (256 bytes + EOS) slice used during
-    learned-EOS sampling, remapping SEQ_EOS_ID targets to the extra column --
-    a no-op for real byte targets and for the padding filler (byte 0), so
-    this one path handles oracle-length, learned-EOS, and mixed-stopped
-    groups uniformly without per-row branching.
+    ``include_eos`` must match the rollout action space. Learned-EOS FIM uses
+    257 actions (256 bytes + EOS), while fixed-frame AR and oracle-length FIM
+    sample only 256 bytes. Scoring a different action space from the behavior
+    policy would give GRPO an incorrect likelihood ratio and KL penalty.
     """
     logits = model(**inputs)
-    allowed_logits = torch.cat(
-        (logits[..., :BYTE_VOCAB_SIZE], logits[..., SEQ_EOS_ID : SEQ_EOS_ID + 1]),
-        dim=-1,
-    )
-    target = torch.where(labels == SEQ_EOS_ID, BYTE_VOCAB_SIZE, labels.clamp_min(0))
+    if include_eos:
+        allowed_logits = torch.cat(
+            (
+                logits[..., :BYTE_VOCAB_SIZE],
+                logits[..., SEQ_EOS_ID : SEQ_EOS_ID + 1],
+            ),
+            dim=-1,
+        )
+        target = torch.where(
+            labels == SEQ_EOS_ID, BYTE_VOCAB_SIZE, labels.clamp_min(0)
+        )
+    else:
+        if bool((labels == SEQ_EOS_ID).any()):
+            raise ValueError("byte-only GRPO scoring received an EOS target")
+        allowed_logits = logits[..., :BYTE_VOCAB_SIZE]
+        target = labels.clamp_min(0)
     log_probs = torch.log_softmax(allowed_logits.float(), dim=-1)
     return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
 

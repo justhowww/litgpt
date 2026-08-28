@@ -7,6 +7,7 @@ and reconstruction logging from LitGPT's generic pretraining orchestration.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -612,31 +613,41 @@ class ByteTrainingRuntime:
 
         raw_model = _unwrap_model(model)
         patch_size = int(raw_model.config.byte_patch_size)
-        # AR stops on a structural frame-count condition, not a sampled EOS
-        # token -- there is nothing to append to a stopped AR candidate's
-        # target sequence, unlike FIM's learned-EOS stopping.
+        # The scorer must use the exact action space used during rollout. AR
+        # always samples bytes until its structural frame target. FIM includes
+        # EOS only when learned-EOS generation is enabled.
+        score_eos = pool_name != "ar" and config.learned_eos
         inputs, labels, supervised = build_group_patch_inputs(
             prepared.sample,
             prepared.candidates,
             patch_size,
             fabric.device,
-            append_eos_on_stop=(pool_name != "ar"),
+            append_eos_on_stop=score_eos,
         )
 
         with torch.no_grad(), fabric.autocast():
-            old_gathered = group_token_log_probabilities(model, inputs, labels).detach()
+            old_gathered = group_token_log_probabilities(
+                model, inputs, labels, include_eos=score_eos
+            ).detach()
             reference_gathered = None
             if self.reference_model is not None and config.kl_coeff > 0:
                 reference_gathered = group_token_log_probabilities(
-                    self.reference_model, inputs, labels
+                    self.reference_model,
+                    inputs,
+                    labels,
+                    include_eos=score_eos,
                 ).detach()
 
         loss_metrics: dict[str, float] = {}
         final_loss = 0.0
+        grad_norms_pre_clip: list[float] = []
+        grad_norms_post_clip: list[float] = []
         for _ in range(config.mu):
             optimizer.zero_grad()
             with fabric.autocast():
-                gathered = group_token_log_probabilities(model, inputs, labels)
+                gathered = group_token_log_probabilities(
+                    model, inputs, labels, include_eos=score_eos
+                )
                 loss, loss_metrics = grpo_clipped_loss(
                     gathered,
                     old_gathered,
@@ -647,7 +658,9 @@ class ByteTrainingRuntime:
                     config.clip_range,
                 )
             fabric.backward(loss)
+            grad_norms_pre_clip.append(self.gradient_l2_norm(model))
             fabric.clip_gradients(model, optimizer, max_norm=max_norm)
+            grad_norms_post_clip.append(self.gradient_l2_norm(model))
             optimizer.step()
             final_loss = float(loss.detach())
         optimizer.zero_grad()
@@ -659,6 +672,14 @@ class ByteTrainingRuntime:
             f"grpo/{pool_name}/mean_reward": prepared.mean_reward,
             f"grpo/{pool_name}/decode_rate": prepared.decode_rate,
             "grpo/loss": final_loss,
+            "grpo/grad_norm_pre_clip": sum(grad_norms_pre_clip)
+            / len(grad_norms_pre_clip),
+            "grpo/grad_norm_post_clip": sum(grad_norms_post_clip)
+            / len(grad_norms_post_clip),
+            "grpo/gradient_nonzero": float(any(x > 0 for x in grad_norms_pre_clip)),
+            "grpo/gradient_finite": float(
+                all(math.isfinite(x) for x in grad_norms_pre_clip)
+            ),
         }
         mean_metrics.update(loss_metrics)
         mean_metrics = self._distributed_mean_metrics(fabric, mean_metrics)
@@ -690,6 +711,7 @@ class ByteTrainingRuntime:
             "grpo/rollouts_per_update": float(group_size),
             "grpo/contexts_per_update": float(fabric.world_size),
             "grpo/mu": float(config.mu),
+            "grpo/scoring_includes_eos": float(score_eos),
         }
         metrics.update(mean_metrics)
         metrics.update(preparation_metrics)
@@ -769,6 +791,8 @@ class ByteTrainingRuntime:
             f"(std {metrics['grpo/reward_std']:.4f}), "
             f"decode: {metrics['grpo/decode_rate']:.1%}, "
             f"loss: {metrics['grpo/loss']:.4f}, "
+            f"grad: {metrics.get('grpo/grad_norm_pre_clip', 0.0):.3e}"
+            f"->{metrics.get('grpo/grad_norm_post_clip', 0.0):.3e}, "
             f"mu: {int(metrics.get('grpo/mu', 1))}, "
             f"clip_frac: {metrics.get('grpo/clip_fraction', 0.0):.3f}, "
             f"signal_ctx: "

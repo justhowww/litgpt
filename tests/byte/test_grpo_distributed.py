@@ -20,6 +20,17 @@ class _LogitModel(nn.Module):
         return torch.zeros((2, 3, 8, SEQ_EOS_ID + 1))
 
 
+class _EOSBiasedLogitModel(nn.Module):
+    def __init__(self, eos_logit: float):
+        super().__init__()
+        self.eos_logit = eos_logit
+
+    def forward(self, **_kwargs):
+        logits = torch.zeros((1, 1, 1, SEQ_EOS_ID + 1))
+        logits[..., SEQ_EOS_ID] = self.eos_logit
+        return logits
+
+
 class _ForwardTrackingWrapper(nn.Module):
     """Looks unwrap-able like DDP while recording wrapper forward usage."""
 
@@ -41,6 +52,32 @@ def test_grpo_candidate_scoring_does_not_bypass_distributed_wrapper():
 
     assert model.called
     assert gathered.shape == labels.shape
+
+
+def test_ar_grpo_scoring_excludes_eos_like_fixed_frame_rollout():
+    labels = torch.zeros((1, 1, 1), dtype=torch.long)
+    low_eos = group_token_log_probabilities(
+        _EOSBiasedLogitModel(-20), {}, labels, include_eos=False
+    )
+    high_eos = group_token_log_probabilities(
+        _EOSBiasedLogitModel(20), {}, labels, include_eos=False
+    )
+
+    assert torch.allclose(low_eos, high_eos)
+    expected = torch.full_like(low_eos, -torch.log(torch.tensor(256.0)))
+    assert torch.allclose(low_eos, expected)
+
+
+def test_learned_eos_grpo_scoring_retains_eos_action():
+    labels = torch.zeros((1, 1, 1), dtype=torch.long)
+    low_eos = group_token_log_probabilities(
+        _EOSBiasedLogitModel(-20), {}, labels, include_eos=True
+    )
+    high_eos = group_token_log_probabilities(
+        _EOSBiasedLogitModel(20), {}, labels, include_eos=True
+    )
+
+    assert high_eos < low_eos
 
 
 def test_distributed_context_positions_are_disjoint_within_an_update():
@@ -86,6 +123,16 @@ def test_grpo_skips_collectively_when_any_rank_is_not_ready():
 
     assert ByteTrainingRuntime._all_ranks_ready(all_ready, True)
     assert not ByteTrainingRuntime._all_ranks_ready(peer_failed, True)
+
+
+def test_gradient_l2_norm_detects_nonzero_backward_signal():
+    model = nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    loss = model(torch.ones(1, 2)).square().sum()
+    loss.backward()
+
+    assert ByteTrainingRuntime.gradient_l2_norm(model) > 0
 
 
 def test_zero_variance_group_keeps_candidates_with_zero_advantages():
