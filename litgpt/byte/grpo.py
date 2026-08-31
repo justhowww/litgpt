@@ -718,6 +718,84 @@ def mean_log_probability(gathered: Tensor, supervised: Tensor) -> Tensor:
     return masked.sum(dim=(1, 2)) / counts
 
 
+def grpo_update_direction_metrics(
+    before_log_probs: Tensor,
+    after_log_probs: Tensor,
+    rewards: Tensor,
+    advantages: Tensor,
+    *,
+    tie_tolerance: float = GRPO_EPS,
+) -> dict[str, float]:
+    """Measure whether one GRPO update moves probability toward reward.
+
+    Inputs are one length-normalized sequence log-probability per candidate.
+    The primary quantity is ``mean(advantage * log_probability)``: at ``mu=1``
+    and before adding a KL term, its negative has the same local gradient as
+    :func:`grpo_clipped_loss`. A correct sufficiently-small optimizer step must
+    therefore increase this score.
+
+    Pairwise metrics are diagnostic rather than the primary invariant. Shared
+    model parameters can make some candidate pairs interfere even when the
+    aggregate policy-gradient direction is correct.
+    """
+    tensors = (before_log_probs, after_log_probs, rewards, advantages)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError("GRPO direction metrics expect one-dimensional tensors")
+    if len({int(tensor.numel()) for tensor in tensors}) != 1:
+        raise ValueError("GRPO direction metric tensors must have equal lengths")
+    if before_log_probs.numel() < 2:
+        raise ValueError("GRPO direction metrics require at least two candidates")
+
+    before = before_log_probs.detach().float()
+    after = after_log_probs.detach().float()
+    reward = rewards.detach().float()
+    advantage = advantages.detach().float()
+    delta = after - before
+
+    score_before = (advantage * before).mean()
+    score_after = (advantage * after).mean()
+
+    centered_advantage = advantage - advantage.mean()
+    centered_delta = delta - delta.mean()
+    correlation_denominator = torch.linalg.vector_norm(
+        centered_advantage
+    ) * torch.linalg.vector_norm(centered_delta)
+    advantage_delta_correlation = (
+        float((centered_advantage * centered_delta).sum() / correlation_denominator)
+        if float(correlation_denominator) > tie_tolerance
+        else float("nan")
+    )
+
+    improved_pairs = 0
+    tied_pairs = 0
+    comparable_pairs = 0
+    for high in range(reward.numel()):
+        for low in range(reward.numel()):
+            if float(reward[high] - reward[low]) <= tie_tolerance:
+                continue
+            comparable_pairs += 1
+            margin_delta = float(
+                (after[high] - after[low]) - (before[high] - before[low])
+            )
+            if margin_delta > tie_tolerance:
+                improved_pairs += 1
+            elif abs(margin_delta) <= tie_tolerance:
+                tied_pairs += 1
+
+    return {
+        "policy_score_before": float(score_before),
+        "policy_score_after": float(score_after),
+        "policy_score_delta": float(score_after - score_before),
+        "advantage_delta_correlation": advantage_delta_correlation,
+        "pairwise_comparable": float(comparable_pairs),
+        "pairwise_improved": float(improved_pairs),
+        "pairwise_tied": float(tied_pairs),
+        "pairwise_improved_fraction": (
+            improved_pairs / comparable_pairs if comparable_pairs else float("nan")
+        ),
+    }
+
+
 def token_kl_to_reference(
     policy_gathered: Tensor, reference_gathered: Tensor, supervised: Tensor
 ) -> Tensor:

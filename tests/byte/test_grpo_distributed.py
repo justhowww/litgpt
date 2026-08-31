@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -8,6 +9,7 @@ from litgpt.byte.grpo import (
     GRPOConfig,
     GRPOPreparationResult,
     _scored_preparation,
+    grpo_update_direction_metrics,
     group_token_log_probabilities,
 )
 from litgpt.byte.grpo_context import OnlineGRPOContextSampler
@@ -133,6 +135,39 @@ def test_gradient_l2_norm_detects_nonzero_backward_signal():
     loss.backward()
 
     assert ByteTrainingRuntime.gradient_l2_norm(model) > 0
+
+
+def test_grpo_direction_metrics_accept_reward_aligned_update():
+    before = torch.tensor([-2.0, -2.0, -2.0])
+    after = torch.tensor([-2.2, -2.0, -1.8])
+    rewards = torch.tensor([-1.0, 0.0, 1.0])
+    advantages = torch.tensor([-1.0, 0.0, 1.0])
+
+    metrics = grpo_update_direction_metrics(before, after, rewards, advantages)
+
+    assert metrics["policy_score_delta"] > 0
+    assert metrics["advantage_delta_correlation"] > 0
+    assert metrics["pairwise_improved_fraction"] == 1.0
+
+
+def test_grpo_direction_metrics_reject_reward_reversed_update():
+    before = torch.tensor([-2.0, -2.0, -2.0])
+    after = torch.tensor([-1.8, -2.0, -2.2])
+    rewards = torch.tensor([-1.0, 0.0, 1.0])
+    advantages = torch.tensor([-1.0, 0.0, 1.0])
+
+    metrics = grpo_update_direction_metrics(before, after, rewards, advantages)
+
+    assert metrics["policy_score_delta"] < 0
+    assert metrics["advantage_delta_correlation"] < 0
+    assert metrics["pairwise_improved_fraction"] == 0.0
+
+
+def test_grpo_direction_metrics_reject_mismatched_shapes():
+    with pytest.raises(ValueError, match="equal lengths"):
+        grpo_update_direction_metrics(
+            torch.zeros(2), torch.zeros(3), torch.zeros(2), torch.zeros(2)
+        )
 
 
 def test_zero_variance_group_keeps_candidates_with_zero_advantages():
