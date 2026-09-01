@@ -118,6 +118,10 @@ GRPO_DECODE_FAILURE_REWARD=${GRPO_DECODE_FAILURE_REWARD:--1.0}
 GRPO_MU=${GRPO_MU:-1}
 GRPO_CLIP_RANGE=${GRPO_CLIP_RANGE:-0.2}
 GRPO_LEARNED_EOS=${GRPO_LEARNED_EOS:-0}
+GRPO_STOP_LOSS_WEIGHT=${GRPO_STOP_LOSS_WEIGHT:-0.0}
+GRPO_STOP_NEGATIVE_SAMPLES=${GRPO_STOP_NEGATIVE_SAMPLES:-4}
+GRPO_STOP_MAX_POSITIVE_STATES=${GRPO_STOP_MAX_POSITIVE_STATES:-4}
+GRPO_FIM_SLICE_LAYOUT=${GRPO_FIM_SLICE_LAYOUT:-macroblock}
 GRPO_GENERATION_BUDGET_MULTIPLIER=${GRPO_GENERATION_BUDGET_MULTIPLIER:-2.0}
 GRPO_AR_PREFIX_FRAMES=${GRPO_AR_PREFIX_FRAMES:-8}
 GRPO_AR_CONT_FRAMES=${GRPO_AR_CONT_FRAMES:-4}
@@ -262,6 +266,10 @@ if [[ "${GRPO_INTERVAL}" != "0" ]]; then
         --grpo-decode-failure-reward "${GRPO_DECODE_FAILURE_REWARD}"
         --grpo-mu "${GRPO_MU}"
         --grpo-clip-range "${GRPO_CLIP_RANGE}"
+        --grpo-stop-loss-weight "${GRPO_STOP_LOSS_WEIGHT}"
+        --grpo-stop-negative-samples "${GRPO_STOP_NEGATIVE_SAMPLES}"
+        --grpo-stop-max-positive-states "${GRPO_STOP_MAX_POSITIVE_STATES}"
+        --grpo-fim-slice-layout "${GRPO_FIM_SLICE_LAYOUT}"
         --grpo-generation-budget-multiplier "${GRPO_GENERATION_BUDGET_MULTIPLIER}"
         --grpo-ar-prefix-frames "${GRPO_AR_PREFIX_FRAMES}"
         --grpo-ar-cont-frames "${GRPO_AR_CONT_FRAMES}"
@@ -286,7 +294,7 @@ fi
 echo "[phase2-fim] model=${MODEL_TAG} n_layer=${N_LAYER} n_embd=${N_EMBD} n_head=${N_HEAD} block=${BLOCK_SIZE} patch=${BYTE_PATCH_SIZE} local=${MEGABYTE_LOCAL_LAYERS}L/${MEGABYTE_LOCAL_EMBD}D/${MEGABYTE_LOCAL_HEADS}H raw_byte_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE)) steps=${STEPS} warmup=${WARMUP_STEPS} gbs=${GLOBAL_BATCH_SIZE} max_rows=${MAX_ROWS} split_by_video=${SPLIT_BY_VIDEO} no_encoding=${NO_ENCODING:-0} free_run_interval=${FREE_RUN_INTERVAL} free_run_temp=${FREE_RUN_TEMP} free_run_slice_layout=${FREE_RUN_SLICE_LAYOUT}"
 echo "[phase2-fim] p_fim=${P_FIM} fixed_fim_holes=${FIXED_FIM_HOLES} fixed_fim_holes_per_window=${FIXED_FIM_HOLES_PER_WINDOW} fim_format=${FIM_FORMAT} fim_loss_scope=${FIM_LOSS_SCOPE} fim_span_loss_weight=${FIM_SPAN_LOSS_WEIGHT} use_eos=${USE_EOS} eos_loss_weight=${EOS_LOSS_WEIGHT} eos_aux_loss_weight=${EOS_AUX_LOSS_WEIGHT} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] frame_guard=${SLICE_HEADER_GUARD_BYTES}"
 if [[ "${GRPO_INTERVAL}" != "0" ]]; then
-    echo "[grpo] interval=${GRPO_INTERVAL} start=${GRPO_START_STEP} group_per_rank=${GRPO_GROUP_SIZE} context_sampling=${GRPO_CONTEXT_SAMPLING} learned_eos=${GRPO_LEARNED_EOS} kl=${GRPO_KL_COEFF} ffmpeg=$(command -v "${GRPO_FFMPEG_BINARY}") initial=${INITIAL_CHECKPOINT_DIR} reference=${GRPO_REFERENCE_CHECKPOINT_DIR}"
+    echo "[grpo] interval=${GRPO_INTERVAL} start=${GRPO_START_STEP} group_per_rank=${GRPO_GROUP_SIZE} context_sampling=${GRPO_CONTEXT_SAMPLING} learned_eos=${GRPO_LEARNED_EOS} stop_loss=${GRPO_STOP_LOSS_WEIGHT} stop_negatives=${GRPO_STOP_NEGATIVE_SAMPLES} fim_slice_layout=${GRPO_FIM_SLICE_LAYOUT} kl=${GRPO_KL_COEFF} ffmpeg=$(command -v "${GRPO_FFMPEG_BINARY}") initial=${INITIAL_CHECKPOINT_DIR} reference=${GRPO_REFERENCE_CHECKPOINT_DIR}"
 fi
 
 # Acquire the lock separately so a failed training process is not mislabeled

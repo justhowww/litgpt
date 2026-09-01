@@ -3,8 +3,9 @@
 This is Experiment 1B: it asks whether several GRPO updates produce a policy
 with higher expected *implemented* reward. Every checkpoint sees the same AR
 and FIM contexts and the same rollout seeds. Each context/seed draws a candidate
-group, so the reported confidence interval reflects variation across fixed
-context-seed units rather than variation in online context difficulty.
+group. Rollout seeds are repeated measurements within a context; confidence
+intervals are computed across the frozen contexts, not across candidates or
+context-seed pairs.
 
 This evaluator does not test whether the reward agrees with the final AR/FIM
 evaluation; that is a separate candidate-level alignment audit (Experiment 2).
@@ -31,8 +32,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from litgpt.byte.data import ByteDataConfig, ByteDataModule  # noqa: E402
 from litgpt.byte.grpo import (  # noqa: E402
+    FIMStopState,
     GRPOConfig,
     PreparedGRPOStep,
+    build_fim_stop_patch_inputs,
+    fim_endpoint_reconnects,
+    fim_ground_truth_reconnects,
+    fim_stop_probabilities_and_ranks,
+    fim_stop_states,
     prepare_grpo_step,
     prepare_grpo_step_ar,
 )
@@ -70,6 +77,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ar-prefix-frames", type=int, default=4)
     parser.add_argument("--ar-cont-frames", type=int, default=2)
     parser.add_argument("--ar-slice-layout", default="macroblock")
+    parser.add_argument(
+        "--fim-slice-layout", choices=("macroblock", "frame"), default="macroblock"
+    )
+    parser.add_argument("--stop-negative-samples", type=int, default=4)
+    parser.add_argument("--stop-max-positive-states", type=int, default=4)
     parser.add_argument("--generation-budget-multiplier", type=float, default=2.0)
     parser.add_argument("--decode-workers", type=int, default=2)
     parser.add_argument("--timeout-sec", type=int, default=30)
@@ -113,6 +125,7 @@ def _grpo_config(args: argparse.Namespace) -> GRPOConfig:
         ar_prefix_frames=args.ar_prefix_frames,
         ar_cont_frames=args.ar_cont_frames,
         ar_slice_layout=args.ar_slice_layout,
+        fim_slice_layout=args.fim_slice_layout,
     )
     config.validate()
     return config
@@ -218,13 +231,52 @@ def _candidate_rows(prepared: PreparedGRPOStep) -> list[dict[str, Any]]:
     return rows
 
 
+@torch.inference_mode()
+def _stop_state_rows(
+    model: nn.Module,
+    sample,
+    states: list[FIMStopState],
+    device: torch.device,
+) -> list[dict[str, Any]]:
+    if not states:
+        return []
+    patch_size = int(_unwrap_model(model).config.byte_patch_size)
+    inputs, labels, supervised, _ = build_fim_stop_patch_inputs(
+        sample, states, patch_size, device
+    )
+    probabilities, ranks = fim_stop_probabilities_and_ranks(
+        model, inputs, labels, supervised
+    )
+    return [
+        {
+            "candidate_index": state.candidate_index,
+            "prefix_length": state.prefix_length,
+            "should_stop": state.should_stop,
+            "eos_probability": float(probability),
+            "eos_rank": int(rank),
+        }
+        for state, probability, rank in zip(states, probabilities, ranks)
+    ]
+
+
 def _mean_ci95(values: list[float]) -> tuple[float | None, float | None, float | None]:
     if not values:
         return None, None, None
     center = statistics.mean(values)
     if len(values) == 1:
         return center, center, center
-    half_width = 1.96 * statistics.stdev(values) / math.sqrt(len(values))
+    # Context counts are intentionally small (normally eight), so a normal
+    # 1.96 multiplier would understate uncertainty. Two-sided Student-t 95%
+    # critical values for df=1..30; the asymptotic value is sufficient above.
+    t95 = (
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262,
+        2.228, 2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101,
+        2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052,
+        2.048, 2.045, 2.042,
+    )
+    degrees_of_freedom = len(values) - 1
+    critical = t95[degrees_of_freedom - 1] if degrees_of_freedom <= 30 else 1.96
+    half_width = critical * statistics.stdev(values) / math.sqrt(len(values))
     return center, center - half_width, center + half_width
 
 
@@ -235,20 +287,68 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for row in available
         for candidate in row["candidates"]
     ]
-    unit_reward_means = [
-        statistics.mean(candidate["reward"] for candidate in row["candidates"])
-        for row in available
+    rewards_by_context: dict[int, list[float]] = {}
+    for row in available:
+        rewards_by_context.setdefault(int(row["context_index"]), []).extend(
+            float(candidate["reward"]) for candidate in row["candidates"]
+        )
+    context_reward_means = [
+        statistics.mean(context_rewards)
+        for context_rewards in rewards_by_context.values()
     ]
-    reward_mean, reward_ci_low, reward_ci_high = _mean_ci95(unit_reward_means)
+    reward_mean, reward_ci_low, reward_ci_high = _mean_ci95(context_reward_means)
     candidates = [candidate for row in available for candidate in row["candidates"]]
     psnrs = [candidate["psnr"] for candidate in candidates if candidate["psnr"] is not None]
+    stop_states = [state for row in available for state in row.get("stop_states", [])]
+    positive_stop_probabilities = [
+        state["eos_probability"] for state in stop_states if state["should_stop"]
+    ]
+    negative_stop_probabilities = [
+        state["eos_probability"] for state in stop_states if not state["should_stop"]
+    ]
+    positive_stop_ranks = [
+        state["eos_rank"] for state in stop_states if state["should_stop"]
+    ]
+    negative_stop_ranks = [
+        state["eos_rank"] for state in stop_states if not state["should_stop"]
+    ]
+    reconnectable = [
+        candidate["suffix_reconnectable"]
+        for candidate in candidates
+        if candidate.get("suffix_reconnectable") is not None
+    ]
+    has_reconnection_labels = bool(reconnectable)
+    generated_lengths = [candidate["num_bytes"] for candidate in candidates]
+    valid_stops = [
+        candidate
+        for candidate in candidates
+        if candidate.get("stopped")
+        and candidate.get("suffix_reconnectable") is True
+    ]
+    premature_stops = [
+        candidate
+        for candidate in candidates
+        if candidate.get("stopped")
+        and candidate.get("suffix_reconnectable") is False
+    ]
+    positive_mean = (
+        statistics.mean(positive_stop_probabilities)
+        if positive_stop_probabilities
+        else None
+    )
+    negative_mean = (
+        statistics.mean(negative_stop_probabilities)
+        if negative_stop_probabilities
+        else None
+    )
     return {
-        "context_seed_units": len(available),
+        "context_units": len(context_reward_means),
+        "context_seed_repeats": len(available),
         "candidate_count": len(candidates),
         "reward_mean": statistics.mean(rewards) if rewards else None,
-        "reward_unit_mean": reward_mean,
-        "reward_unit_ci95_low": reward_ci_low,
-        "reward_unit_ci95_high": reward_ci_high,
+        "reward_context_mean": reward_mean,
+        "reward_context_ci95_low": reward_ci_low,
+        "reward_context_ci95_high": reward_ci_high,
         "decode_rate": (
             statistics.mean(float(candidate["decoded"]) for candidate in candidates)
             if candidates
@@ -259,7 +359,55 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if candidates
             else None
         ),
+        "valid_eos_rate": (
+            len(valid_stops) / len(candidates)
+            if candidates and has_reconnection_labels
+            else None
+        ),
+        "premature_eos_rate": (
+            len(premature_stops) / len(candidates)
+            if candidates and has_reconnection_labels
+            else None
+        ),
+        "no_eos_by_budget_rate": (
+            statistics.mean(float(not candidate["stopped"]) for candidate in candidates)
+            if candidates and has_reconnection_labels
+            else None
+        ),
+        "suffix_reconnect_rate": (
+            statistics.mean(float(value) for value in reconnectable)
+            if reconnectable
+            else None
+        ),
         "psnr_mean_successful": statistics.mean(psnrs) if psnrs else None,
+        "stop_supervision_units": sum(bool(row.get("stop_states")) for row in available),
+        "stop_positive_states": len(positive_stop_probabilities),
+        "stop_negative_states": len(negative_stop_probabilities),
+        "stop_positive_eos_probability": positive_mean,
+        "stop_negative_eos_probability": negative_mean,
+        "stop_positive_eos_rank_mean": (
+            statistics.mean(positive_stop_ranks) if positive_stop_ranks else None
+        ),
+        "stop_negative_eos_rank_mean": (
+            statistics.mean(negative_stop_ranks) if negative_stop_ranks else None
+        ),
+        "stop_probability_margin": (
+            None
+            if positive_mean is None or negative_mean is None
+            else positive_mean - negative_mean
+        ),
+        "generated_bytes_mean": (
+            statistics.mean(generated_lengths) if generated_lengths else None
+        ),
+        "generated_bytes_median": (
+            statistics.median(generated_lengths) if generated_lengths else None
+        ),
+        "generated_bytes_min": min(generated_lengths) if generated_lengths else None,
+        "generated_bytes_max": max(generated_lengths) if generated_lengths else None,
+        "informative_groups": sum(row["status"] == "ready" for row in rows),
+        "zero_variance_groups": sum(
+            row["status"] == "zero_reward_variance" for row in rows
+        ),
         "status_hist": dict(Counter(row["status"] for row in rows)),
     }
 
@@ -274,6 +422,16 @@ def main() -> None:
     first_model.eval()
     sampler = _build_sampler(args, first_model, config)
     contexts = _fixed_contexts(sampler, args.tasks, args.num_contexts)
+    for selection in contexts.get("fim", []):
+        if not fim_ground_truth_reconnects(
+            selection.sample, slice_layout=args.fim_slice_layout
+        ):
+            raise RuntimeError(
+                "Ground-truth FIM middle failed parser reconnection sanity for "
+                f"dataset_index={selection.dataset_index}; stop-label metrics "
+                "would not be trustworthy"
+            )
+    fixed_stop_states: dict[tuple[int, int], list[FIMStopState]] = {}
 
     all_rows: list[dict[str, Any]] = []
     summaries: dict[str, dict[str, Any]] = {}
@@ -302,6 +460,33 @@ def main() -> None:
                         if result.prepared is None
                         else _candidate_rows(result.prepared)
                     )
+                    if task == "fim" and result.prepared is not None:
+                        reconnects = fim_endpoint_reconnects(
+                            result.prepared.sample,
+                            result.prepared.candidates,
+                            slice_layout=args.fim_slice_layout,
+                        )
+                        for candidate_row, reconnects_suffix in zip(
+                            candidates, reconnects
+                        ):
+                            candidate_row["suffix_reconnectable"] = reconnects_suffix
+                    stop_key = (context_index, rollout_seed)
+                    if task == "fim" and checkpoint_index == 0:
+                        fixed_stop_states[stop_key] = (
+                            []
+                            if result.prepared is None
+                            else fim_stop_states(
+                                result.prepared.sample,
+                                result.prepared.candidates,
+                                slice_layout=args.fim_slice_layout,
+                                negative_samples=args.stop_negative_samples,
+                                max_positive_states=args.stop_max_positive_states,
+                            )
+                        )
+                    states = fixed_stop_states.get(stop_key, []) if task == "fim" else []
+                    stop_state_rows = _stop_state_rows(
+                        model, selection.sample, states, device
+                    )
                     row = {
                         "checkpoint": label,
                         "checkpoint_dir": str(checkpoint_dir),
@@ -317,6 +502,10 @@ def main() -> None:
                         "status": result.status,
                         "candidate_count": len(candidates),
                         "candidates": candidates,
+                        "stop_states": stop_state_rows,
+                        "stop_probe_source_checkpoint": (
+                            args.labels[0] if stop_state_rows else None
+                        ),
                     }
                     task_rows.append(row)
                     all_rows.append(row)
@@ -335,9 +524,11 @@ def main() -> None:
             summary = summaries[label][task]
             print(
                 f"[{label}/{task}] reward={summary['reward_mean']!s} "
-                f"CI95=[{summary['reward_unit_ci95_low']!s}, "
-                f"{summary['reward_unit_ci95_high']!s}] "
+                f"context_CI95=[{summary['reward_context_ci95_low']!s}, "
+                f"{summary['reward_context_ci95_high']!s}] "
                 f"decode={summary['decode_rate']!s} stop={summary['stop_rate']!s}",
+                f" reconnect={summary['suffix_reconnect_rate']!s}",
+                f" eos_margin={summary['stop_probability_margin']!s}",
                 flush=True,
             )
         if checkpoint_index > 0:
@@ -369,17 +560,25 @@ def main() -> None:
                 if current["reward_mean"] is None or base["reward_mean"] is None
                 else current["reward_mean"] - base["reward_mean"]
             )
-            paired_deltas = []
+            paired_context_deltas = []
+            paired_seed_pairs = 0
             for context_index in range(args.num_contexts):
+                context_deltas = []
                 for rollout_seed in args.rollout_seeds:
                     base_key = (base_label, task, context_index, rollout_seed)
                     current_key = (label, task, context_index, rollout_seed)
                     if base_key in unit_reward and current_key in unit_reward:
-                        paired_deltas.append(
+                        paired_seed_pairs += 1
+                        context_deltas.append(
                             unit_reward[current_key] - unit_reward[base_key]
                         )
-            paired_mean, paired_low, paired_high = _mean_ci95(paired_deltas)
-            current["paired_reward_delta_units"] = len(paired_deltas)
+                if context_deltas:
+                    paired_context_deltas.append(statistics.mean(context_deltas))
+            paired_mean, paired_low, paired_high = _mean_ci95(
+                paired_context_deltas
+            )
+            current["paired_reward_delta_contexts"] = len(paired_context_deltas)
+            current["paired_reward_delta_seed_pairs"] = paired_seed_pairs
             current["paired_reward_delta_mean"] = paired_mean
             current["paired_reward_delta_ci95_low"] = paired_low
             current["paired_reward_delta_ci95_high"] = paired_high
@@ -402,6 +601,9 @@ def main() -> None:
             "top_k": args.top_k,
             "top_p": args.top_p,
             "context_seed": args.context_seed,
+            "fim_slice_layout": args.fim_slice_layout,
+            "stop_negative_samples": args.stop_negative_samples,
+            "stop_max_positive_states": args.stop_max_positive_states,
         },
         "summaries": summaries,
     }

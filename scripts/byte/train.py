@@ -412,6 +412,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--grpo-stop-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of balanced parser-derived FIM stop/no-stop supervision. "
+            "Only certified suffix-reconnection endpoints and nearby earlier "
+            "negative states are scored. Requires --grpo-learned-eos."
+        ),
+    )
+    parser.add_argument("--grpo-stop-negative-samples", type=int, default=4)
+    parser.add_argument("--grpo-stop-max-positive-states", type=int, default=4)
+    parser.add_argument(
+        "--grpo-fim-slice-layout",
+        choices=SLICE_LAYOUTS,
+        default=SLICE_LAYOUT_MACROBLOCK,
+        help="H.264 slice layout used to certify FIM suffix reconnection.",
+    )
+    parser.add_argument(
         "--grpo-generation-budget-multiplier",
         type=float,
         default=2.0,
@@ -719,6 +737,10 @@ def main() -> None:
         ar_prefix_frames=args.grpo_ar_prefix_frames,
         ar_cont_frames=args.grpo_ar_cont_frames,
         ar_slice_layout=args.grpo_ar_slice_layout,
+        stop_loss_weight=args.grpo_stop_loss_weight,
+        stop_negative_samples=args.grpo_stop_negative_samples,
+        stop_max_positive_states=args.grpo_stop_max_positive_states,
+        fim_slice_layout=args.grpo_fim_slice_layout,
         timeout_sec=args.grpo_timeout_sec,
         decode_workers=args.grpo_decode_workers,
         ffmpeg_binary=args.grpo_ffmpeg_binary,

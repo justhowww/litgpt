@@ -25,9 +25,13 @@ from litgpt.byte.data import (
     SEQ_EOS_ID,
 )
 from litgpt.byte.grpo import (
+    FIMStopState,
     GRPOConfig,
     GRPOPreparationResult,
+    build_fim_stop_patch_inputs,
     build_group_patch_inputs,
+    fim_stop_loss,
+    fim_stop_states,
     group_token_log_probabilities,
     grpo_clipped_loss,
     prepare_grpo_step,
@@ -573,10 +577,29 @@ class ByteTrainingRuntime:
             return metrics
         assert prepared is not None
 
+        stop_states = []
+        if pool_name == "fim" and config.stop_loss_weight > 0:
+            assert isinstance(prepared.sample, ReconstructionSample)
+            stop_states = fim_stop_states(
+                prepared.sample,
+                prepared.candidates,
+                slice_layout=config.fim_slice_layout,
+                negative_samples=config.stop_negative_samples,
+                max_positive_states=config.stop_max_positive_states,
+            )
+        stop_active_contexts = torch.tensor(
+            float(bool(stop_states)), device=fabric.device
+        )
+        if fabric.world_size > 1:
+            stop_active_contexts = fabric.all_reduce(
+                stop_active_contexts, reduce_op="sum"
+            )
+        stop_active_context_count = float(stop_active_contexts)
+
         active_contexts = preparation_metrics[
             "grpo/contexts_with_policy_signal"
         ]
-        if active_contexts == 0:
+        if active_contexts == 0 and stop_active_context_count == 0:
             self._log_grpo_context(
                 next_step=next_step,
                 update_index=update_index,
@@ -590,7 +613,7 @@ class ByteTrainingRuntime:
             metrics = {
                 "grpo/skipped": 1.0,
                 "grpo/pool": pool_name,
-                "grpo/skip_reason": "zero_reward_variance_on_all_ranks",
+                "grpo/skip_reason": "zero_reward_variance_and_no_stop_labels",
             }
             metrics.update(preparation_metrics)
             return metrics
@@ -609,7 +632,8 @@ class ByteTrainingRuntime:
         # zero-variance groups so the policy gradient remains the mean over
         # contexts that actually contain a preference signal.  Degenerate
         # ranks retain all-zero advantages and still enter the same backward.
-        advantages.mul_(fabric.world_size / active_contexts)
+        if active_contexts > 0:
+            advantages.mul_(fabric.world_size / active_contexts)
 
         raw_model = _unwrap_model(model)
         patch_size = int(raw_model.config.byte_patch_size)
@@ -625,6 +649,33 @@ class ByteTrainingRuntime:
             append_eos_on_stop=score_eos,
         )
 
+        stop_inputs = None
+        stop_labels = None
+        stop_supervised = None
+        stop_should_stop = None
+        if pool_name == "fim" and config.stop_loss_weight > 0:
+            # Every rank must execute the same second DDP forward/backward. A
+            # rank without a certified positive uses a balanced contradictory
+            # dummy pair whose scalar loss is multiplied by zero below.
+            stop_scoring_states = stop_states
+            if not stop_scoring_states:
+                dummy_data = prepared.candidates[0].data
+                stop_scoring_states = [
+                    FIMStopState(0, len(dummy_data), dummy_data, True),
+                    FIMStopState(0, len(dummy_data), dummy_data, False),
+                ]
+            (
+                stop_inputs,
+                stop_labels,
+                stop_supervised,
+                stop_should_stop,
+            ) = build_fim_stop_patch_inputs(
+                prepared.sample,
+                stop_scoring_states,
+                patch_size,
+                fabric.device,
+            )
+
         with torch.no_grad(), fabric.autocast():
             old_gathered = group_token_log_probabilities(
                 model, inputs, labels, include_eos=score_eos
@@ -639,6 +690,7 @@ class ByteTrainingRuntime:
                 ).detach()
 
         loss_metrics: dict[str, float] = {}
+        stop_metrics: dict[str, float] = {}
         final_loss = 0.0
         grad_norms_pre_clip: list[float] = []
         grad_norms_post_clip: list[float] = []
@@ -654,15 +706,49 @@ class ByteTrainingRuntime:
                     supervised,
                     advantages,
                     reference_gathered,
-                    config.kl_coeff,
+                    # Before stop supervision, a globally zero-variance group
+                    # skipped this optimizer step entirely. If certified stop
+                    # labels keep the step alive, do not silently introduce a
+                    # new KL-only update as a second experimental change.
+                    config.kl_coeff if active_contexts > 0 else 0.0,
                     config.clip_range,
                 )
             fabric.backward(loss)
+            stop_contribution = 0.0
+            if stop_inputs is not None:
+                assert stop_labels is not None
+                assert stop_supervised is not None
+                assert stop_should_stop is not None
+                with fabric.autocast():
+                    stop_gathered = group_token_log_probabilities(
+                        model, stop_inputs, stop_labels, include_eos=True
+                    )
+                    stop_loss_value, local_stop_metrics = fim_stop_loss(
+                        stop_gathered,
+                        stop_labels,
+                        stop_supervised,
+                        stop_should_stop,
+                    )
+                    if stop_states:
+                        stop_metrics = local_stop_metrics
+                    else:
+                        stop_loss_value = stop_loss_value * 0.0
+                    # DDP averages gradients across ranks. Preserve an average
+                    # over contexts that actually supplied a certified positive
+                    # state instead of diluting the auxiliary gradient by ranks
+                    # whose rollout had no safe stop label.
+                    if stop_states:
+                        stop_loss_value = stop_loss_value * (
+                            fabric.world_size / stop_active_context_count
+                        )
+                    weighted_stop_loss = config.stop_loss_weight * stop_loss_value
+                fabric.backward(weighted_stop_loss)
+                stop_contribution = float(weighted_stop_loss.detach())
             grad_norms_pre_clip.append(self.gradient_l2_norm(model))
             fabric.clip_gradients(model, optimizer, max_norm=max_norm)
             grad_norms_post_clip.append(self.gradient_l2_norm(model))
             optimizer.step()
-            final_loss = float(loss.detach())
+            final_loss = float(loss.detach()) + stop_contribution
         optimizer.zero_grad()
 
         mean_metrics = {
@@ -680,9 +766,70 @@ class ByteTrainingRuntime:
             "grpo/gradient_finite": float(
                 all(math.isfinite(x) for x in grad_norms_pre_clip)
             ),
+            "grpo/stop_loss_weight": config.stop_loss_weight,
+            "grpo/stop_active_contexts": stop_active_context_count,
         }
         mean_metrics.update(loss_metrics)
+        for key in (
+            "grpo/stop_loss",
+            "grpo/stop_positive_loss",
+            "grpo/stop_negative_loss",
+        ):
+            mean_metrics[key] = stop_metrics.get(key, 0.0)
         mean_metrics = self._distributed_mean_metrics(fabric, mean_metrics)
+
+        if config.stop_loss_weight > 0:
+            positive_count = stop_metrics.get("grpo/stop_positive_states", 0.0)
+            negative_count = stop_metrics.get("grpo/stop_negative_states", 0.0)
+            stop_stats = torch.tensor(
+                [
+                    stop_metrics.get("grpo/stop_positive_probability", 0.0)
+                    * positive_count,
+                    positive_count,
+                    stop_metrics.get("grpo/stop_negative_probability", 0.0)
+                    * negative_count,
+                    negative_count,
+                    stop_metrics.get("grpo/stop_loss", 0.0)
+                    * float(bool(stop_states)),
+                    stop_metrics.get("grpo/stop_positive_loss", 0.0)
+                    * float(bool(stop_states)),
+                    stop_metrics.get("grpo/stop_negative_loss", 0.0)
+                    * float(bool(stop_states)),
+                    float(bool(stop_states)),
+                ],
+                dtype=torch.float32,
+                device=fabric.device,
+            )
+            if fabric.world_size > 1:
+                stop_stats = fabric.all_reduce(stop_stats, reduce_op="sum")
+            global_positive_count = float(stop_stats[1])
+            global_negative_count = float(stop_stats[3])
+            global_stop_active_count = float(stop_stats[7])
+            if global_stop_active_count:
+                mean_metrics.update(
+                    {
+                        "grpo/stop_loss": float(stop_stats[4])
+                        / global_stop_active_count,
+                        "grpo/stop_positive_loss": float(stop_stats[5])
+                        / global_stop_active_count,
+                        "grpo/stop_negative_loss": float(stop_stats[6])
+                        / global_stop_active_count,
+                    }
+                )
+            if global_positive_count and global_negative_count:
+                positive_probability = float(stop_stats[0] / stop_stats[1])
+                negative_probability = float(stop_stats[2] / stop_stats[3])
+                mean_metrics.update(
+                    {
+                        "grpo/stop_positive_probability": positive_probability,
+                        "grpo/stop_negative_probability": negative_probability,
+                        "grpo/stop_probability_margin": (
+                            positive_probability - negative_probability
+                        ),
+                        "grpo/stop_positive_states": global_positive_count,
+                        "grpo/stop_negative_states": global_negative_count,
+                    }
+                )
 
         reward_min = torch.tensor(
             float(prepared.rewards.min()), device=fabric.device
@@ -805,6 +952,12 @@ class ByteTrainingRuntime:
             + (
                 f", kl: {metrics['grpo/kl_to_reference']:.4f}"
                 if "grpo/kl_to_reference" in metrics
+                else ""
+            )
+            + (
+                f", stop_ctx: {int(metrics.get('grpo/stop_active_contexts', 0))}, "
+                f"stop_margin: {metrics['grpo/stop_probability_margin']:+.4f}"
+                if "grpo/stop_probability_margin" in metrics
                 else ""
             )
         )

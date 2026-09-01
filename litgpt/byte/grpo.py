@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,6 +115,14 @@ class GRPOConfig:
     ar_prefix_frames: int = 8
     ar_cont_frames: int = 4
     ar_slice_layout: str = "macroblock"
+    # Optional parser-derived termination supervision for learned-EOS FIM.
+    # A positive state is an on-policy candidate endpoint whose fixed suffix
+    # completes the same H.264 automaton used by constrained evaluation. Nearby
+    # earlier endpoints that do not reconnect are balanced negative examples.
+    stop_loss_weight: float = 0.0
+    stop_negative_samples: int = 4
+    stop_max_positive_states: int = 4
+    fim_slice_layout: str = "macroblock"
 
     @property
     def enabled(self) -> bool:
@@ -155,6 +164,16 @@ class GRPOConfig:
             raise ValueError("GRPO AR prefix/continuation frame counts must be positive")
         if self.ar_slice_layout not in HM.SLICE_LAYOUTS:
             raise ValueError(f"GRPO AR slice layout must be one of {HM.SLICE_LAYOUTS}")
+        if self.stop_loss_weight < 0:
+            raise ValueError("GRPO stop-loss weight must be non-negative")
+        if self.stop_negative_samples <= 0:
+            raise ValueError("GRPO stop-loss negative sample count must be positive")
+        if self.stop_max_positive_states <= 0:
+            raise ValueError("GRPO stop-loss positive-state cap must be positive")
+        if self.fim_slice_layout not in HM.SLICE_LAYOUTS:
+            raise ValueError(f"GRPO FIM slice layout must be one of {HM.SLICE_LAYOUTS}")
+        if self.stop_loss_weight > 0 and not self.learned_eos:
+            raise ValueError("GRPO stop loss requires learned-EOS FIM rollouts")
 
 
 @dataclass(frozen=True)
@@ -189,6 +208,212 @@ class GRPOPreparationResult:
     decoded_count: int = 0
     reward_std: float | None = None
     has_policy_signal: bool = False
+
+
+@dataclass(frozen=True)
+class FIMStopState:
+    """One counterfactual EOS decision under an on-policy generated prefix."""
+
+    candidate_index: int
+    prefix_length: int
+    data: bytes
+    should_stop: bool
+
+
+def _fim_parser_fragments(sample: ReconstructionSample) -> tuple[bytes, bytes]:
+    """Return bytes before and after a window-FIM hole in original stream order."""
+    if sample.task != "fim" or sample.replacement_end is None:
+        raise ValueError("stop supervision requires a FIM reconstruction sample")
+    stream = sample.h264_path.read_bytes()
+    window = stream[sample.target_start : sample.target_end]
+    start = int(sample.replacement_start)
+    end = int(sample.replacement_end)
+    if not 0 <= start <= end <= len(window):
+        raise ValueError(
+            "FIM replacement bounds fall outside the reconstruction window: "
+            f"{start}:{end} vs {len(window)}"
+        )
+    return window[:start], window[end:]
+
+
+def _fim_parser_seed(
+    sample: ReconstructionSample,
+    *,
+    slice_layout: str,
+) -> tuple[HM.MaskState, bytes, bool]:
+    """Build the parser state before the hole and verify its GT prefix."""
+    before_hole, suffix = _fim_parser_fragments(sample)
+    seed = HM.MaskState(
+        slice_max_mbs=HM.slice_max_mbs_for_layout(slice_layout),
+        fail_closed=True,
+    )
+    for byte in before_hole:
+        HM.advance(seed, byte)
+        if seed.automaton_unknown:
+            return seed, suffix, False
+    seed.generation_started = True
+    return seed, suffix, True
+
+
+def fim_ground_truth_reconnects(
+    sample: ReconstructionSample,
+    *,
+    slice_layout: str,
+) -> bool:
+    """Sanity-check that the parser accepts the original middle and suffix."""
+    seed, suffix, valid_prefix = _fim_parser_seed(
+        sample, slice_layout=slice_layout
+    )
+    if not valid_prefix or sample.replacement_end is None:
+        return False
+    stream = sample.h264_path.read_bytes()
+    window = stream[sample.target_start : sample.target_end]
+    middle = window[
+        int(sample.replacement_start) : int(sample.replacement_end)
+    ]
+    state = deepcopy(seed)
+    for byte in middle:
+        allowed = HM.get_valid_byte_mask(state)
+        if not allowed[byte]:
+            return False
+        HM.advance(state, byte)
+        if state.automaton_unknown:
+            return False
+    return HM.can_append_bytes(state, suffix, require_complete=True)
+
+
+def fim_endpoint_reconnects(
+    sample: ReconstructionSample,
+    candidates: list[GeneratedCandidate],
+    *,
+    slice_layout: str,
+) -> list[bool]:
+    """Certify whether each generated endpoint can accept the fixed suffix."""
+    seed, suffix, valid_prefix = _fim_parser_seed(
+        sample, slice_layout=slice_layout
+    )
+    if not valid_prefix:
+        return [False] * len(candidates)
+    results: list[bool] = []
+    for candidate in candidates:
+        state = deepcopy(seed)
+        for byte in candidate.data:
+            allowed = HM.get_valid_byte_mask(state)
+            if not allowed[byte]:
+                state.automaton_unknown = True
+                break
+            HM.advance(state, byte)
+            if state.automaton_unknown:
+                break
+        results.append(
+            not state.automaton_unknown
+            and HM.can_append_bytes(state, suffix, require_complete=True)
+        )
+    return results
+
+
+def fim_stop_states(
+    sample: ReconstructionSample,
+    candidates: list[GeneratedCandidate],
+    *,
+    slice_layout: str,
+    negative_samples: int = 4,
+    max_positive_states: int = 4,
+) -> list[FIMStopState]:
+    """Build balanced parser-derived stop/no-stop labels from rollout endpoints.
+
+    The generated endpoint is positive only when appending the fixed suffix from
+    that exact decoder state completes the parser. Up to ``negative_samples``
+    immediately preceding byte boundaries are retained when they do not
+    reconnect. A trajectory without a positive state contributes no negatives,
+    preventing a no-EOS rollout from suppressing EOS even further.
+
+    Endpoint-only certification is deliberate. Exhaustively probing every byte
+    of every rollout would repeatedly parse a potentially long suffix and make
+    online GRPO unusably expensive. It also keeps the labels tied to an actual
+    stopping decision sampled by the policy rather than to ground-truth length.
+    """
+    if negative_samples <= 0 or max_positive_states <= 0:
+        raise ValueError("stop-state sample counts must be positive")
+    seed, suffix, valid_prefix = _fim_parser_seed(
+        sample, slice_layout=slice_layout
+    )
+    if not valid_prefix:
+        return []
+
+    result: list[FIMStopState] = []
+    seen: set[tuple[bytes, bool]] = set()
+    positives = 0
+    for candidate_index, candidate in enumerate(candidates):
+        if positives >= max_positive_states:
+            break
+        state = deepcopy(seed)
+        recent: list[tuple[int, bytes, HM.MaskState]] = []
+        first_retained_length = max(0, len(candidate.data) - negative_samples)
+        if first_retained_length == 0:
+            recent.append((0, b"", deepcopy(state)))
+        parser_failed = bool(state.automaton_unknown)
+        for prefix_length, byte in enumerate(candidate.data, start=1):
+            allowed = HM.get_valid_byte_mask(state)
+            if not allowed[byte]:
+                parser_failed = True
+                break
+            HM.advance(state, byte)
+            if prefix_length >= first_retained_length:
+                recent.append(
+                    (
+                        prefix_length,
+                        candidate.data[:prefix_length],
+                        deepcopy(state),
+                    )
+                )
+            if state.automaton_unknown:
+                parser_failed = True
+                break
+        if parser_failed or not recent or len(candidate.data) != recent[-1][0]:
+            continue
+        if not HM.can_append_bytes(state, suffix, require_complete=True):
+            continue
+
+        positive_key = (candidate.data, True)
+        if positive_key in seen:
+            continue
+        candidate_negatives: list[FIMStopState] = []
+        negative_count = 0
+        for prefix_length, prefix, earlier_state in reversed(list(recent)[:-1]):
+            if negative_count >= negative_samples:
+                break
+            if earlier_state.automaton_unknown or HM.can_append_bytes(
+                earlier_state, suffix, require_complete=True
+            ):
+                continue
+            key = (prefix, False)
+            if key in seen:
+                continue
+            candidate_negatives.append(
+                FIMStopState(
+                    candidate_index=candidate_index,
+                    prefix_length=prefix_length,
+                    data=prefix,
+                    should_stop=False,
+                )
+            )
+            negative_count += 1
+        if not candidate_negatives:
+            continue
+        seen.add(positive_key)
+        seen.update((state.data, False) for state in candidate_negatives)
+        result.append(
+            FIMStopState(
+                candidate_index=candidate_index,
+                prefix_length=len(candidate.data),
+                data=candidate.data,
+                should_stop=True,
+            )
+        )
+        result.extend(candidate_negatives)
+        positives += 1
+    return result
 
 
 def _scored_preparation(
@@ -711,11 +936,131 @@ def group_token_log_probabilities(
     return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
 
 
+def fim_stop_probabilities_and_ranks(
+    model: nn.Module,
+    inputs: dict[str, Tensor],
+    labels: Tensor,
+    supervised: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Return EOS probability and rank at each counterfactual stop decision."""
+    logits = model(**inputs)
+    allowed_logits = torch.cat(
+        (
+            logits[..., :BYTE_VOCAB_SIZE],
+            logits[..., SEQ_EOS_ID : SEQ_EOS_ID + 1],
+        ),
+        dim=-1,
+    )
+    eos_positions = supervised & labels.eq(SEQ_EOS_ID)
+    eos_counts = eos_positions.sum(dim=(1, 2))
+    if not bool((eos_counts == 1).all()):
+        raise ValueError("each stop-state sequence must contain exactly one EOS target")
+    flat_logits = allowed_logits.reshape(
+        allowed_logits.size(0), -1, BYTE_VOCAB_SIZE + 1
+    )
+    flat_positions = eos_positions.reshape(eos_positions.size(0), -1)
+    position_indices = flat_positions.to(dtype=torch.int64).argmax(dim=1)
+    decision_logits = flat_logits[
+        torch.arange(flat_logits.size(0), device=flat_logits.device),
+        position_indices,
+    ].float()
+    eos_logits = decision_logits[:, -1]
+    probabilities = torch.softmax(decision_logits, dim=-1)[:, -1]
+    ranks = 1 + (decision_logits > eos_logits.unsqueeze(-1)).sum(dim=-1)
+    return probabilities, ranks
+
+
 def mean_log_probability(gathered: Tensor, supervised: Tensor) -> Tensor:
     """Length-normalized per-candidate log-prob, shape ``(B,)``."""
     masked = gathered.masked_fill(~supervised, 0.0)
     counts = supervised.sum(dim=(1, 2)).clamp_min(1)
     return masked.sum(dim=(1, 2)) / counts
+
+
+def build_fim_stop_patch_inputs(
+    sample: ReconstructionSample,
+    states: list[FIMStopState],
+    patch_size: int,
+    device: torch.device,
+) -> tuple[dict[str, Tensor], Tensor, Tensor, Tensor]:
+    """Patch counterfactual EOS decisions using the normal MEGABYTE scorer."""
+    if not states:
+        raise ValueError("cannot score an empty stop-state set")
+    candidates = [GeneratedCandidate(data=state.data, stopped=True) for state in states]
+    inputs, labels, supervised = build_group_patch_inputs(
+        sample,
+        candidates,
+        patch_size,
+        device,
+        append_eos_on_stop=True,
+    )
+    should_stop = torch.tensor(
+        [state.should_stop for state in states],
+        dtype=torch.bool,
+        device=device,
+    )
+    return inputs, labels, supervised, should_stop
+
+
+def fim_stop_loss(
+    gathered: Tensor,
+    labels: Tensor,
+    supervised: Tensor,
+    should_stop: Tensor,
+) -> tuple[Tensor, dict[str, float]]:
+    """Balanced binary EOS loss at parser-labelled generated states.
+
+    ``gathered`` contains token log-probabilities for complete counterfactual
+    sequences whose final supervised token is EOS. Only that final EOS decision
+    enters this loss; generated prefix bytes provide conditioning context but do
+    not receive another language-model loss here.
+    """
+    if gathered.shape != labels.shape or gathered.shape != supervised.shape:
+        raise ValueError("stop-loss tensors must have identical shapes")
+    if should_stop.ndim != 1 or should_stop.numel() != gathered.size(0):
+        raise ValueError("one stop label is required per counterfactual sequence")
+    eos_logp = fim_stop_log_probabilities(gathered, labels, supervised)
+    should_stop = should_stop.to(device=eos_logp.device, dtype=torch.bool)
+    if not bool(should_stop.any()) or not bool((~should_stop).any()):
+        raise ValueError("balanced stop loss requires positive and negative states")
+
+    positive_loss = -eos_logp[should_stop].mean()
+    # log(1-exp(log p)) is stable as log(-expm1(log p)); keep a tiny margin
+    # below zero for finite-precision logits that round p(EOS) to exactly one.
+    negative_logp = eos_logp[~should_stop].clamp(max=-GRPO_EPS)
+    negative_loss = -torch.log(-torch.expm1(negative_logp)).mean()
+    loss = 0.5 * (positive_loss + negative_loss)
+
+    probabilities = eos_logp.detach().float().exp()
+    positive_probability = float(probabilities[should_stop].mean())
+    negative_probability = float(probabilities[~should_stop].mean())
+    return loss, {
+        "grpo/stop_loss": float(loss.detach()),
+        "grpo/stop_positive_loss": float(positive_loss.detach()),
+        "grpo/stop_negative_loss": float(negative_loss.detach()),
+        "grpo/stop_positive_probability": positive_probability,
+        "grpo/stop_negative_probability": negative_probability,
+        "grpo/stop_probability_margin": (
+            positive_probability - negative_probability
+        ),
+        "grpo/stop_positive_states": float(should_stop.sum()),
+        "grpo/stop_negative_states": float((~should_stop).sum()),
+    }
+
+
+def fim_stop_log_probabilities(
+    gathered: Tensor,
+    labels: Tensor,
+    supervised: Tensor,
+) -> Tensor:
+    """Extract the single EOS log-probability from each stop-state sequence."""
+    if gathered.shape != labels.shape or gathered.shape != supervised.shape:
+        raise ValueError("stop-state tensors must have identical shapes")
+    eos_positions = supervised & labels.eq(SEQ_EOS_ID)
+    eos_counts = eos_positions.sum(dim=(1, 2))
+    if not bool((eos_counts == 1).all()):
+        raise ValueError("each stop-state sequence must contain exactly one EOS target")
+    return gathered.masked_fill(~eos_positions, 0.0).sum(dim=(1, 2))
 
 
 def grpo_update_direction_metrics(
