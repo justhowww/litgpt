@@ -12,10 +12,10 @@ checker that is already used at generation time to keep sampled output valid
 this script only runs it once, offline, walking the real data instead of
 generated data, and saves the results.
 
-Most positions in a file share the same answer as many other positions -- for
-example, every position inside a file header allows all 256 byte values,
-because the checker does not attempt to constrain headers (see "What this mask
-does and does not guarantee" below). Because of this repetition, each distinct
+Most positions in a file share the same answer as many other positions. For
+example, at a NAL-header position the corpus policy only rejects bytes whose
+mandatory ``forbidden_zero_bit`` is set; it deliberately does not force the
+next NAL to be a particular slice type. Because of this repetition, each distinct
 256-flag answer is stored once in a shared table, and each file is stored as a
 short list of pointers into that shared table, one pointer per byte in the
 file. This keeps the output small.
@@ -150,6 +150,7 @@ from typing import Iterator
 from litgpt.byte.data import load_manifest_rows
 from litgpt.byte import h264_automaton as HA
 from litgpt.byte.h264_mask import (
+    NAL_HEADER_POLICY_SYNTAX_ONLY,
     SLICE_LAYOUT_MACROBLOCK,
     SLICE_LAYOUTS,
     MaskState,
@@ -159,6 +160,7 @@ from litgpt.byte.h264_mask import (
 )
 
 DEFAULT_MASK_TABLE_NAME = "legal_mask_table.sqlite"
+MASK_TABLE_NAL_HEADER_POLICY = NAL_HEADER_POLICY_SYNTAX_ONLY
 MASK_COMPILERS = ("legacy", "memoized", "compare")
 DP_CACHE_SCOPES = ("root", "worker")
 _WORKER_COMPILERS = {}
@@ -296,7 +298,10 @@ def iter_legal_masks(
     illegal. See the "What this mask does and does not guarantee" section at
     the top of this file for what that limitation means in practice.
     """
-    state = MaskState(slice_max_mbs=slice_max_mbs_for_layout(slice_layout))
+    state = MaskState(
+        slice_max_mbs=slice_max_mbs_for_layout(slice_layout),
+        nal_header_policy=NAL_HEADER_POLICY_SYNTAX_ONLY,
+    )
     for offset, byte in enumerate(data):
         if byte_mask_compiler is not None:
             byte_mask_compiler.record_corpus_byte()
@@ -377,9 +382,11 @@ def scan_file(
             local_mask_ids[i] = local_id
     except HA.MaskCacheLimitError as exc:
         raise RuntimeError(
-            f"{exc}; worker_statistics="
+            f"{path}: {exc}; worker_statistics="
             f"{json.dumps(compiler.statistics(), sort_keys=True)}"
         ) from exc
+    except RuntimeError as exc:
+        raise RuntimeError(f"{path}: {exc}") from exc
 
     timings = {
         "scan_seconds": time.perf_counter() - scan_started,
@@ -635,6 +642,9 @@ def build_table(
         stored_layout = connection.execute(
             "SELECT value FROM metadata WHERE key = 'slice_layout'"
         ).fetchone()
+        stored_header_policy = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'nal_header_policy'"
+        ).fetchone()
         existing_count = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         if (
             existing_count
@@ -653,6 +663,14 @@ def build_table(
             raise RuntimeError(
                 "Existing legal-mask table predates slice-layout metadata. "
                 "Use --rebuild before building frame-layout masks."
+            )
+        if existing_count and (
+            stored_header_policy is None
+            or stored_header_policy[0] != MASK_TABLE_NAL_HEADER_POLICY
+        ):
+            raise RuntimeError(
+                "Existing legal-mask table uses an absent or incompatible "
+                "NAL-header policy. Use --rebuild before resuming."
             )
         existing_files = {
             path: (size, mtime_ns)
@@ -766,6 +784,7 @@ def build_table(
             "manifest_size": str(manifest_stat.st_size),
             "manifest_mtime_ns": str(manifest_stat.st_mtime_ns),
             "slice_layout": slice_layout,
+            "nal_header_policy": MASK_TABLE_NAL_HEADER_POLICY,
             "mask_compiler": compiler_mode,
             "dp_cache_scope": dp_cache_scope,
         }
@@ -785,6 +804,7 @@ def build_table(
         {
             "manifest": str(manifest_path.resolve()),
             "slice_layout": slice_layout,
+            "nal_header_policy": MASK_TABLE_NAL_HEADER_POLICY,
             "compiler_mode": compiler_mode,
             "dp_cache_scope": dp_cache_scope,
             "processed_files": processed_files,

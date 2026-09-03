@@ -256,6 +256,26 @@ def test_picture_state_constrains_nal_header_and_slice_identity():
     assert constraints["slice_type"] == syntax.SLICE_TYPE_P
 
 
+def test_syntax_only_nal_header_policy_accepts_repeated_parameter_sets():
+    """Corpus replay must not mistake legal SPS/PPS insertion for a bad slice."""
+    _, _, mask_module, _ = _load_stack()
+    picture = mask_module.PictureState(active=True, picture_complete=True)
+    state = mask_module.MaskState(
+        picture=picture,
+        expect_nal_header=True,
+        nal_header_policy=mask_module.NAL_HEADER_POLICY_SYNTAX_ONLY,
+    )
+
+    allowed = mask_module.get_valid_byte_mask(state)
+
+    assert allowed[0x67]  # SPS
+    assert allowed[0x68]  # PPS
+    assert allowed[0x06]  # SEI
+    assert allowed[0x65]  # IDR slice
+    assert sum(allowed) == 128
+    assert not allowed[0xE7]  # forbidden_zero_bit is set
+
+
 def test_generation_without_prior_picture_starts_with_idr():
     _, _, mask_module, _ = _load_stack()
     state = mask_module.MaskState(

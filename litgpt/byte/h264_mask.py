@@ -23,6 +23,12 @@ START_CODE = (0, 0, 1)
 SLICE_LAYOUT_MACROBLOCK = "macroblock"
 SLICE_LAYOUT_FRAME = "frame"
 SLICE_LAYOUTS = (SLICE_LAYOUT_MACROBLOCK, SLICE_LAYOUT_FRAME)
+NAL_HEADER_POLICY_EXPECTED_VCL = "expected_vcl"
+NAL_HEADER_POLICY_SYNTAX_ONLY = "syntax_only"
+NAL_HEADER_POLICIES = (
+    NAL_HEADER_POLICY_EXPECTED_VCL,
+    NAL_HEADER_POLICY_SYNTAX_ONLY,
+)
 _DEBUG_DEFAULT = False
 _DEBUG_STAGES_DEFAULT = False
 _RESIDUAL_TAGS = {
@@ -178,6 +184,11 @@ class MaskState:
     picture: PictureState = field(default_factory=PictureState)
     expect_nal_header: bool = False
     generation_started: bool = False
+    # Generation normally restricts a new NAL to the VCL header implied by the
+    # tracked picture sequence. Whole-corpus preprocessing instead uses the
+    # syntax-only policy because valid streams may insert SPS/PPS/SEI/AUD NALs
+    # between pictures; those are not errors and must not be labelled illegal.
+    nal_header_policy: str = NAL_HEADER_POLICY_EXPECTED_VCL
     # Positive integer: fixed macroblocks per slice (the AVC-LM corpus uses 1).
     # None: one complete progressive picture per slice; VclAutomaton resolves the
     # concrete extent from the active SPS and requires first_mb_in_slice == 0.
@@ -196,6 +207,11 @@ class MaskState:
     def __post_init__(self) -> None:
         if self.slice_max_mbs is not None and self.slice_max_mbs <= 0:
             raise ValueError("slice_max_mbs must be positive or None")
+        if self.nal_header_policy not in NAL_HEADER_POLICIES:
+            raise ValueError(
+                f"unknown nal_header_policy {self.nal_header_policy!r}; "
+                f"expected one of {NAL_HEADER_POLICIES}"
+            )
 
     def last_two_raw(self) -> tuple[int, int] | None:
         if len(self.cur_nal_bytes) < 2:
@@ -262,14 +278,24 @@ def get_valid_byte_mask(state: MaskState, *, byte_mask_compiler=None) -> list[bo
     auto = state.automaton
     state.mask_calls += 1
     strict = False
-    if (
-        state.expect_nal_header
-        and not state.residual_only
+    constrain_expected_vcl = (
+        state.nal_header_policy == NAL_HEADER_POLICY_EXPECTED_VCL
         and (state.picture.active or state.generation_started)
+    )
+    if state.expect_nal_header and not state.residual_only and (
+        constrain_expected_vcl
+        or state.nal_header_policy == NAL_HEADER_POLICY_SYNTAX_ONLY
     ):
-        mask = [False] * 256
-        for header in state.picture.allowed_nal_headers():
-            mask[header] = True
+        if state.nal_header_policy == NAL_HEADER_POLICY_SYNTAX_ONLY:
+            # forbidden_zero_bit is the only unconditional per-header-bit rule.
+            # Keep reserved/unspecified nal_unit_type values permissive: a true
+            # table entry means "no proven objection", whereas false must be a
+            # sound claim that the byte is impossible.
+            mask = [header < 0x80 for header in range(256)]
+        else:
+            mask = [False] * 256
+            for header in state.picture.allowed_nal_headers():
+                mask[header] = True
         state.strict_mask_calls += 1
         if state.debug and state.mask_calls % state.debug_every_masks == 0:
             _debug(
