@@ -50,6 +50,30 @@ def test_wrapper_never_rejects_fixture_prefix_and_uses_strict_masks():
     assert strict_masks > 0
 
 
+def test_wrapper_memoized_compiler_matches_legacy_masks():
+    if not _FIXTURE.exists():
+        return
+    syntax, automaton, mask_module, _ = _load_stack()
+    data = _FIXTURE.read_bytes()
+    vcl = next(n for n in syntax.iter_nals(data) if n.nal_type in syntax.VCL_NAL_TYPES)
+    stop = min(len(data), vcl.payload_start + 1 + 256)
+    legacy_state = mask_module.MaskState(slice_max_mbs=99)
+    memoized_state = mask_module.MaskState(slice_max_mbs=99)
+    compiler = automaton.MemoizedByteMaskCompiler(max_cache_entries=500_000)
+
+    for offset, byte in enumerate(data[:stop]):
+        compiler.record_corpus_byte()
+        legacy = mask_module.get_valid_byte_mask(legacy_state)
+        memoized = mask_module.get_valid_byte_mask(
+            memoized_state, byte_mask_compiler=compiler
+        )
+        assert memoized == legacy, f"memoized wrapper mismatch at byte {offset}"
+        mask_module.advance(legacy_state, byte)
+        mask_module.advance(memoized_state, byte)
+
+    assert compiler.statistics()["root_requests"] > 0
+
+
 def test_frame_layout_never_rejects_full_picture_fixture():
     """The dynamic layout must derive the fixture's 99-MB extent from its SPS."""
     if not _FIXTURE.exists():

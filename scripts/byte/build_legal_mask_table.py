@@ -117,11 +117,24 @@ next-byte-prediction setup elsewhere might.
 
 Usage:
     python scripts/byte/build_legal_mask_table.py manifest.jsonl
+
+Exact DP pilot (run separately for ``macroblock`` and ``frame`` corpora):
+    python scripts/byte/build_legal_mask_table.py manifest.jsonl \
+        --output /tmp/legal-mask-pilot.sqlite --rebuild --max-files 100 \
+        --slice-layout frame --mask-compiler compare --workers 1 \
+        --statistics-json /tmp/legal-mask-pilot.json \
+        --require-committed-grid-crossing
+
+``compare`` is intentionally a validation mode, not a speed benchmark: it runs
+both implementations.  After exact equality is established, use ``memoized`` and
+repeat with the intended worker count to measure warm-cache throughput.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import json
 import os
 import sqlite3
 import sys
@@ -133,6 +146,7 @@ from pathlib import Path
 from typing import Iterator
 
 from litgpt.byte.data import load_manifest_rows
+from litgpt.byte import h264_automaton as HA
 from litgpt.byte.h264_mask import (
     SLICE_LAYOUT_MACROBLOCK,
     SLICE_LAYOUTS,
@@ -143,6 +157,8 @@ from litgpt.byte.h264_mask import (
 )
 
 DEFAULT_MASK_TABLE_NAME = "legal_mask_table.sqlite"
+MASK_COMPILERS = ("legacy", "memoized", "compare")
+_WORKER_COMPILERS = {}
 
 if array("I").itemsize != 4:
     raise RuntimeError(
@@ -154,8 +170,96 @@ def default_mask_table_path(manifest_path: Path) -> Path:
     return manifest_path.with_name(DEFAULT_MASK_TABLE_NAME)
 
 
+class ByteMaskCompiler:
+    """Build-script adapter for legacy, memoized, and exact-comparison modes."""
+
+    def __init__(self, mode: str, max_cache_entries: int, collect_stats: bool):
+        if mode not in MASK_COMPILERS:
+            raise ValueError(f"unknown mask compiler {mode!r}")
+        self.mode = mode
+        self.memoized = (
+            HA.MemoizedByteMaskCompiler(
+                max_cache_entries=max_cache_entries,
+                collect_field_cardinality=collect_stats,
+            )
+            if mode != "legacy"
+            else None
+        )
+        self.corpus_bytes = 0
+        self.comparisons = 0
+        self.mismatches = 0
+        self.legacy_transition_computations = 0
+
+    def record_corpus_byte(self):
+        self.corpus_bytes += 1
+        if self.memoized is not None:
+            self.memoized.record_corpus_byte()
+
+    def compile_byte_mask(self, auto, *, residual_only=False):
+        def count_legacy_transition():
+            self.legacy_transition_computations += 1
+
+        if self.mode == "legacy":
+            return HA.compile_byte_mask(
+                auto,
+                residual_only=residual_only,
+                transition_counter=count_legacy_transition,
+            )
+        memoized = self.memoized.compile_byte_mask(
+            auto, residual_only=residual_only
+        )
+        if self.mode == "memoized":
+            return memoized
+
+        legacy = HA.compile_byte_mask(
+            auto,
+            residual_only=residual_only,
+            transition_counter=count_legacy_transition,
+        )
+        self.comparisons += 1
+        if legacy != memoized:
+            self.mismatches += 1
+            differing = [i for i, (a, b) in enumerate(zip(legacy, memoized)) if a != b]
+            raise AssertionError(
+                "legacy/memoized legal-byte masks differ at "
+                f"stage={auto.stage} syntax={auto.ae_tag} bit={auto.pos}; "
+                f"first differing bytes={differing[:16]}"
+            )
+        return memoized
+
+    def statistics(self):
+        result = {
+            "mode": self.mode,
+            "corpus_bytes": self.corpus_bytes,
+            "legacy_comparisons": self.comparisons,
+            "legacy_mismatches": self.mismatches,
+            "legacy_transition_computations": self.legacy_transition_computations,
+            "legacy_transition_computations_per_byte": (
+                self.legacy_transition_computations / self.corpus_bytes
+                if self.corpus_bytes
+                else None
+            ),
+        }
+        if self.memoized is not None:
+            result.update(self.memoized.statistics())
+        return result
+
+
+def _worker_compiler(mode, max_cache_entries, collect_stats):
+    """One warm cache per worker process, shared across that worker's files."""
+    key = (mode, max_cache_entries, collect_stats)
+    compiler = _WORKER_COMPILERS.get(key)
+    if compiler is None:
+        compiler = ByteMaskCompiler(mode, max_cache_entries, collect_stats)
+        _WORKER_COMPILERS[key] = compiler
+    return compiler
+
+
 def iter_legal_masks(
-    data: bytes, slice_layout: str = SLICE_LAYOUT_MACROBLOCK
+    data: bytes,
+    slice_layout: str = SLICE_LAYOUT_MACROBLOCK,
+    *,
+    byte_mask_compiler=None,
 ) -> Iterator[list[bool]]:
     """Walk one raw H.264 file byte by byte and, for each position, report which
     of the 256 possible byte values could legally appear there, given only the
@@ -182,7 +286,11 @@ def iter_legal_masks(
     """
     state = MaskState(slice_max_mbs=slice_max_mbs_for_layout(slice_layout))
     for offset, byte in enumerate(data):
-        mask = get_valid_byte_mask(state)
+        if byte_mask_compiler is not None:
+            byte_mask_compiler.record_corpus_byte()
+        mask = get_valid_byte_mask(
+            state, byte_mask_compiler=byte_mask_compiler
+        )
         if len(mask) != 256:
             raise RuntimeError(
                 f"Expected 256-entry mask at byte {offset}, got {len(mask)}"
@@ -211,8 +319,12 @@ def unpack_mask(packed: bytes) -> list[bool]:
 
 
 def scan_file(
-    path_string: str, slice_layout: str = SLICE_LAYOUT_MACROBLOCK
-) -> tuple[str, int, int, array, list[bytes]]:
+    path_string: str,
+    slice_layout: str = SLICE_LAYOUT_MACROBLOCK,
+    compiler_mode: str = "legacy",
+    max_cache_entries: int = 1_000_000,
+    collect_stats: bool = False,
+) -> tuple[str, int, int, array, list[bytes], int, dict, dict]:
     """Compute per-byte legal masks for one file, deduplicated LOCALLY (per file).
 
     Global (cross-file) dedup happens in the writer, which is single-threaded
@@ -224,20 +336,52 @@ def scan_file(
     path = Path(path_string)
     data = path.read_bytes()
     stat = path.stat()
+    compiler = _worker_compiler(
+        compiler_mode, max_cache_entries, collect_stats
+    )
 
     local_table: dict[bytes, int] = {}
     local_masks: list[bytes] = []
     local_mask_ids = array("I", [0]) * len(data)
-    for i, mask in enumerate(iter_legal_masks(data, slice_layout)):
-        packed = pack_mask(mask)
-        local_id = local_table.get(packed)
-        if local_id is None:
-            local_id = len(local_masks)
-            local_table[packed] = local_id
-            local_masks.append(packed)
-        local_mask_ids[i] = local_id
+    pack_seconds = 0.0
+    scan_started = time.perf_counter()
+    try:
+        for i, mask in enumerate(
+            iter_legal_masks(
+                data,
+                slice_layout,
+                byte_mask_compiler=compiler,
+            )
+        ):
+            pack_started = time.perf_counter()
+            packed = pack_mask(mask)
+            pack_seconds += time.perf_counter() - pack_started
+            local_id = local_table.get(packed)
+            if local_id is None:
+                local_id = len(local_masks)
+                local_table[packed] = local_id
+                local_masks.append(packed)
+            local_mask_ids[i] = local_id
+    except HA.MaskCacheLimitError as exc:
+        raise RuntimeError(
+            f"{exc}; worker_statistics="
+            f"{json.dumps(compiler.statistics(), sort_keys=True)}"
+        ) from exc
 
-    return path_string, stat.st_size, stat.st_mtime_ns, local_mask_ids, local_masks
+    timings = {
+        "scan_seconds": time.perf_counter() - scan_started,
+        "pack_seconds": pack_seconds,
+    }
+    return (
+        path_string,
+        stat.st_size,
+        stat.st_mtime_ns,
+        local_mask_ids,
+        local_masks,
+        os.getpid(),
+        compiler.statistics(),
+        timings,
+    )
 
 
 def initialize_database(connection: sqlite3.Connection, rebuild: bool) -> None:
@@ -298,9 +442,9 @@ def get_or_create_global_mask_id(
 def write_file_result(
     connection: sqlite3.Connection,
     global_cache: dict[bytes, int],
-    result: tuple[str, int, int, array, list[bytes]],
+    result: tuple[str, int, int, array, list[bytes], int, dict, dict],
 ) -> int:
-    path, size, mtime_ns, local_mask_ids, local_masks = result
+    path, size, mtime_ns, local_mask_ids, local_masks = result[:5]
 
     previous = connection.execute(
         "SELECT id, size, mtime_ns FROM files WHERE path = ?", (path,)
@@ -352,15 +496,115 @@ def read_mask_ids(blob: bytes) -> array:
     return ids
 
 
+def aggregate_worker_statistics(worker_statistics: dict[int, dict]) -> dict:
+    """Aggregate counters while retaining per-process cache/cardinality details.
+
+    Cache entries and field cardinalities are process-local and therefore are not
+    presented as a fictitious global union.  The decision metric--actual parser
+    transition computations per source byte--is additive and is aggregated.
+    """
+    workers = list(worker_statistics.values())
+
+    def total(name):
+        return sum(worker.get(name, 0) or 0 for worker in workers)
+
+    corpus_bytes = total("corpus_bytes")
+    transition_requests = total("transition_requests")
+    transition_computations = total("transition_computations")
+    legacy_transition_computations = total("legacy_transition_computations")
+    root_requests = total("root_requests")
+    root_hits = total("root_hits")
+    dp_by_k = {}
+    for k in range(1, 9):
+        entries = [worker.get("dp_by_k", {}).get(str(k), {}) for worker in workers]
+        requests = sum(entry.get("requests", 0) for entry in entries)
+        hits = sum(entry.get("hits", 0) for entry in entries)
+        misses = sum(entry.get("misses", 0) for entry in entries)
+        dp_by_k[str(k)] = {
+            "requests": requests,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": hits / requests if requests else None,
+        }
+
+    bucket_labels = Counter()
+    context_sources = Counter()
+    seconds = Counter()
+    for worker in workers:
+        bucket_labels.update(worker.get("bucket_crossings_by_coeff_token_label", {}))
+        context_sources.update(worker.get("context_crossings_by_source", {}))
+        seconds.update(worker.get("seconds", {}))
+
+    return {
+        "worker_count": len(workers),
+        "corpus_bytes": corpus_bytes,
+        "root_requests": root_requests,
+        "root_hits": root_hits,
+        "root_misses": total("root_misses"),
+        "root_hit_rate": root_hits / root_requests if root_requests else None,
+        "dp_by_k": dp_by_k,
+        "transition_requests": transition_requests,
+        "transition_hits": total("transition_hits"),
+        "transition_computations": transition_computations,
+        "transition_hit_rate": (
+            total("transition_hits") / transition_requests
+            if transition_requests
+            else None
+        ),
+        "transition_computations_per_byte": (
+            transition_computations / corpus_bytes if corpus_bytes else None
+        ),
+        "legacy_transition_computations": legacy_transition_computations,
+        "legacy_transition_computations_per_byte": (
+            legacy_transition_computations / corpus_bytes if corpus_bytes else None
+        ),
+        "transition_reduction_factor": (
+            legacy_transition_computations / transition_computations
+            if legacy_transition_computations and transition_computations
+            else None
+        ),
+        "coeff_context_crossings": total("coeff_context_crossings"),
+        "committed_grid_bucket_crossings": total(
+            "committed_grid_bucket_crossings"
+        ),
+        "overlay_bucket_crossings": total("overlay_bucket_crossings"),
+        "bucket_crossings_by_coeff_token_label": dict(bucket_labels),
+        "context_crossings_by_source": dict(context_sources),
+        "legacy_comparisons": total("legacy_comparisons"),
+        "legacy_mismatches": total("legacy_mismatches"),
+        "seconds": dict(seconds),
+        "sum_process_local_cache_entries": total("total_cache_entries"),
+        "max_process_cache_entries": max(
+            (worker.get("total_cache_entries", 0) for worker in workers),
+            default=0,
+        ),
+        "max_process_peak_rss_mb": max(
+            (worker.get("peak_rss_mb", 0) for worker in workers), default=0
+        ),
+        "per_worker": {
+            str(pid): statistics for pid, statistics in sorted(worker_statistics.items())
+        },
+    }
+
+
 def build_table(
     manifest_path: Path,
     output_path: Path,
     workers: int,
     rebuild: bool,
     slice_layout: str = SLICE_LAYOUT_MACROBLOCK,
+    *,
+    compiler_mode: str = "legacy",
+    max_cache_entries: int = 1_000_000,
+    statistics_path: Path | None = None,
+    require_committed_grid_crossing: bool = False,
+    max_files: int | None = None,
 ) -> None:
+    _WORKER_COMPILERS.clear()
     rows = load_manifest_rows(manifest_path, report_progress=True)
     paths = list(dict.fromkeys(str(Path(row["h264_path"])) for row in rows))
+    if max_files is not None:
+        paths = paths[:max_files]
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(output_path) as connection:
@@ -412,7 +656,11 @@ def build_table(
         # mask_table rows for now-unused masks are left in place (harmless, may be
         # reused by future files -- only inflates the table after repeated churn).
         current_paths = set(paths)
-        stale_paths = [p for p in existing_files if p not in current_paths]
+        stale_paths = (
+            [p for p in existing_files if p not in current_paths]
+            if max_files is None
+            else []
+        )
         for stale_path in stale_paths:
             connection.execute("DELETE FROM files WHERE path = ?", (stale_path,))
         if stale_paths:
@@ -429,24 +677,48 @@ def build_table(
         started_at = time.perf_counter()
         processed_bytes = 0
         processed_files = 0
+        worker_statistics = {}
+        scan_seconds = 0.0
+        pack_seconds = 0.0
+        write_seconds = 0.0
         print(
             f"Building legal-mask table: {unchanged_files:,} cached, "
-            f"{len(pending_paths):,} pending -> {output_path}",
+            f"{len(pending_paths):,} pending, compiler={compiler_mode} "
+            f"-> {output_path}",
             flush=True,
         )
 
         if workers == 1:
-            results = map(scan_file, pending_paths, repeat(slice_layout))
+            results = map(
+                scan_file,
+                pending_paths,
+                repeat(slice_layout),
+                repeat(compiler_mode),
+                repeat(max_cache_entries),
+                repeat(statistics_path is not None or compiler_mode == "compare"),
+            )
             executor = None
         else:
             executor = ProcessPoolExecutor(max_workers=workers)
             results = executor.map(
-                scan_file, pending_paths, repeat(slice_layout), chunksize=4
+                scan_file,
+                pending_paths,
+                repeat(slice_layout),
+                repeat(compiler_mode),
+                repeat(max_cache_entries),
+                repeat(statistics_path is not None or compiler_mode == "compare"),
+                chunksize=4,
             )
 
         try:
             for result in results:
+                worker_pid, compiler_statistics, timings = result[5:]
+                worker_statistics[worker_pid] = compiler_statistics
+                scan_seconds += timings["scan_seconds"]
+                pack_seconds += timings["pack_seconds"]
+                write_started = time.perf_counter()
                 processed_bytes += write_file_result(connection, global_cache, result)
+                write_seconds += time.perf_counter() - write_started
                 processed_files += 1
                 if processed_files % 50 == 0:
                     connection.commit()
@@ -469,6 +741,7 @@ def build_table(
             "manifest_size": str(manifest_stat.st_size),
             "manifest_mtime_ns": str(manifest_stat.st_mtime_ns),
             "slice_layout": slice_layout,
+            "mask_compiler": compiler_mode,
         }
         connection.executemany(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
@@ -479,6 +752,50 @@ def build_table(
         n_files, n_masks = connection.execute(
             "SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM mask_table)"
         ).fetchone()
+
+    elapsed = time.perf_counter() - started_at
+    aggregate = aggregate_worker_statistics(worker_statistics)
+    aggregate.update(
+        {
+            "manifest": str(manifest_path.resolve()),
+            "slice_layout": slice_layout,
+            "compiler_mode": compiler_mode,
+            "processed_files": processed_files,
+            "processed_bytes": processed_bytes,
+            "wall_seconds": elapsed,
+            "throughput_bytes_per_second": (
+                processed_bytes / elapsed if elapsed else None
+            ),
+            "summed_worker_scan_seconds": scan_seconds,
+            "summed_worker_pack_seconds": pack_seconds,
+            "writer_seconds": write_seconds,
+        }
+    )
+    if statistics_path is not None:
+        statistics_path.parent.mkdir(parents=True, exist_ok=True)
+        statistics_path.write_text(json.dumps(aggregate, indent=2, sort_keys=True) + "\n")
+        print(f"Compiler statistics -> {statistics_path}", flush=True)
+
+    transitions_per_byte = aggregate.get("transition_computations_per_byte")
+    if transitions_per_byte is not None:
+        reduction = aggregate.get("transition_reduction_factor")
+        reduction_text = f", reduction={reduction:.2f}x" if reduction else ""
+        print(
+            "Memoized compiler: "
+            f"{transitions_per_byte:.3f} transition computations/source byte, "
+            f"root hit rate={aggregate['root_hit_rate'] or 0.0:.3%}, "
+            f"committed-grid crossings={aggregate['committed_grid_bucket_crossings']:,}"
+            f"{reduction_text}",
+            flush=True,
+        )
+    if (
+        require_committed_grid_crossing
+        and aggregate.get("committed_grid_bucket_crossings", 0) == 0
+    ):
+        raise RuntimeError(
+            "No look-ahead transition crossed into a coeff_token context that read "
+            "the committed coefficient grid; the riskiest cache-key path was not tested"
+        )
 
     print(
         f"Legal-mask table complete: {n_files:,} files, {n_masks:,} unique masks -> {output_path}",
@@ -496,6 +813,38 @@ def parse_args() -> argparse.Namespace:
         choices=SLICE_LAYOUTS,
         default=SLICE_LAYOUT_MACROBLOCK,
     )
+    parser.add_argument(
+        "--mask-compiler",
+        choices=MASK_COMPILERS,
+        default="legacy",
+        help=(
+            "legacy keeps the existing exhaustive tree; memoized uses the DP; "
+            "compare runs both and aborts on the first unequal mask"
+        ),
+    )
+    parser.add_argument(
+        "--max-cache-entries",
+        type=int,
+        default=1_000_000,
+        help="hard per-worker DP+transition cache limit; entries are never evicted",
+    )
+    parser.add_argument(
+        "--statistics-json",
+        type=Path,
+        default=None,
+        help="write compiler/cache/timing diagnostics as JSON",
+    )
+    parser.add_argument(
+        "--require-committed-grid-crossing",
+        action="store_true",
+        help="fail if the pilot never exercises an nC lookup from the committed grid",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="only process the first N unique manifest files (pilot runs)",
+    )
     parser.add_argument("--rebuild", action="store_true")
     return parser.parse_args()
 
@@ -504,6 +853,15 @@ def main() -> None:
     args = parse_args()
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
+    if args.max_cache_entries < 1:
+        raise ValueError("--max-cache-entries must be at least 1")
+    if args.max_files is not None and args.max_files < 1:
+        raise ValueError("--max-files must be at least 1")
+    if args.max_files is not None and args.output is None:
+        raise ValueError(
+            "--max-files requires an explicit --output so a pilot cannot overwrite "
+            "the corpus-wide default table"
+        )
     output = args.output or default_mask_table_path(args.manifest)
     build_table(
         args.manifest,
@@ -511,6 +869,11 @@ def main() -> None:
         args.workers,
         args.rebuild,
         slice_layout=args.slice_layout,
+        compiler_mode=args.mask_compiler,
+        max_cache_entries=args.max_cache_entries,
+        statistics_path=args.statistics_json,
+        require_committed_grid_crossing=args.require_committed_grid_crossing,
+        max_files=args.max_files,
     )
 
 

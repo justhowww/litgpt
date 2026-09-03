@@ -25,7 +25,11 @@ Mirrors, bit-for-bit: ``_residual_block`` / ``_parse_residual`` / ``_parse_macro
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from functools import lru_cache
+import resource
+import sys
+import time
 
 try:  # package import (full env) vs flat import (stdlib-only tests)
     from . import h264_cavlc_tables as T
@@ -600,6 +604,17 @@ class MbAutomaton:
         # Copy-on-write overlay used during compile_byte_mask lookahead; None in the
         # committed state (writes then go straight to the grids above).
         self.overlay = None  # type: dict | None
+        # Cached look-ahead states share these grids.  Increment this revision on
+        # every committed grid write so a memoized state can never survive a
+        # change to the decoder history it depends on.  Overlay writes are local
+        # to a look-ahead branch and are represented directly in its signature.
+        self._grid_revision = 0
+
+        # Diagnostic-only record of the most recent nC lookup.  It lets the mask
+        # compiler prove that tests crossed a residual-block boundary and read
+        # the committed coefficient grid (the subtle cache-key dependency).
+        self._context_event_serial = 0
+        self._last_context_event = None
 
         self.mbs_done = 0
         self.stage = "slice"  # "slice" | "trailing" | "done"
@@ -667,22 +682,34 @@ class MbAutomaton:
     def _chroma_coords(mbx, mby, blk):
         return mbx * 2 + (blk & 1), mby * 2 + (blk >> 1)
 
-    def _cell_luma(self, x, y):
+    def _cell_luma(self, x, y, sources=None):
         if x < 0 or y < 0:
+            if sources is not None:
+                sources.append("unavailable")
             return -1
         if self.overlay is not None:
             v = self.overlay.get(("L", x, y))
             if v is not None:
+                if sources is not None:
+                    sources.append("overlay")
                 return v
+        if sources is not None:
+            sources.append("committed")
         return self.luma[y][x]
 
-    def _cell_chroma(self, comp, x, y):
+    def _cell_chroma(self, comp, x, y, sources=None):
         if x < 0 or y < 0:
+            if sources is not None:
+                sources.append("unavailable")
             return -1
         if self.overlay is not None:
             v = self.overlay.get(("C", comp, x, y))
             if v is not None:
+                if sources is not None:
+                    sources.append("overlay")
                 return v
+        if sources is not None:
+            sources.append("committed")
         return self.chroma[comp][y][x]
 
     @staticmethod
@@ -698,12 +725,32 @@ class MbAutomaton:
 
     def _predict_luma(self, blk):
         x, y = self._luma_coords(self.cur_mbx, self.cur_mby, blk)
-        return self._predict(self._cell_luma(x - 1, y), self._cell_luma(x, y - 1))
+        sources = []
+        nc = self._predict(
+            self._cell_luma(x - 1, y, sources),
+            self._cell_luma(x, y - 1, sources),
+        )
+        self._record_context_event("luma", blk, nc, sources)
+        return nc
 
     def _predict_chroma(self, comp, blk):
         x, y = self._chroma_coords(self.cur_mbx, self.cur_mby, blk)
-        return self._predict(
-            self._cell_chroma(comp, x - 1, y), self._cell_chroma(comp, x, y - 1)
+        sources = []
+        nc = self._predict(
+            self._cell_chroma(comp, x - 1, y, sources),
+            self._cell_chroma(comp, x, y - 1, sources),
+        )
+        self._record_context_event(f"chroma{comp}", blk, nc, sources)
+        return nc
+
+    def _record_context_event(self, plane, blk, nc, sources):
+        self._context_event_serial += 1
+        self._last_context_event = (
+            self._context_event_serial,
+            plane,
+            blk,
+            nc,
+            tuple(sources),
         )
 
     def _set_luma(self, mbx, mby, blk, val):
@@ -712,6 +759,7 @@ class MbAutomaton:
             self.overlay[("L", x, y)] = val
         else:
             self.luma[y][x] = val
+            self._grid_revision += 1
 
     def _set_chroma(self, mbx, mby, comp, blk, val):
         x, y = self._chroma_coords(mbx, mby, blk)
@@ -719,6 +767,7 @@ class MbAutomaton:
             self.overlay[("C", comp, x, y)] = val
         else:
             self.chroma[comp][y][x] = val
+            self._grid_revision += 1
 
     def _set_mb(self, mbx, mby, luma_val, chroma_val):
         for b in range(16):
@@ -1225,7 +1274,9 @@ def _se(k: int) -> int:
 
 
 # --- byte-mask compilation --------------------------------------------------
-def compile_byte_mask(auto, *, residual_only: bool = False) -> list:
+def compile_byte_mask(
+    auto, *, residual_only: bool = False, transition_counter=None
+) -> list:
     """bool[256]: which next emitted byte keeps the RBSP grammar legal, checked by
     chaining through element boundaries within the byte (strict). Caller ANDs Layer-1
     Annex-B on top. Uses a fresh overlay so lookahead nnz writes don't touch the grid.
@@ -1240,6 +1291,8 @@ def compile_byte_mask(auto, *, residual_only: bool = False) -> list:
     def visit(node, depth, prefix):
         for bit in (0, 1):
             child = node.clone()
+            if transition_counter is not None:
+                transition_counter()
             st = child.consume_bit(bit)
             if st == INVALID:
                 continue
@@ -1271,3 +1324,348 @@ def _fill(mask, prefix, depth):
     base = prefix << shift
     for i in range(1 << shift):
         mask[base + i] = True
+
+
+class MaskCacheLimitError(RuntimeError):
+    """The memoized compiler reached its fail-fast cache-size guard."""
+
+
+def _freeze_signature_value(value):
+    """Convert the small parser-state values used by a signature to hashables."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_signature_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_signature_value(item) for item in value), key=repr))
+    if isinstance(value, dict):
+        items = (
+            (
+                _freeze_signature_value(key),
+                _freeze_signature_value(item),
+            )
+            for key, item in value.items()
+        )
+        return tuple(sorted(items, key=repr))
+    values = getattr(value, "__dict__", None)
+    if values is not None:
+        return (
+            type(value).__qualname__,
+            tuple(
+                sorted(
+                    (key, _freeze_signature_value(item))
+                    for key, item in values.items()
+                )
+            ),
+        )
+    raise TypeError(f"unsupported automaton signature value {type(value)!r}")
+
+
+def automaton_signature(auto):
+    """Return an exact, conservative key for future ``consume_bit`` behavior.
+
+    Absolute bit positions are canonicalized modulo eight because all parser
+    decisions use them only for byte alignment.  Committed coefficient grids use
+    identity + revision rather than hashing a whole picture on every transition;
+    the complete copy-on-write overlay remains part of the key.  This deliberately
+    favors correctness over cross-file sharing for the first implementation.
+
+    The second return value exposes named components for cache-cardinality
+    diagnostics.  It is not consulted by the compiler.
+    """
+    if isinstance(auto, VclAutomaton) and auto._mb is not None:
+        signature, fields = automaton_signature(auto._mb)
+        return ("vcl-delegated", signature), {
+            "automaton": "vcl-delegated",
+            **fields,
+        }
+
+    if isinstance(auto, MbAutomaton):
+        excluded = {
+            "luma",
+            "chroma",
+            "overlay",
+            "ae_prefixes",  # derived exactly by _start from the other fields
+            "_grid_revision",
+            "_context_event_serial",  # diagnostics only
+            "_last_context_event",  # diagnostics only
+        }
+        fields = {
+            key: _freeze_signature_value(value)
+            for key, value in auto.__dict__.items()
+            if key not in excluded
+        }
+        # Only byte alignment affects parsing; retaining the absolute position
+        # would manufacture thousands of distinct states with identical futures.
+        fields["pos"] = auto.pos % 8
+        fields["grid_identity"] = (id(auto.luma), id(auto.chroma))
+        fields["grid_revision"] = auto._grid_revision
+        fields["overlay"] = _freeze_signature_value(auto.overlay)
+        signature = ("mb", tuple(sorted(fields.items())))
+        return signature, {"automaton": "mb", **fields}
+
+    if isinstance(auto, VclAutomaton):
+        excluded = {
+            "_mb",
+            "sps_map",
+            "pps_map",
+            "ae_prefixes",  # derived exactly by _start from the other fields
+            "invalid_reason",  # reporting only; INVALID states are never cached
+        }
+        fields = {
+            key: _freeze_signature_value(value)
+            for key, value in auto.__dict__.items()
+            if key not in excluded
+        }
+        fields["_pos"] = auto._pos % 8
+        fields["sps_map"] = _freeze_signature_value(auto.sps_map)
+        fields["pps_map"] = _freeze_signature_value(auto.pps_map)
+        signature = ("vcl-header", tuple(sorted(fields.items())))
+        return signature, {"automaton": "vcl-header", **fields}
+
+    raise TypeError(f"unsupported automaton type {type(auto)!r}")
+
+
+def _rss_megabytes():
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux reports KiB; macOS and the BSDs report bytes.
+    divisor = 1024.0 if sys.platform.startswith("linux") else 1024.0 * 1024.0
+    return value / divisor
+
+
+class MemoizedByteMaskCompiler:
+    """Compile exact byte masks with dynamic programming over parser states.
+
+    ``P(state, k)`` is the packed truth table for all legal ``k``-bit strings.
+    A cache miss computes the two one-bit transitions once, then reuses the
+    cached child subproblems.  The table is intentionally process-local in v1;
+    the build script keeps one compiler alive across all files handled by a
+    worker process.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_cache_entries: int = 1_000_000,
+        collect_field_cardinality: bool = False,
+    ) -> None:
+        if max_cache_entries <= 0:
+            raise ValueError("max_cache_entries must be positive")
+        self.max_cache_entries = max_cache_entries
+        self.collect_field_cardinality = collect_field_cardinality
+        self._dp = {}
+        self._transitions = {}
+        self._seen_signatures = set()
+        self._field_values = defaultdict(set)
+        self._counts = Counter()
+        self._dp_requests_by_k = Counter()
+        self._dp_hits_by_k = Counter()
+        self._dp_misses_by_k = Counter()
+        self._bucket_labels = Counter()
+        self._context_sources = Counter()
+        self._seconds = Counter()
+        self._peak_cache_entries = 0
+
+    def record_corpus_byte(self) -> None:
+        """Count every source byte, including positions with permissive masks."""
+        self._counts["corpus_bytes"] += 1
+
+    def _signature(self, auto):
+        started = time.perf_counter()
+        signature, fields = automaton_signature(auto)
+        self._seconds["signature"] += time.perf_counter() - started
+        if self.collect_field_cardinality:
+            self._seen_signatures.add(signature)
+            for name, value in fields.items():
+                self._field_values[name].add(value)
+        return signature
+
+    def _reserve(self, cache_name: str) -> None:
+        entries = len(self._dp) + len(self._transitions)
+        if entries >= self.max_cache_entries:
+            self._counts["cache_limit_aborts"] += 1
+            raise MaskCacheLimitError(
+                f"memoized mask cache reached {entries:,} entries "
+                f"(limit={self.max_cache_entries:,}) before inserting into {cache_name}; "
+                "no entries were evicted"
+            )
+
+    @staticmethod
+    def _mb(auto):
+        return auto._mb if isinstance(auto, VclAutomaton) else auto
+
+    def _record_context_crossing(self, parent, child) -> None:
+        parent_mb = self._mb(parent)
+        child_mb = self._mb(child)
+        if not isinstance(parent_mb, MbAutomaton) or not isinstance(child_mb, MbAutomaton):
+            return
+        if child_mb._context_event_serial == parent_mb._context_event_serial:
+            return
+        event = child_mb._last_context_event
+        if event is None:
+            return
+        _, _plane, _block, _nc, sources = event
+        self._counts["coeff_context_crossings"] += 1
+        self._bucket_labels[child_mb.ae_label] += 1
+        unique_sources = set(sources)
+        for source in unique_sources:
+            self._context_sources[source] += 1
+        if "committed" in unique_sources:
+            self._counts["committed_grid_bucket_crossings"] += 1
+        if "overlay" in unique_sources:
+            self._counts["overlay_bucket_crossings"] += 1
+
+    def _transition(self, auto, signature, bit):
+        self._counts["transition_requests"] += 1
+        key = (signature, bit)
+        cached = self._transitions.get(key)
+        if cached is not None:
+            self._counts["transition_hits"] += 1
+            return cached
+
+        self._counts["transition_misses"] += 1
+        started = time.perf_counter()
+        child = auto.clone()
+        status = child.consume_bit(bit)
+        self._seconds["transition"] += time.perf_counter() - started
+        self._record_context_crossing(auto, child)
+        self._reserve("transition cache")
+        result = (status, child)
+        self._transitions[key] = result
+        self._update_peak()
+        return result
+
+    @staticmethod
+    def _all_suffixes(k):
+        return (1 << (1 << k)) - 1
+
+    def _branch(self, auto, signature, bit, remaining, residual_only):
+        status, child = self._transition(auto, signature, bit)
+        if status == INVALID:
+            return 0
+        if remaining == 0:
+            return 1
+        if status == DONE:
+            return self._all_suffixes(remaining)
+        if (
+            residual_only
+            and child.stage == "slice"
+            and child.ae_tag not in _RESIDUAL_TAGS
+        ):
+            return self._all_suffixes(remaining)
+        return self._solve(child, remaining, residual_only)
+
+    def _solve(self, auto, k, residual_only, signature=None):
+        if k == 0:
+            return 1
+        if signature is None:
+            signature = self._signature(auto)
+        key = (residual_only, k, signature)
+        self._dp_requests_by_k[k] += 1
+        cached = self._dp.get(key)
+        if cached is not None:
+            self._dp_hits_by_k[k] += 1
+            return cached
+
+        self._dp_misses_by_k[k] += 1
+        remaining = k - 1
+        left = self._branch(auto, signature, 0, remaining, residual_only)
+        right = self._branch(auto, signature, 1, remaining, residual_only)
+        value = (left << (1 << remaining)) | right
+        self._reserve("DP cache")
+        self._dp[key] = value
+        self._update_peak()
+        return value
+
+    def _update_peak(self):
+        self._peak_cache_entries = max(
+            self._peak_cache_entries, len(self._dp) + len(self._transitions)
+        )
+
+    def compile_byte_mask_int(self, auto, *, residual_only: bool = False) -> int:
+        root = auto.clone()
+        if hasattr(root, "prepare_lookahead"):
+            root.prepare_lookahead()
+        else:
+            root.overlay = {} if auto.overlay is None else dict(auto.overlay)
+
+        signature = self._signature(root)
+        key = (residual_only, 8, signature)
+        self._counts["root_requests"] += 1
+        if key in self._dp:
+            self._counts["root_hits"] += 1
+        else:
+            self._counts["root_misses"] += 1
+        started = time.perf_counter()
+        value = self._solve(root, 8, residual_only, signature)
+        self._seconds["dp"] += time.perf_counter() - started
+        return value
+
+    def compile_byte_mask(self, auto, *, residual_only: bool = False) -> list:
+        value = self.compile_byte_mask_int(auto, residual_only=residual_only)
+        return [(value >> (255 - byte)) & 1 == 1 for byte in range(256)]
+
+    def statistics(self) -> dict:
+        corpus_bytes = self._counts["corpus_bytes"]
+        root_requests = self._counts["root_requests"]
+        transition_requests = self._counts["transition_requests"]
+        transition_misses = self._counts["transition_misses"]
+
+        def ratio(numerator, denominator):
+            return numerator / denominator if denominator else None
+
+        by_k = {}
+        for k in range(1, 9):
+            requests = self._dp_requests_by_k[k]
+            hits = self._dp_hits_by_k[k]
+            by_k[str(k)] = {
+                "requests": requests,
+                "hits": hits,
+                "misses": self._dp_misses_by_k[k],
+                "hit_rate": ratio(hits, requests),
+            }
+        return {
+            "corpus_bytes": corpus_bytes,
+            "root_requests": root_requests,
+            "root_hits": self._counts["root_hits"],
+            "root_misses": self._counts["root_misses"],
+            "root_hit_rate": ratio(self._counts["root_hits"], root_requests),
+            "dp_by_k": by_k,
+            "transition_requests": transition_requests,
+            "transition_hits": self._counts["transition_hits"],
+            "transition_computations": transition_misses,
+            "transition_hit_rate": ratio(
+                self._counts["transition_hits"], transition_requests
+            ),
+            "transition_computations_per_byte": ratio(
+                transition_misses, corpus_bytes
+            ),
+            "dp_cache_entries": len(self._dp),
+            "transition_cache_entries": len(self._transitions),
+            "total_cache_entries": len(self._dp) + len(self._transitions),
+            "peak_cache_entries": self._peak_cache_entries,
+            "max_cache_entries": self.max_cache_entries,
+            "cache_limit_aborts": self._counts["cache_limit_aborts"],
+            "unique_signatures": (
+                len(self._seen_signatures)
+                if self.collect_field_cardinality
+                else None
+            ),
+            "signature_field_cardinality": (
+                {
+                    name: len(values)
+                    for name, values in sorted(self._field_values.items())
+                }
+                if self.collect_field_cardinality
+                else None
+            ),
+            "coeff_context_crossings": self._counts["coeff_context_crossings"],
+            "committed_grid_bucket_crossings": self._counts[
+                "committed_grid_bucket_crossings"
+            ],
+            "overlay_bucket_crossings": self._counts["overlay_bucket_crossings"],
+            "bucket_crossings_by_coeff_token_label": dict(self._bucket_labels),
+            "context_crossings_by_source": dict(self._context_sources),
+            "seconds": dict(self._seconds),
+            "peak_rss_mb": _rss_megabytes(),
+        }

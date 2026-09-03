@@ -252,7 +252,7 @@ def _apply_annexb_mask(
         mask[3] = epb_legal
 
 
-def get_valid_byte_mask(state: MaskState) -> list[bool]:
+def get_valid_byte_mask(state: MaskState, *, byte_mask_compiler=None) -> list[bool]:
     """Return a 256-entry mask for the next emitted byte.
 
     In full mode, the NAL header, slice header, and supported slice data are all
@@ -291,7 +291,12 @@ def get_valid_byte_mask(state: MaskState) -> list[bool]:
         not state.residual_only or auto.ae_tag in _RESIDUAL_TAGS
     )
     if should_compile:
-        mask = HA.compile_byte_mask(auto, residual_only=state.residual_only)
+        if byte_mask_compiler is None:
+            mask = HA.compile_byte_mask(auto, residual_only=state.residual_only)
+        else:
+            mask = byte_mask_compiler.compile_byte_mask(
+                auto, residual_only=state.residual_only
+            )
         strict = True
         state.strict_mask_calls += 1
         if not any(mask) and state.failure_reason is None:

@@ -295,6 +295,71 @@ def test_full_byte_mask_rejects_oversized_skip_run_prefix():
     assert not any(mask[0b01100000:0b10000000])
 
 
+def test_memoized_byte_mask_is_exact_and_reuses_root():
+    compiler = A.MemoizedByteMaskCompiler(
+        max_cache_entries=100_000,
+        collect_field_cardinality=True,
+    )
+    auto = _small_automaton()
+    compiler.record_corpus_byte()
+    assert compiler.compile_byte_mask(auto) == A.compile_byte_mask(auto)
+
+    before = compiler.statistics()
+    compiler.record_corpus_byte()
+    assert compiler.compile_byte_mask(auto) == A.compile_byte_mask(auto)
+    after = compiler.statistics()
+    assert after["root_hits"] == before["root_hits"] + 1
+    assert (
+        after["transition_computations"]
+        == before["transition_computations"]
+    )
+    assert after["transition_computations_per_byte"] is not None
+    assert after["signature_field_cardinality"]
+
+
+def test_memoized_cache_key_changes_after_committed_grid_write():
+    compiler = A.MemoizedByteMaskCompiler(max_cache_entries=100_000)
+    auto = _small_automaton()
+    compiler.record_corpus_byte()
+    compiler.compile_byte_mask(auto)
+    before = compiler.statistics()
+
+    auto._set_luma(0, 0, 0, 3)
+    compiler.record_corpus_byte()
+    assert compiler.compile_byte_mask(auto) == A.compile_byte_mask(auto)
+    after = compiler.statistics()
+    assert after["root_misses"] == before["root_misses"] + 1
+
+
+def test_memoized_compiler_exercises_committed_grid_coeff_context():
+    auto = _small_automaton()
+    auto.cur_mbx = 1
+    auto.cur_mby = 1
+    auto.res_phase = "luma"
+    auto.res_blk = 1
+    auto.cbp_luma = 1
+    auto.cbp_chroma = 0
+    auto._rb_start(nc=0, max_coeff=16, set_target=("L", 0))
+
+    compiler = A.MemoizedByteMaskCompiler(max_cache_entries=100_000)
+    compiler.record_corpus_byte()
+    assert compiler.compile_byte_mask(auto) == A.compile_byte_mask(auto)
+    statistics = compiler.statistics()
+    assert statistics["coeff_context_crossings"] > 0
+    assert statistics["committed_grid_bucket_crossings"] > 0
+    assert statistics["bucket_crossings_by_coeff_token_label"]
+
+
+def test_memoized_compiler_aborts_instead_of_evicting():
+    compiler = A.MemoizedByteMaskCompiler(max_cache_entries=1)
+    try:
+        compiler.compile_byte_mask(_small_automaton())
+    except A.MaskCacheLimitError as exc:
+        assert "no entries were evicted" in str(exc)
+    else:
+        raise AssertionError("hard cache limit did not abort")
+
+
 def test_automaton_rejects_slice_extent_outside_picture():
     try:
         A.MbAutomaton(
