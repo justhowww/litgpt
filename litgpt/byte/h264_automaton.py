@@ -1437,10 +1437,11 @@ class MemoizedByteMaskCompiler:
     """Compile exact byte masks with dynamic programming over parser states.
 
     ``P(state, k)`` is the packed truth table for all legal ``k``-bit strings.
-    A cache miss computes the two one-bit transitions once, then reuses the
-    cached child subproblems.  The table is intentionally process-local in v1;
-    the build script keeps one compiler alive across all files handled by a
-    worker process.
+    A cache miss computes two one-bit transitions, then reuses cached child
+    subproblems.  ``cache_scope='root'`` clears the table before every source
+    byte, bounding memory while retaining convergence inside that byte's search
+    tree.  ``cache_scope='worker'`` is an analysis mode that also measures reuse
+    across source bytes handled by one worker.
     """
 
     def __init__(
@@ -1448,23 +1449,31 @@ class MemoizedByteMaskCompiler:
         *,
         max_cache_entries: int = 1_000_000,
         collect_field_cardinality: bool = False,
+        cache_scope: str = "root",
     ) -> None:
         if max_cache_entries <= 0:
             raise ValueError("max_cache_entries must be positive")
+        if cache_scope not in ("root", "worker"):
+            raise ValueError("cache_scope must be 'root' or 'worker'")
         self.max_cache_entries = max_cache_entries
         self.collect_field_cardinality = collect_field_cardinality
+        self.cache_scope = cache_scope
         self._dp = {}
-        self._transitions = {}
         self._seen_signatures = set()
         self._field_values = defaultdict(set)
+        self._cardinality_hash_cap = 50_000
+        self._saturated_cardinality_fields = set()
         self._counts = Counter()
         self._dp_requests_by_k = Counter()
         self._dp_hits_by_k = Counter()
+        self._dp_same_root_hits_by_k = Counter()
+        self._dp_cross_root_hits_by_k = Counter()
         self._dp_misses_by_k = Counter()
         self._bucket_labels = Counter()
         self._context_sources = Counter()
         self._seconds = Counter()
         self._peak_cache_entries = 0
+        self._root_id = 0
 
     def record_corpus_byte(self) -> None:
         """Count every source byte, including positions with permissive masks."""
@@ -1475,18 +1484,28 @@ class MemoizedByteMaskCompiler:
         signature, fields = automaton_signature(auto)
         self._seconds["signature"] += time.perf_counter() - started
         if self.collect_field_cardinality:
-            self._seen_signatures.add(signature)
+            # Keep diagnostics from recreating the memory problem that root-scoped
+            # DP avoids.  Process-local hashes make cardinality a negligible-memory
+            # estimate instead of retaining every large overlay/signature tuple.
+            if len(self._seen_signatures) < self._cardinality_hash_cap:
+                self._seen_signatures.add(hash(signature))
+            else:
+                self._saturated_cardinality_fields.add("__signature__")
             for name, value in fields.items():
-                self._field_values[name].add(value)
+                values = self._field_values[name]
+                if len(values) < self._cardinality_hash_cap:
+                    values.add(hash(value))
+                else:
+                    self._saturated_cardinality_fields.add(name)
         return signature
 
-    def _reserve(self, cache_name: str) -> None:
-        entries = len(self._dp) + len(self._transitions)
+    def _reserve(self) -> None:
+        entries = len(self._dp)
         if entries >= self.max_cache_entries:
             self._counts["cache_limit_aborts"] += 1
             raise MaskCacheLimitError(
                 f"memoized mask cache reached {entries:,} entries "
-                f"(limit={self.max_cache_entries:,}) before inserting into {cache_name}; "
+                f"(limit={self.max_cache_entries:,}) before inserting into DP cache; "
                 "no entries were evicted"
             )
 
@@ -1515,32 +1534,21 @@ class MemoizedByteMaskCompiler:
         if "overlay" in unique_sources:
             self._counts["overlay_bucket_crossings"] += 1
 
-    def _transition(self, auto, signature, bit):
+    def _transition(self, auto, bit):
         self._counts["transition_requests"] += 1
-        key = (signature, bit)
-        cached = self._transitions.get(key)
-        if cached is not None:
-            self._counts["transition_hits"] += 1
-            return cached
-
-        self._counts["transition_misses"] += 1
         started = time.perf_counter()
         child = auto.clone()
         status = child.consume_bit(bit)
         self._seconds["transition"] += time.perf_counter() - started
         self._record_context_crossing(auto, child)
-        self._reserve("transition cache")
-        result = (status, child)
-        self._transitions[key] = result
-        self._update_peak()
-        return result
+        return status, child
 
     @staticmethod
     def _all_suffixes(k):
         return (1 << (1 << k)) - 1
 
-    def _branch(self, auto, signature, bit, remaining, residual_only):
-        status, child = self._transition(auto, signature, bit)
+    def _branch(self, auto, bit, remaining, residual_only):
+        status, child = self._transition(auto, bit)
         if status == INVALID:
             return 0
         if remaining == 0:
@@ -1564,25 +1572,31 @@ class MemoizedByteMaskCompiler:
         self._dp_requests_by_k[k] += 1
         cached = self._dp.get(key)
         if cached is not None:
+            value, origin_root_id = cached
             self._dp_hits_by_k[k] += 1
-            return cached
+            if origin_root_id == self._root_id:
+                self._dp_same_root_hits_by_k[k] += 1
+            else:
+                self._dp_cross_root_hits_by_k[k] += 1
+            return value
 
         self._dp_misses_by_k[k] += 1
         remaining = k - 1
-        left = self._branch(auto, signature, 0, remaining, residual_only)
-        right = self._branch(auto, signature, 1, remaining, residual_only)
+        left = self._branch(auto, 0, remaining, residual_only)
+        right = self._branch(auto, 1, remaining, residual_only)
         value = (left << (1 << remaining)) | right
-        self._reserve("DP cache")
-        self._dp[key] = value
+        self._reserve()
+        self._dp[key] = (value, self._root_id)
         self._update_peak()
         return value
 
     def _update_peak(self):
-        self._peak_cache_entries = max(
-            self._peak_cache_entries, len(self._dp) + len(self._transitions)
-        )
+        self._peak_cache_entries = max(self._peak_cache_entries, len(self._dp))
 
     def compile_byte_mask_int(self, auto, *, residual_only: bool = False) -> int:
+        self._root_id += 1
+        if self.cache_scope == "root":
+            self._dp.clear()
         root = auto.clone()
         if hasattr(root, "prepare_lookahead"):
             root.prepare_lookahead()
@@ -1609,7 +1623,6 @@ class MemoizedByteMaskCompiler:
         corpus_bytes = self._counts["corpus_bytes"]
         root_requests = self._counts["root_requests"]
         transition_requests = self._counts["transition_requests"]
-        transition_misses = self._counts["transition_misses"]
 
         def ratio(numerator, denominator):
             return numerator / denominator if denominator else None
@@ -1621,33 +1634,55 @@ class MemoizedByteMaskCompiler:
             by_k[str(k)] = {
                 "requests": requests,
                 "hits": hits,
+                "same_root_hits": self._dp_same_root_hits_by_k[k],
+                "cross_root_hits": self._dp_cross_root_hits_by_k[k],
                 "misses": self._dp_misses_by_k[k],
                 "hit_rate": ratio(hits, requests),
             }
+        same_root_hits = sum(self._dp_same_root_hits_by_k.values())
+        cross_root_hits = sum(self._dp_cross_root_hits_by_k.values())
         return {
+            "dp_cache_scope": self.cache_scope,
             "corpus_bytes": corpus_bytes,
             "root_requests": root_requests,
             "root_hits": self._counts["root_hits"],
             "root_misses": self._counts["root_misses"],
             "root_hit_rate": ratio(self._counts["root_hits"], root_requests),
             "dp_by_k": by_k,
-            "transition_requests": transition_requests,
-            "transition_hits": self._counts["transition_hits"],
-            "transition_computations": transition_misses,
-            "transition_hit_rate": ratio(
-                self._counts["transition_hits"], transition_requests
+            "dp_same_root_hits": same_root_hits,
+            "dp_cross_root_hits": cross_root_hits,
+            "dp_cross_root_fraction_of_hits": ratio(
+                cross_root_hits, same_root_hits + cross_root_hits
             ),
+            "transition_requests": transition_requests,
+            "transition_computations": transition_requests,
             "transition_computations_per_byte": ratio(
-                transition_misses, corpus_bytes
+                transition_requests, corpus_bytes
             ),
             "dp_cache_entries": len(self._dp),
-            "transition_cache_entries": len(self._transitions),
-            "total_cache_entries": len(self._dp) + len(self._transitions),
+            "transition_cache_entries": 0,
+            "transition_cache_removed": True,
+            "total_cache_entries": len(self._dp),
             "peak_cache_entries": self._peak_cache_entries,
             "max_cache_entries": self.max_cache_entries,
             "cache_limit_aborts": self._counts["cache_limit_aborts"],
             "unique_signatures": (
                 len(self._seen_signatures)
+                if self.collect_field_cardinality
+                else None
+            ),
+            "signature_cardinality_method": (
+                "process-local hash estimate, capped per field"
+                if self.collect_field_cardinality
+                else None
+            ),
+            "signature_cardinality_hash_cap": (
+                self._cardinality_hash_cap
+                if self.collect_field_cardinality
+                else None
+            ),
+            "saturated_signature_cardinality_fields": (
+                sorted(self._saturated_cardinality_fields)
                 if self.collect_field_cardinality
                 else None
             ),

@@ -299,6 +299,7 @@ def test_memoized_byte_mask_is_exact_and_reuses_root():
     compiler = A.MemoizedByteMaskCompiler(
         max_cache_entries=100_000,
         collect_field_cardinality=True,
+        cache_scope="worker",
     )
     auto = _small_automaton()
     compiler.record_corpus_byte()
@@ -309,6 +310,7 @@ def test_memoized_byte_mask_is_exact_and_reuses_root():
     assert compiler.compile_byte_mask(auto) == A.compile_byte_mask(auto)
     after = compiler.statistics()
     assert after["root_hits"] == before["root_hits"] + 1
+    assert after["dp_cross_root_hits"] > before["dp_cross_root_hits"]
     assert (
         after["transition_computations"]
         == before["transition_computations"]
@@ -318,7 +320,9 @@ def test_memoized_byte_mask_is_exact_and_reuses_root():
 
 
 def test_memoized_cache_key_changes_after_committed_grid_write():
-    compiler = A.MemoizedByteMaskCompiler(max_cache_entries=100_000)
+    compiler = A.MemoizedByteMaskCompiler(
+        max_cache_entries=100_000, cache_scope="worker"
+    )
     auto = _small_automaton()
     compiler.record_corpus_byte()
     compiler.compile_byte_mask(auto)
@@ -329,6 +333,22 @@ def test_memoized_cache_key_changes_after_committed_grid_write():
     assert compiler.compile_byte_mask(auto) == A.compile_byte_mask(auto)
     after = compiler.statistics()
     assert after["root_misses"] == before["root_misses"] + 1
+
+
+def test_root_scoped_memoization_does_not_grow_across_bytes():
+    compiler = A.MemoizedByteMaskCompiler(
+        max_cache_entries=100_000, cache_scope="root"
+    )
+    auto = _small_automaton()
+    compiler.compile_byte_mask(auto)
+    first_entries = compiler.statistics()["dp_cache_entries"]
+    compiler.compile_byte_mask(auto)
+    statistics = compiler.statistics()
+    assert statistics["dp_cache_entries"] == first_entries
+    assert statistics["root_hits"] == 0
+    assert statistics["dp_cross_root_hits"] == 0
+    assert statistics["dp_same_root_hits"] > 0
+    assert statistics["transition_cache_entries"] == 0
 
 
 def test_memoized_compiler_exercises_committed_grid_coeff_context():

@@ -127,7 +127,9 @@ Exact DP pilot (run separately for ``macroblock`` and ``frame`` corpora):
 
 ``compare`` is intentionally a validation mode, not a speed benchmark: it runs
 both implementations.  After exact equality is established, use ``memoized`` and
-repeat with the intended worker count to measure warm-cache throughput.
+repeat with the intended worker count to measure throughput.  The default
+``--dp-cache-scope root`` bounds memory to one byte's search tree.  Use
+``--dp-cache-scope worker`` only on a small pilot to measure cross-byte reuse.
 """
 
 from __future__ import annotations
@@ -158,6 +160,7 @@ from litgpt.byte.h264_mask import (
 
 DEFAULT_MASK_TABLE_NAME = "legal_mask_table.sqlite"
 MASK_COMPILERS = ("legacy", "memoized", "compare")
+DP_CACHE_SCOPES = ("root", "worker")
 _WORKER_COMPILERS = {}
 
 if array("I").itemsize != 4:
@@ -173,7 +176,13 @@ def default_mask_table_path(manifest_path: Path) -> Path:
 class ByteMaskCompiler:
     """Build-script adapter for legacy, memoized, and exact-comparison modes."""
 
-    def __init__(self, mode: str, max_cache_entries: int, collect_stats: bool):
+    def __init__(
+        self,
+        mode: str,
+        max_cache_entries: int,
+        collect_stats: bool,
+        dp_cache_scope: str,
+    ):
         if mode not in MASK_COMPILERS:
             raise ValueError(f"unknown mask compiler {mode!r}")
         self.mode = mode
@@ -181,6 +190,7 @@ class ByteMaskCompiler:
             HA.MemoizedByteMaskCompiler(
                 max_cache_entries=max_cache_entries,
                 collect_field_cardinality=collect_stats,
+                cache_scope=dp_cache_scope,
             )
             if mode != "legacy"
             else None
@@ -245,12 +255,14 @@ class ByteMaskCompiler:
         return result
 
 
-def _worker_compiler(mode, max_cache_entries, collect_stats):
-    """One warm cache per worker process, shared across that worker's files."""
-    key = (mode, max_cache_entries, collect_stats)
+def _worker_compiler(mode, max_cache_entries, collect_stats, dp_cache_scope):
+    """One compiler/stat accumulator per worker; DP sharing follows its scope."""
+    key = (mode, max_cache_entries, collect_stats, dp_cache_scope)
     compiler = _WORKER_COMPILERS.get(key)
     if compiler is None:
-        compiler = ByteMaskCompiler(mode, max_cache_entries, collect_stats)
+        compiler = ByteMaskCompiler(
+            mode, max_cache_entries, collect_stats, dp_cache_scope
+        )
         _WORKER_COMPILERS[key] = compiler
     return compiler
 
@@ -324,6 +336,7 @@ def scan_file(
     compiler_mode: str = "legacy",
     max_cache_entries: int = 1_000_000,
     collect_stats: bool = False,
+    dp_cache_scope: str = "root",
 ) -> tuple[str, int, int, array, list[bytes], int, dict, dict]:
     """Compute per-byte legal masks for one file, deduplicated LOCALLY (per file).
 
@@ -337,7 +350,7 @@ def scan_file(
     data = path.read_bytes()
     stat = path.stat()
     compiler = _worker_compiler(
-        compiler_mode, max_cache_entries, collect_stats
+        compiler_mode, max_cache_entries, collect_stats, dp_cache_scope
     )
 
     local_table: dict[bytes, int] = {}
@@ -519,13 +532,20 @@ def aggregate_worker_statistics(worker_statistics: dict[int, dict]) -> dict:
         entries = [worker.get("dp_by_k", {}).get(str(k), {}) for worker in workers]
         requests = sum(entry.get("requests", 0) for entry in entries)
         hits = sum(entry.get("hits", 0) for entry in entries)
+        same_root_hits = sum(entry.get("same_root_hits", 0) for entry in entries)
+        cross_root_hits = sum(entry.get("cross_root_hits", 0) for entry in entries)
         misses = sum(entry.get("misses", 0) for entry in entries)
         dp_by_k[str(k)] = {
             "requests": requests,
             "hits": hits,
+            "same_root_hits": same_root_hits,
+            "cross_root_hits": cross_root_hits,
             "misses": misses,
             "hit_rate": hits / requests if requests else None,
         }
+
+    dp_same_root_hits = total("dp_same_root_hits")
+    dp_cross_root_hits = total("dp_cross_root_hits")
 
     bucket_labels = Counter()
     context_sources = Counter()
@@ -543,14 +563,16 @@ def aggregate_worker_statistics(worker_statistics: dict[int, dict]) -> dict:
         "root_misses": total("root_misses"),
         "root_hit_rate": root_hits / root_requests if root_requests else None,
         "dp_by_k": dp_by_k,
-        "transition_requests": transition_requests,
-        "transition_hits": total("transition_hits"),
-        "transition_computations": transition_computations,
-        "transition_hit_rate": (
-            total("transition_hits") / transition_requests
-            if transition_requests
+        "dp_same_root_hits": dp_same_root_hits,
+        "dp_cross_root_hits": dp_cross_root_hits,
+        "dp_cross_root_fraction_of_hits": (
+            dp_cross_root_hits / (dp_same_root_hits + dp_cross_root_hits)
+            if dp_same_root_hits + dp_cross_root_hits
             else None
         ),
+        "transition_requests": transition_requests,
+        "transition_computations": transition_computations,
+        "transition_cache_removed": True,
         "transition_computations_per_byte": (
             transition_computations / corpus_bytes if corpus_bytes else None
         ),
@@ -596,6 +618,7 @@ def build_table(
     *,
     compiler_mode: str = "legacy",
     max_cache_entries: int = 1_000_000,
+    dp_cache_scope: str = "root",
     statistics_path: Path | None = None,
     require_committed_grid_crossing: bool = False,
     max_files: int | None = None,
@@ -696,6 +719,7 @@ def build_table(
                 repeat(compiler_mode),
                 repeat(max_cache_entries),
                 repeat(statistics_path is not None or compiler_mode == "compare"),
+                repeat(dp_cache_scope),
             )
             executor = None
         else:
@@ -707,6 +731,7 @@ def build_table(
                 repeat(compiler_mode),
                 repeat(max_cache_entries),
                 repeat(statistics_path is not None or compiler_mode == "compare"),
+                repeat(dp_cache_scope),
                 chunksize=4,
             )
 
@@ -742,6 +767,7 @@ def build_table(
             "manifest_mtime_ns": str(manifest_stat.st_mtime_ns),
             "slice_layout": slice_layout,
             "mask_compiler": compiler_mode,
+            "dp_cache_scope": dp_cache_scope,
         }
         connection.executemany(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
@@ -760,6 +786,7 @@ def build_table(
             "manifest": str(manifest_path.resolve()),
             "slice_layout": slice_layout,
             "compiler_mode": compiler_mode,
+            "dp_cache_scope": dp_cache_scope,
             "processed_files": processed_files,
             "processed_bytes": processed_bytes,
             "wall_seconds": elapsed,
@@ -780,12 +807,18 @@ def build_table(
     if transitions_per_byte is not None:
         reduction = aggregate.get("transition_reduction_factor")
         reduction_text = f", reduction={reduction:.2f}x" if reduction else ""
+        cross_root_fraction = aggregate.get("dp_cross_root_fraction_of_hits")
+        cross_root_text = (
+            f", cross-byte share of DP hits={cross_root_fraction:.2%}"
+            if cross_root_fraction is not None
+            else ""
+        )
         print(
             "Memoized compiler: "
             f"{transitions_per_byte:.3f} transition computations/source byte, "
-            f"root hit rate={aggregate['root_hit_rate'] or 0.0:.3%}, "
+            f"cache_scope={dp_cache_scope}, "
             f"committed-grid crossings={aggregate['committed_grid_bucket_crossings']:,}"
-            f"{reduction_text}",
+            f"{reduction_text}{cross_root_text}",
             flush=True,
         )
     if (
@@ -826,7 +859,16 @@ def parse_args() -> argparse.Namespace:
         "--max-cache-entries",
         type=int,
         default=1_000_000,
-        help="hard per-worker DP+transition cache limit; entries are never evicted",
+        help="hard DP-cache limit; entries are never evicted",
+    )
+    parser.add_argument(
+        "--dp-cache-scope",
+        choices=DP_CACHE_SCOPES,
+        default="root",
+        help=(
+            "root clears DP state before each corpus byte (bounded default); "
+            "worker retains it to measure cross-byte reuse"
+        ),
     )
     parser.add_argument(
         "--statistics-json",
@@ -871,6 +913,7 @@ def main() -> None:
         slice_layout=args.slice_layout,
         compiler_mode=args.mask_compiler,
         max_cache_entries=args.max_cache_entries,
+        dp_cache_scope=args.dp_cache_scope,
         statistics_path=args.statistics_json,
         require_committed_grid_crossing=args.require_committed_grid_crossing,
         max_files=args.max_files,
