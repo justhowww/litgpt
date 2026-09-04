@@ -65,6 +65,7 @@ from litgpt.byte.data import (  # noqa: E402
     IGNORE_INDEX,
     REGION_BRIDGE,
     SEQ_EOS_ID,
+    VCL_NAL_TYPES,
     ByteStreamWindowDataset,
     default_nal_index_path,
     load_manifest_rows,
@@ -82,6 +83,7 @@ from scripts.byte.eval.helpers.checkpoint_eval_helpers import (  # noqa: E402
 )
 from scripts.byte.eval.helpers.comparison_video import (  # noqa: E402
     save_comparison_video,
+    save_stream_comparison_video,
 )
 from scripts.byte.eval import eval_ar_continuation as AR  # noqa: E402
 
@@ -106,6 +108,7 @@ class WindowFimSample:
     target_bytes: bytes
     window_bytes: bytes
     hole_id: int | None = None
+    corruption_frame_type: str | None = None
 
     @property
     def target_length(self) -> int:
@@ -278,8 +281,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help=(
-            "Whole-byte approximation of corrupt_Gen.py's x+7 hexadecimal-character "
-            "offset. Used only by corrupt_gen_frame."
+            "Four-byte start-code/NAL-header guard matching the byte-aligned "
+            "frame corruption diagnostic. Used only by corrupt_gen_frame."
         ),
     )
     parser.add_argument(
@@ -290,6 +293,16 @@ def parse_args() -> argparse.Namespace:
             "Optional larger cut length used only to choose eligible frames. Set "
             "this to the largest deletion in a severity sweep so every run selects "
             "the same frame while still deleting --corr-len-bytes."
+        ),
+    )
+    parser.add_argument(
+        "--corr-frame-type",
+        choices=("any", "idr", "p"),
+        default="any",
+        help=(
+            "Frame class eligible for --hole-placement corrupt_gen_frame. "
+            "Use separate idr and p runs to distinguish immediate corruption "
+            "from reference-chain propagation."
         ),
     )
     parser.add_argument(
@@ -359,6 +372,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
+    parser.add_argument("--ffprobe-binary", default="ffprobe")
     parser.add_argument("--timeout-sec", type=int, default=30)
     args = parser.parse_args()
     if args.max_gen_bytes <= 0:
@@ -387,6 +401,8 @@ def parse_args() -> argparse.Namespace:
                 "--hole-placement corrupt_gen_frame is incompatible with "
                 "--hole-set trained/heldout; use --hole-set sampled"
             )
+    elif args.corr_frame_type != "any":
+        parser.error("--corr-frame-type requires --hole-placement corrupt_gen_frame")
     return args
 
 
@@ -503,13 +519,14 @@ def _corrupt_gen_frame_hole_spec(
     corr_pos: float,
     eligibility_bytes: int,
     seed: int,
+    frame_type: str = "any",
 ) -> tuple[int, int, int, int] | None:
     """Select one exact, byte-aligned corrupt_Gen-style frame deletion.
 
     ``ByteStreamWindowDataset`` has already been configured with a fixed
-    ``fim_min_gap == fim_max_gap`` and the four-byte approximation of
-    corrupt_Gen.py's x+7-nibble header offset. Consequently every candidate can
-    hold the complete requested deletion and no short-frame fallback is possible.
+    ``fim_min_gap == fim_max_gap`` and the diagnostic's four-byte header guard.
+    Consequently every candidate can hold the complete requested deletion and
+    no short-frame fallback is possible.
     """
     if dataset.fim_min_gap != dataset.fim_max_gap:
         raise ValueError("corrupt_gen_frame requires one fixed deletion length")
@@ -524,6 +541,13 @@ def _corrupt_gen_frame_hole_spec(
         - 1
         >= eligibility_bytes
     ]
+    if frame_type != "any":
+        wanted = str(frame_type)
+        candidates = [
+            bounds
+            for bounds in candidates
+            if _corruption_frame_type(dataset, idx, bounds[0], data=data) == wanted
+        ]
     if not candidates:
         return None
 
@@ -538,6 +562,46 @@ def _corrupt_gen_frame_hole_spec(
         raise AssertionError("eligible frame cannot hold the requested full cut")
     split = first_start + int(available * corr_pos)
     return frame_lo, frame_hi, split, gap
+
+
+def _corruption_frame_type(
+    dataset: ByteStreamWindowDataset,
+    idx: int,
+    frame_lo: int,
+    *,
+    data: bytes | None = None,
+) -> str:
+    """Return the first VCL slice class at a window-relative frame boundary."""
+    sample = dataset.samples[idx]
+    nals = dataset.nal_index[str(sample.h264_path)]
+    if data is None:
+        data = sample.h264_path.read_bytes()
+    cursor = 0
+    for nal in nals[sample.start_nal : sample.end_nal]:
+        if cursor == frame_lo and nal.nal_type in VCL_NAL_TYPES:
+            if nal.nal_type == 5:
+                return "idr"
+            nal_bytes = data[nal.start + nal.start_code_len : nal.end]
+            try:
+                rbsp, _byte_map, _epb = HS.unescape_rbsp(
+                    nal_bytes, 1, len(nal_bytes)
+                )
+                reader = HS.BitReader(rbsp)
+                reader.read_ue()  # first_mb_in_slice
+                slice_type = reader.read_ue() % 5
+            except (HS.BitReaderError, IndexError):
+                return "unknown"
+            return {
+                0: "p",
+                1: "b",
+                2: "i",
+                3: "sp",
+                4: "si",
+            }.get(slice_type, "unknown")
+        cursor += nal.end - nal.start
+    raise RuntimeError(
+        f"No VCL NAL begins at frame_lo={frame_lo} for {sample.h264_path}"
+    )
 
 
 def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
@@ -628,6 +692,17 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
             flush=True,
         )
 
+    if hole_placement == "corrupt_gen_frame":
+        # Filtering by a recorded train split preserves manifest order. Shuffle
+        # before taking NUM_CLIPS so visualizations do not cluster in the first
+        # few source videos. This remains reproducible across severity runs.
+        indices = list(indices)
+        random.Random(int(args.seed)).shuffle(indices)
+        print(
+            f"corrupt_gen_frame window order shuffled with seed={args.seed}",
+            flush=True,
+        )
+
     requested_hole_set = getattr(args, "hole_set", "auto")
     if hole_placement == "corrupt_gen_frame":
         if requested_hole_set not in ("auto", "sampled"):
@@ -662,6 +737,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                 corr_pos=float(getattr(args, "corr_pos", 0.4)),
                 eligibility_bytes=corr_eligibility_bytes,
                 seed=int(args.seed),
+                frame_type=str(getattr(args, "corr_frame_type", "any")),
             )
             if hole is not None:
                 requests.append((idx, hole, None))
@@ -801,6 +877,11 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                 hole_id=(
                     int(meta["fim_hole_id"])
                     if int(meta.get("fim_hole_id", -1)) >= 0
+                    else None
+                ),
+                corruption_frame_type=(
+                    _corruption_frame_type(dataset, idx, int(meta["frame_lo"]))
+                    if hole_placement == "corrupt_gen_frame"
                     else None
                 ),
             )
@@ -1385,68 +1466,85 @@ def save_fim_videos(
     )
     for sample_id, item in viz.items():
         out_path = frame_dir / f"sample_{sample_id:04d}_{stop_mode}.mp4"
-        saved = save_comparison_video(
-            reference_frames=item["gt_full_frames"],
-            middle_frames=item["corrupted_strict_frames"],
-            second_middle_frames=item["corrupted_concealed_frames"],
-            result_frames=item["repaired_full_frames"],
-            out_path=out_path,
-            ffmpeg_binary=args.ffmpeg_binary,
-            fps=args.viz_fps,
-            timeout_sec=args.timeout_sec,
-            columns=(
-                "clean GT (strict)",
-                "corrupted input (strict)",
-                "corrupted input (concealed)",
-                "repaired output (strict)",
-            ),
-            border_changes_at=item["target_frame"],
-            thumbnail_frame=item["target_frame"],
-            metadata={
-                "checkpoint": checkpoint_name,
-                "sample_id": sample_id,
-                "stop_mode": stop_mode,
-                "target_frame": item["target_frame"],
-                "gt_full_strict_decode_status": item[
-                    "gt_full_strict_decode_status"
-                ],
-                "gt_full_ffmpeg_decode": item["gt_full_ffmpeg_decode"],
-                "corrupted_strict_decode_status": item["corrupted_strict_status"],
-                "corrupted_strict_ffmpeg_decode": item[
-                    "corrupted_strict_decode"
-                ],
-                "corrupted_concealed_decode_status": item[
-                    "corrupted_concealed_status"
-                ],
-                "corrupted_concealed_ffmpeg_decode": item[
-                    "corrupted_concealed_decode"
-                ],
-                "repaired_full_strict_decode_status": item[
-                    "repaired_full_strict_status"
-                ],
-                "repaired_full_ffmpeg_decode": item[
-                    "repaired_full_strict_decode"
-                ],
-                "panel_frame_counts": {
-                    "clean_gt_strict": len(item["gt_full_frames"]),
-                    "corrupted_strict": len(item["corrupted_strict_frames"]),
-                    "corrupted_concealed": len(
-                        item["corrupted_concealed_frames"]
-                    ),
-                    "repaired_strict": len(item["repaired_full_frames"]),
-                },
-                "panel_stream_bytes": item["panel_stream_bytes"],
-                "visualization_stream_scope": "full sampled window",
-                "corrupted_concealed_is_metric": True,
-                "corrupted_concealed_psnr": item.get(
-                    "corrupted_concealed_psnr"
-                ),
-                "repaired_psnr": item.get("repaired_psnr"),
-                "repair_psnr_lift_db": item.get("repair_psnr_lift_db"),
-                "strict_valid": item["strict_valid"],
-                "h264_path": item["h264_path"],
-            },
+        columns = (
+            "clean GT (strict)",
+            "corrupted input (strict)",
+            "corrupted input (concealed)",
+            "repaired output (strict)",
         )
+        metadata = {
+            "checkpoint": checkpoint_name,
+            "sample_id": sample_id,
+            "stop_mode": stop_mode,
+            "target_frame": item["target_frame"],
+            "corruption_frame_type": item.get("corruption_frame_type"),
+            "gt_full_strict_decode_status": item["gt_full_strict_decode_status"],
+            "gt_full_ffmpeg_decode": item["gt_full_ffmpeg_decode"],
+            "corrupted_strict_decode_status": item["corrupted_strict_status"],
+            "corrupted_strict_ffmpeg_decode": item["corrupted_strict_decode"],
+            "corrupted_concealed_decode_status": item[
+                "corrupted_concealed_status"
+            ],
+            "corrupted_concealed_ffmpeg_decode": item[
+                "corrupted_concealed_decode"
+            ],
+            "repaired_full_strict_decode_status": item[
+                "repaired_full_strict_status"
+            ],
+            "repaired_full_ffmpeg_decode": item["repaired_full_strict_decode"],
+            "panel_frame_counts": {
+                "clean_gt_strict": len(item["gt_full_frames"]),
+                "corrupted_strict": len(item["corrupted_strict_frames"]),
+                "corrupted_concealed": len(item["corrupted_concealed_frames"]),
+                "repaired_strict": len(item["repaired_full_frames"]),
+            },
+            "panel_stream_bytes": item["panel_stream_bytes"],
+            "visualization_stream_scope": "full sampled window",
+            "corrupted_concealed_is_metric": True,
+            "corrupted_concealed_psnr": item.get("corrupted_concealed_psnr"),
+            "repaired_psnr": item.get("repaired_psnr"),
+            "repair_psnr_lift_db": item.get("repair_psnr_lift_db"),
+            "strict_valid": item["strict_valid"],
+            "h264_path": item["h264_path"],
+        }
+        if args.hole_placement == "corrupt_gen_frame":
+            reference = item["gt_full_frames"][0]
+            saved = save_stream_comparison_video(
+                clean_stream=item["clean_full_stream"],
+                corrupted_stream=item["corrupted_full_stream"],
+                repaired_stream=item["repaired_full_stream"],
+                strict_corrupted_frame_count=len(item["corrupted_strict_frames"]),
+                concealed_corrupted_frame_count=len(
+                    item["corrupted_concealed_frames"]
+                ),
+                repaired_frame_count=len(item["repaired_full_frames"]),
+                reference_frame_count=len(item["gt_full_frames"]),
+                frame_height=int(reference.shape[0]),
+                frame_width=int(reference.shape[1]),
+                target_frame=item["target_frame"],
+                out_path=out_path,
+                ffmpeg_binary=args.ffmpeg_binary,
+                ffprobe_binary=args.ffprobe_binary,
+                fps=args.viz_fps,
+                timeout_sec=args.timeout_sec,
+                columns=columns,
+                metadata=metadata,
+            )
+        else:
+            saved = save_comparison_video(
+                reference_frames=item["gt_full_frames"],
+                middle_frames=item["corrupted_strict_frames"],
+                second_middle_frames=item["corrupted_concealed_frames"],
+                result_frames=item["repaired_full_frames"],
+                out_path=out_path,
+                ffmpeg_binary=args.ffmpeg_binary,
+                fps=args.viz_fps,
+                timeout_sec=args.timeout_sec,
+                columns=columns,
+                border_changes_at=item["target_frame"],
+                thumbnail_frame=item["target_frame"],
+                metadata=metadata,
+            )
         if not saved:
             print(f"  FIM video failed for sample {sample_id}", flush=True)
 
@@ -1760,6 +1858,53 @@ def summarize(
             else None
         ),
     }
+    frame_type_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in details:
+        frame_type = row.get("corruption_frame_type")
+        if frame_type:
+            frame_type_groups.setdefault(str(frame_type), []).append(row)
+    out["corruption_by_frame_type"] = {
+        frame_type: {
+            "count": len(group),
+            "termination_success_rate": AR.mean(
+                [
+                    1.0
+                    if _termination_succeeded(
+                        stop_mode, str(row.get("stop_reason") or "none")
+                    )
+                    else 0.0
+                    for row in group
+                ]
+            ),
+            "repair_decode_success_rate": (
+                AR.mean([1.0 if row.get("strict_valid") else 0.0 for row in group])
+                if decode_enabled
+                else None
+            ),
+            "corrupted_concealed_psnr_mean": AR.mean(
+                [
+                    float(row["corrupted_concealed_psnr"])
+                    for row in group
+                    if row.get("corrupted_concealed_psnr") is not None
+                ]
+            ),
+            "repaired_psnr_mean": AR.mean(
+                [
+                    float(row["cont_psnr_mean"])
+                    for row in group
+                    if row.get("cont_psnr_mean") is not None
+                ]
+            ),
+            "repair_psnr_lift_db_mean": AR.mean(
+                [
+                    float(row["repair_psnr_lift_db"])
+                    for row in group
+                    if row.get("repair_psnr_lift_db") is not None
+                ]
+            ),
+        }
+        for frame_type, group in sorted(frame_type_groups.items())
+    }
     out.update(AR.distribution_metrics(real_app, gen_app, real_mot, gen_mot))
     return out
 
@@ -1820,6 +1965,7 @@ def main() -> None:
             "hole_id": s.hole_id,
             "target_length": s.target_length,
             "hole_placement": args.hole_placement,
+            "corruption_frame_type": s.corruption_frame_type,
             "requested_corr_pos": (
                 args.corr_pos
                 if args.hole_placement == "corrupt_gen_frame"
@@ -2012,6 +2158,7 @@ def main() -> None:
                     "gt_parse": gt_parse,
                     "model_parse": model_parse,
                     "hole_placement": args.hole_placement,
+                    "corruption_frame_type": sample.corruption_frame_type,
                     "requested_corr_pos": (
                         args.corr_pos
                         if args.hole_placement == "corrupt_gen_frame"
@@ -2223,6 +2370,14 @@ def main() -> None:
                                     sample.repaired_full_stream(result.data)
                                 ),
                             },
+                            "clean_full_stream": sample.window_bytes,
+                            "corrupted_full_stream": sample.corrupted_full_stream,
+                            "repaired_full_stream": sample.repaired_full_stream(
+                                result.data
+                            ),
+                            "corruption_frame_type": (
+                                sample.corruption_frame_type
+                            ),
                             "strict_valid": strict_valid,
                             "h264_path": str(sample.h264_path),
                             "corrupted_concealed_psnr": row.get(
@@ -2256,6 +2411,7 @@ def main() -> None:
                 "stop_mode": stop_mode,
                 "slice_layout": args.slice_layout,
                 "hole_placement": args.hole_placement,
+                "corr_frame_type": args.corr_frame_type,
                 "corr_len_bytes": args.corr_len_bytes,
                 "corr_pos": (
                     args.corr_pos

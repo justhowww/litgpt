@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.byte.eval.eval_fim_avclm import (
+    _corruption_frame_type,
     _corrupt_gen_frame_hole_spec,
     _load_train_split,
     _verify_fixed_hole_replay,
@@ -123,6 +124,28 @@ def test_corrupt_gen_frame_hole_is_exact_positioned_and_reproducible(tmp_path):
     assert second == first
 
 
+def test_corruption_frame_type_reads_idr_and_p_slice_type(tmp_path):
+    path = tmp_path / "clip.h264"
+    # first_mb_in_slice=0 and slice_type=P(0) are each encoded as ue(v) bit 1.
+    path.write_bytes(b"\x00\x00\x01\x65\xc0\x00\x00\x01\x41\xc0")
+    dataset = SimpleNamespace(
+        samples=[SimpleNamespace(h264_path=path, start_nal=0, end_nal=2)],
+        nal_index={
+            str(path): [
+                SimpleNamespace(
+                    start=0, end=5, start_code_len=3, nal_type=5
+                ),
+                SimpleNamespace(
+                    start=5, end=10, start_code_len=3, nal_type=1
+                ),
+            ]
+        },
+    )
+
+    assert _corruption_frame_type(dataset, 0, 0) == "idr"
+    assert _corruption_frame_type(dataset, 0, 5) == "p"
+
+
 def test_summary_reports_corruption_baseline_and_repair_lift():
     summary = summarize(
         [
@@ -140,6 +163,7 @@ def test_summary_reports_corruption_baseline_and_repair_lift():
                 "repair_ssim_lift": 0.2,
                 "corrupted_concealed_target_frame_available": True,
                 "corrupted_concealed_decode_status": "decoded",
+                "corruption_frame_type": "p",
             }
         ],
         stop_mode="learned_eos",
@@ -148,4 +172,11 @@ def test_summary_reports_corruption_baseline_and_repair_lift():
     assert summary["corrupted_concealed_psnr_mean"] == 20.0
     assert summary["repaired_psnr_mean"] == 30.0
     assert summary["repair_psnr_lift_db_mean"] == 10.0
+    assert summary["corruption_by_frame_type"]["p"]["count"] == 1
+    assert (
+        summary["corruption_by_frame_type"]["p"][
+            "corrupted_concealed_psnr_mean"
+        ]
+        == 20.0
+    )
     assert summary["repair_quality_paired_count"] == 1
