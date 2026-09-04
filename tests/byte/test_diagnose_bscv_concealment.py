@@ -84,6 +84,32 @@ def test_original_vcl_recognizes_three_and_four_byte_start_codes():
     assert len(stream) - len(corrupted) == 50
 
 
+def test_bscv_exact_retries_from_start_of_gop_when_selected_vcl_is_too_short():
+    stream = (
+        b"\x00\x00\x01\x67" + b"S" * 10
+        + b"\x00\x00\x01\x65" + b"i" * 4
+        + b"\x00\x00\x01\x41" + b"P" * 100
+        + b"\x00\x00\x01\x67" + b"T" * 10
+        + b"\x00\x00\x01\x65" + b"I" * 100
+    )
+
+    # Seed 1 selects the short IDR in the first GOP. The released generator
+    # then scans from the start of that GOP until it finds the large P NAL.
+    corrupted, cuts = D.corrupt_bscv_exact(
+        stream,
+        corr_prob=1,
+        corr_pos=0.4,
+        corr_len_hex=40,
+        seed=1,
+    )
+
+    assert len(cuts) == 2
+    assert cuts[0].selected_index == 1
+    assert not cuts[0].fallback
+    assert cuts[0].deleted_hex_chars == 40
+    assert len(stream) - len(corrupted) == 40
+
+
 def test_short_frame_uses_original_style_fallback():
     data = b"x" * 30
     packets = [{"pos": 0, "size": len(data), "flags": "K__"}]

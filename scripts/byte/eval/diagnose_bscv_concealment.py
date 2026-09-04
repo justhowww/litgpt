@@ -13,11 +13,13 @@ Two corruption units are available:
     valid causal comparison across the three encoders.
 
 ``original-vcl``
-    Reproduces BSCV corrupt_Gen.py's VCL-NAL-as-frame assumption, including
-    fixed corr_pos and deletion length measured in hexadecimal characters.
-    Use this for one-slice/frame BSCV streams. On AVC-LM, one VCL NAL is one
-    macroblock rather than one frame, so this mode is deliberately not a fair
-    cross-encoding comparison.
+    A safer approximation of BSCV's VCL-NAL-as-frame operator.
+
+``bscv-exact``
+    Preserves corrupt_Gen.py's original GOP selection, short-NAL retry,
+    final-GOP, hexadecimal indexing, and odd-nibble behaviors. Use only to
+    reproduce the benchmark on one-slice/frame streams. On multi-slice AVC-LM
+    streams, one VCL NAL is not one frame, so this mode is not meaningful.
 """
 
 from __future__ import annotations
@@ -104,6 +106,22 @@ def _splice_hex(data: bytes, cuts: list[Cut]) -> bytes:
     if len(encoded) % 2:
         raise ValueError("BSCV cuts left an odd number of hexadecimal characters")
     return binascii.unhexlify(encoded)
+
+
+def _splice_hex_bscv_exact(data: bytes, cuts: list[Cut]) -> tuple[bytes, list[Cut]]:
+    """Apply ranges exactly like corrupt_Gen.py's remove_ranges."""
+    encoded = binascii.hexlify(data)
+    applied: list[Cut] = []
+    for cut in sorted(cuts, key=lambda item: (item.start_hex, item.end_hex), reverse=True):
+        start, end = cut.start_hex, cut.end_hex
+        candidate = encoded[:start] + encoded[end:]
+        if len(candidate) % 2:
+            start += 1
+            end += 1
+            candidate = encoded[:start] + encoded[end:]
+        encoded = candidate
+        applied.append(replace(cut, start_hex=start, end_hex=end))
+    return binascii.unhexlify(encoded), sorted(applied, key=lambda item: (item.start_hex, item.end_hex))
 
 
 def _choose_per_gop(items: list[int], count: int, seed: int, gop_index: int) -> list[int]:
@@ -207,6 +225,94 @@ def corrupt_original_vcl(
                 )
             )
     return _splice_hex(data, cuts), cuts
+
+
+def corrupt_bscv_exact(
+    data: bytes, *, corr_prob: int, corr_pos: float, corr_len_hex: int, seed: int
+) -> tuple[bytes, list[Cut]]:
+    """Port corrupt_Gen.py literally, with a seeded RNG for reproducibility."""
+    encoded = binascii.hexlify(data)
+    starts = sorted(_find_all(encoded, b"000001"))
+    headers = sorted(_find_all(encoded, b"00000167"))
+    idr = sorted(_find_all(encoded, b"00000165"))
+    frames = sorted(
+        idr
+        + _find_all(encoded, b"00000141")
+        + _find_all(encoded, b"00000101")
+    )
+    if not starts or not headers or not idr or not frames:
+        return data, []
+
+    # Preserve the original script's special-case removal verbatim.
+    working_idr = list(idr)
+    if len(working_idr) > 2 and working_idr[-2] > max(headers):
+        working_idr = working_idr[:-1]
+    if not working_idr:
+        return data, []
+
+    rng = random.Random(seed)
+    cuts: list[Cut] = []
+    for gop_index, gop_start in enumerate(working_idr):
+        if gop_start < max(working_idr):
+            next_header = min(index for index in headers if index > gop_start)
+            last_frame = max(index for index in frames if index < next_header)
+            candidates = frames[frames.index(gop_start) : frames.index(last_frame) + 1]
+            selected = rng.sample(candidates, min(len(candidates), corr_prob))
+            for initially_selected in selected:
+                x = initially_selected
+                y = min(index for index in starts if index > x)
+                j = 0
+                while True:
+                    if y - x > corr_len_hex:
+                        available = int(y - x - 7 - corr_len_hex)
+                        start = int(x + 7 + available * corr_pos)
+                        cuts.append(
+                            Cut(
+                                gop_index,
+                                frames.index(x),
+                                start,
+                                start + corr_len_hex,
+                                False,
+                                (y - x) // 2,
+                            )
+                        )
+                        break
+                    if j == len(candidates):
+                        cuts.append(
+                            Cut(
+                                gop_index,
+                                frames.index(x),
+                                int(x + 9),
+                                int(y + 1),
+                                True,
+                                (y - x) // 2,
+                            )
+                        )
+                        break
+                    x = candidates[j]
+                    y = min(index for index in starts if index > x)
+                    j += 1
+        else:
+            candidates = frames[frames.index(gop_start) :]
+            selected = rng.sample(candidates, min(len(candidates), corr_prob))
+            for x in selected:
+                y = min(index for index in starts if index > x) if x < max(frames) else len(encoded)
+                # The released script performs no short-unit check in the
+                # final GOP. Negative available space is intentionally kept.
+                available = int(y - x - 7 - corr_len_hex)
+                start = int(x + 7 + available * corr_pos)
+                cuts.append(
+                    Cut(
+                        gop_index,
+                        frames.index(x),
+                        start,
+                        start + corr_len_hex,
+                        False,
+                        (y - x) // 2,
+                    )
+                )
+
+    return _splice_hex_bscv_exact(data, cuts)
 
 
 def _probe_packets(path: Path, ffprobe: str) -> list[dict[str, Any]]:
@@ -788,11 +894,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "delete this fraction of each selected frame access unit (for example 0.01 for 1%); "
+            "delete this fraction of each selected frame access unit (for example 0.01 for 1%%); "
             "when set, overrides --corr-len-hex in frame mode"
         ),
     )
-    parser.add_argument("--corruption-unit", choices=("frame", "original-vcl"), default="frame")
+    parser.add_argument(
+        "--corruption-unit",
+        choices=("frame", "original-vcl", "bscv-exact"),
+        default="frame",
+    )
     parser.add_argument("--display-fps", type=int, default=6)
     parser.add_argument("--panel-width", type=int, default=640)
     parser.add_argument("--panel-height", type=int, default=360)
@@ -948,7 +1058,15 @@ def main() -> None:
             packets: list[dict[str, Any]] = item["packets"]
             selected_display_frames: list[int] = []
             display_positions: list[int | None] = item["display_positions"]
-            if args.corruption_unit == "original-vcl":
+            if args.corruption_unit == "bscv-exact":
+                corrupted_bytes, cuts = corrupt_bscv_exact(
+                    clean_bytes,
+                    corr_prob=args.corr_prob,
+                    corr_pos=args.corr_pos,
+                    corr_len_hex=args.corr_len_hex,
+                    seed=args.seed + sample_index,
+                )
+            elif args.corruption_unit == "original-vcl":
                 corrupted_bytes, cuts = corrupt_original_vcl(
                     clean_bytes,
                     corr_prob=args.corr_prob,
