@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/byte/eval/diagnose_bscv_concealment.py"
@@ -10,6 +11,7 @@ def _load_module():
     spec = importlib.util.spec_from_file_location("diagnose_bscv_concealment", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -75,3 +77,25 @@ def test_short_frame_uses_original_style_fallback():
     assert len(cuts) == 1
     assert cuts[0].fallback
     assert 0 < len(corrupted) < len(data)
+
+
+def test_factorial_changes_only_cabac_and_slice_count():
+    configs = D._factorial_configs(duration=5.0, slices=16)
+
+    assert set(configs) == {
+        "cavlc_01slice",
+        "cavlc_16slice",
+        "cabac_01slice",
+        "cabac_16slice",
+    }
+    reference = configs["cavlc_01slice"][0]
+    for name, (config, _) in configs.items():
+        assert config.width == reference.width
+        assert config.height == reference.height
+        assert config.fps == reference.fps
+        assert config.qp == reference.qp
+        assert config.gop == reference.gop
+        assert config.ffmpeg.disable_bframes == reference.ffmpeg.disable_bframes
+        assert config.ffmpeg.refs == reference.ffmpeg.refs
+        assert config.ffmpeg.x264_params["cabac"] == int(name.startswith("cabac"))
+        assert config.ffmpeg.x264_params["slices"] == (16 if "16slice" in name else 1)

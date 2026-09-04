@@ -26,6 +26,7 @@ import argparse
 import binascii
 import json
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -190,6 +191,52 @@ def _probe_packets(path: Path, ffprobe: str) -> list[dict[str, Any]]:
     ]
 
 
+def _probe_fps(path: Path, ffprobe: str) -> float:
+    result = _run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    stream = json.loads(result.stdout).get("streams", [{}])[0]
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        value = stream.get(key, "0/0")
+        numerator, denominator = value.split("/", 1)
+        if float(denominator) and float(numerator):
+            return float(numerator) / float(denominator)
+    raise ValueError(f"could not determine frame rate for {path}")
+
+
+def _probe_display_packet_positions(path: Path, ffprobe: str) -> list[int | None]:
+    result = _run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=pkt_pos",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    return [
+        int(frame["pkt_pos"]) if frame.get("pkt_pos") not in (None, "N/A") else None
+        for frame in json.loads(result.stdout).get("frames", [])
+    ]
+
+
 def corrupt_frames(
     data: bytes,
     packets: list[dict[str, Any]],
@@ -255,7 +302,7 @@ def _decode_default(
         "-preset",
         "veryfast",
         "-crf",
-        "18",
+        "0",
         "-pix_fmt",
         "yuv420p",
         str(output),
@@ -305,6 +352,8 @@ def _make_grid(
     height: int,
     duration: float,
 ) -> None:
+    if len(inputs) % 2:
+        raise ValueError("comparison grid requires clean/corrupted input pairs")
     filter_list = subprocess.run(
         [ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True
     )
@@ -327,8 +376,12 @@ def _make_grid(
             )
         filters.append(f"[{index}:v]{operations}[v{index}]")
         labels.append(f"[v{index}]")
-    layout = f"0_0|{width}_0|0_{height}|{width}_{height}|0_{2 * height}|{width}_{2 * height}"
-    filters.append("".join(labels) + f"xstack=inputs=6:layout={layout}:fill=black[out]")
+    layout = "|".join(
+        f"{column * width}_{row * height}"
+        for row in range(len(inputs) // 2)
+        for column in range(2)
+    )
+    filters.append("".join(labels) + f"xstack=inputs={len(inputs)}:layout={layout}:fill=black[out]")
     cmd += [
         "-filter_complex",
         ";".join(filters),
@@ -349,6 +402,182 @@ def _make_grid(
         str(output),
     ]
     _run(cmd)
+
+
+def _make_native_triptych(
+    clean: Path,
+    corrupted: Path,
+    output: Path,
+    *,
+    ffmpeg: str,
+    fps: float,
+    width: int,
+    height: int,
+    duration: float,
+    affected_ranges: list[tuple[int, int]],
+) -> None:
+    filter_list = subprocess.run(
+        [ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True
+    )
+    has_drawtext = " drawtext " in filter_list.stdout
+    frame_expression = "+".join(
+        f"between(n\\,{first}\\,{last})" for first, last in affected_ranges
+    )
+    border = (
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=red:t=8:enable='{frame_expression}'"
+        if frame_expression
+        else "null"
+    )
+    clean_label = (
+        ",drawtext=text='clean':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.65:x=12:y=12"
+        if has_drawtext
+        else ""
+    )
+    corrupt_label = (
+        ",drawtext=text='corrupted default concealment':fontcolor=white:fontsize=24:"
+        "box=1:boxcolor=black@0.65:x=12:y=12"
+        if has_drawtext
+        else ""
+    )
+    diff_label = (
+        ",drawtext=text='grayscale absolute difference x4':fontcolor=white:fontsize=24:"
+        "box=1:boxcolor=black@0.65:x=12:y=12"
+        if has_drawtext
+        else ""
+    )
+    filters = (
+        f"[0:v]tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},"
+        f"setpts=PTS-STARTPTS,split=2[c][cd];"
+        f"[1:v]tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},"
+        f"setpts=PTS-STARTPTS,split=2[x][xd];"
+        f"[c]{border}{clean_label}[co];"
+        f"[x]{border}{corrupt_label}[xo];"
+        f"[cd][xd]blend=all_mode=difference,format=gray,lutyuv=y=val*4,format=yuv420p{diff_label}[d];"
+        "[co][xo][d]hstack=inputs=3[out]"
+    )
+    _run(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-i",
+            str(clean),
+            "-i",
+            str(corrupted),
+            "-filter_complex",
+            filters,
+            "-map",
+            "[out]",
+            "-r",
+            str(fps),
+            "-t",
+            str(duration),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(output),
+        ]
+    )
+
+
+_PSNR_PATTERN = re.compile(r"n:(?P<n>\d+).*?psnr_avg:(?P<psnr>[-+a-zA-Z0-9.]+)")
+
+
+def _measure_psnr(
+    clean: Path,
+    corrupted: Path,
+    stats_path: Path,
+    *,
+    ffmpeg: str,
+    cut_frames: set[int],
+    follow_frames: int,
+) -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(clean),
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(corrupted),
+            "-lavfi",
+            f"[0:v][1:v]psnr=stats_file={stats_path}",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    rows: list[dict[str, Any]] = []
+    if stats_path.exists():
+        for line in stats_path.read_text().splitlines():
+            match = _PSNR_PATTERN.search(line)
+            if not match:
+                continue
+            frame_index = int(match.group("n")) - 1
+            value = match.group("psnr")
+            infinite = value.lower() == "inf"
+            psnr = None if infinite else float(value)
+            rows.append(
+                {
+                    "frame_index": frame_index,
+                    "psnr_db": psnr,
+                    "psnr_is_infinite": infinite,
+                    "is_corrupted_frame": frame_index in cut_frames,
+                    "within_following_window": any(
+                        cut <= frame_index <= cut + follow_frames for cut in cut_frames
+                    ),
+                }
+            )
+    finite = [row["psnr_db"] for row in rows if row["psnr_db"] is not None]
+    payload = {
+        "ok": result.returncode == 0 and bool(rows),
+        "paired_frames": len(rows),
+        "finite_psnr_frames": len(finite),
+        "mean_finite_psnr_db": sum(finite) / len(finite) if finite else None,
+        "minimum_psnr_db": min(finite) if finite else None,
+        "frames": rows,
+        "stderr_tail": result.stderr[-4000:],
+    }
+    stats_path.with_suffix(".json").write_text(json.dumps(payload, indent=2) + "\n")
+    return payload
+
+
+def _factorial_configs(duration: float, slices: int) -> dict[str, tuple[Any, str]]:
+    base = replace(load_config(CONFIGS["project"]), clip_duration_sec=duration)
+    out: dict[str, tuple[Any, str]] = {}
+    for cabac in (False, True):
+        for slice_count in (1, slices):
+            params = dict(base.ffmpeg.x264_params)
+            params.pop("slice-max-mbs", None)
+            params["cabac"] = int(cabac)
+            params["slices"] = slice_count
+            ffmpeg_config = replace(
+                base.ffmpeg,
+                profile="high" if cabac else "baseline",
+                x264_params=params,
+            )
+            name = f"{'cabac' if cabac else 'cavlc'}_{slice_count:02d}slice"
+            out[name] = (
+                replace(base, ffmpeg=ffmpeg_config),
+                f"controlled factorial: cabac={int(cabac)}, slices/frame={slice_count}",
+            )
+    return out
 
 
 def _sample_sources(input_dir: Path, count: int, seed: int) -> list[Path]:
@@ -379,6 +608,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-fps", type=int, default=6)
     parser.add_argument("--panel-width", type=int, default=640)
     parser.add_argument("--panel-height", type=int, default=360)
+    parser.add_argument(
+        "--following-frames",
+        type=int,
+        default=16,
+        help="mark and score this many frames after every corrupted frame",
+    )
+    parser.add_argument(
+        "--factorial-slices",
+        type=int,
+        default=16,
+        help="frequent-slice level in the controlled CABAC/CAVLC x slice-count ablation",
+    )
+    parser.add_argument("--no-factorial", action="store_true")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -410,18 +652,27 @@ def main() -> None:
     for sample_index, source in enumerate(sources):
         sample_dir = args.out_dir / f"sample_{sample_index:03d}_{source.stem}"
         sample_report: dict[str, Any] = {"source": str(source), "settings": {}}
-        grid_inputs: list[tuple[Path, str]] = []
+        real_settings = {
+            name: (replace(load_config(path), clip_duration_sec=args.duration), str(path))
+            for name, path in CONFIGS.items()
+        }
+        factorial_settings = (
+            {} if args.no_factorial else _factorial_configs(args.duration, args.factorial_slices)
+        )
+        settings = {**real_settings, **factorial_settings}
+        real_grid_inputs: list[tuple[Path, str]] = []
+        factorial_grid_inputs: list[tuple[Path, str]] = []
 
-        for setting, config_path in CONFIGS.items():
+        for setting, (config, config_description) in settings.items():
             setting_dir = sample_dir / setting
             clean = setting_dir / "clean.h264"
             corrupted = setting_dir / "corrupted.h264"
             setting_dir.mkdir(parents=True, exist_ok=True)
 
-            config = replace(load_config(config_path), clip_duration_sec=args.duration)
             if args.force or not clean.exists():
                 encode_video(source, clean, config)
             clean_bytes = clean.read_bytes()
+            packets: list[dict[str, Any]] = []
             if args.corruption_unit == "original-vcl":
                 corrupted_bytes, cuts = corrupt_original_vcl(
                     clean_bytes,
@@ -441,6 +692,81 @@ def main() -> None:
                     seed=args.seed + sample_index,
                 )
             corrupted.write_bytes(corrupted_bytes)
+
+            display_positions = _probe_display_packet_positions(clean, config.ffmpeg.ffprobe_binary)
+            position_to_display = {
+                position: index for index, position in enumerate(display_positions) if position is not None
+            }
+            if packets:
+                cut_packet_positions = [
+                    packets[cut.selected_index]["pos"]
+                    for cut in cuts
+                    if 0 <= cut.selected_index < len(packets)
+                ]
+                cut_frames = {
+                    position_to_display[position]
+                    for position in cut_packet_positions
+                    if position in position_to_display
+                }
+            else:
+                cut_packet_positions = []
+                cut_frames = set()
+            affected_ranges = sorted(
+                (frame, frame + args.following_frames) for frame in cut_frames
+            )
+
+            native_fps = float(config.fps) if config.fps is not None else _probe_fps(
+                clean, config.ffmpeg.ffprobe_binary
+            )
+            clean_native_mp4 = setting_dir / "clean_native_default_decode.mp4"
+            corrupt_native_mp4 = setting_dir / "corrupted_native_default_decode.mp4"
+            clean_native_decode = _decode_default(
+                clean,
+                clean_native_mp4,
+                ffmpeg=config.ffmpeg.binary,
+                fps=max(1, round(native_fps)),
+                width=args.panel_width,
+                height=args.panel_height,
+                duration=args.duration,
+            )
+            corrupt_native_decode = _decode_default(
+                corrupted,
+                corrupt_native_mp4,
+                ffmpeg=config.ffmpeg.binary,
+                fps=max(1, round(native_fps)),
+                width=args.panel_width,
+                height=args.panel_height,
+                duration=args.duration,
+            )
+            if not corrupt_native_decode["ok"]:
+                _placeholder(
+                    corrupt_native_mp4,
+                    ffmpeg=config.ffmpeg.binary,
+                    fps=max(1, round(native_fps)),
+                    width=args.panel_width,
+                    height=args.panel_height,
+                    duration=args.duration,
+                )
+            native_triptych = setting_dir / "native_clean_corrupted_difference.mp4"
+            _make_native_triptych(
+                clean_native_mp4,
+                corrupt_native_mp4,
+                native_triptych,
+                ffmpeg=config.ffmpeg.binary,
+                fps=native_fps,
+                width=args.panel_width,
+                height=args.panel_height,
+                duration=args.duration,
+                affected_ranges=affected_ranges,
+            )
+            psnr = _measure_psnr(
+                clean,
+                corrupted,
+                setting_dir / "per_frame_psnr.log",
+                ffmpeg=config.ffmpeg.binary,
+                cut_frames=cut_frames,
+                follow_frames=args.following_frames,
+            )
 
             clean_mp4 = setting_dir / "clean_default_decode.mp4"
             corrupt_mp4 = setting_dir / "corrupted_default_decode.mp4"
@@ -464,9 +790,10 @@ def main() -> None:
             )
             if not clean_decode["ok"]:
                 raise RuntimeError(f"clean decode failed for {clean}: {clean_decode['stderr_tail']}")
-            if clean_decode["warnings"]:
+            clean_warnings = sorted(set(clean_decode["warnings"] + clean_native_decode["warnings"]))
+            if clean_warnings:
                 print(
-                    f"WARNING: {setting} clean decode reported {clean_decode['warnings']}; "
+                    f"WARNING: {setting} clean decode reported {clean_warnings}; "
                     "inspect clean_default_decode.mp4 before interpreting corruption",
                     file=sys.stderr,
                 )
@@ -482,19 +809,32 @@ def main() -> None:
 
             actual_deleted_hex = sum(cut.deleted_hex_chars for cut in cuts)
             sample_report["settings"][setting] = {
-                "config": str(config_path),
+                "config": config_description,
+                "resolved_config": asdict(config),
                 "clean_bytes": len(clean_bytes),
                 "corrupted_bytes": len(corrupted_bytes),
                 "actual_deleted_bytes": (len(clean_bytes) - len(corrupted_bytes)),
                 "actual_deleted_hex_chars_from_records": actual_deleted_hex,
                 "cuts": [asdict(cut) for cut in cuts],
+                "cut_packet_positions": cut_packet_positions,
+                "cut_display_frame_indices": sorted(cut_frames),
+                "affected_display_frame_ranges": affected_ranges,
+                "native_fps": native_fps,
                 "clean_decode": clean_decode,
                 "corrupted_decode": corrupt_decode,
+                "clean_native_decode": clean_native_decode,
+                "corrupted_native_decode": corrupt_native_decode,
+                "native_triptych": str(native_triptych),
+                "psnr": psnr,
             }
             (setting_dir / "corruption.json").write_text(
                 json.dumps(sample_report["settings"][setting], indent=2) + "\n"
             )
-            grid_inputs += [(clean_mp4, f"{setting} clean"), (corrupt_mp4, f"{setting} corrupted default concealment")]
+            pair = [(clean_mp4, f"{setting} clean"), (corrupt_mp4, f"{setting} corrupted default concealment")]
+            if setting in real_settings:
+                real_grid_inputs += pair
+            else:
+                factorial_grid_inputs += pair
 
         comparison = sample_dir / "comparison.mp4"
         (sample_dir / "layout.txt").write_text(
@@ -503,7 +843,7 @@ def main() -> None:
             "bscv clean    | bscv corrupted (default concealment)\n"
         )
         _make_grid(
-            grid_inputs,
+            real_grid_inputs,
             comparison,
             ffmpeg="ffmpeg",
             fps=args.display_fps,
@@ -512,6 +852,24 @@ def main() -> None:
             duration=args.duration,
         )
         sample_report["comparison"] = str(comparison)
+        if factorial_grid_inputs:
+            factorial_comparison = sample_dir / "factorial_comparison.mp4"
+            (sample_dir / "factorial_layout.txt").write_text(
+                "CAVLC, 1 slice/frame: clean | corrupted\n"
+                f"CAVLC, {args.factorial_slices} slices/frame: clean | corrupted\n"
+                "CABAC, 1 slice/frame: clean | corrupted\n"
+                f"CABAC, {args.factorial_slices} slices/frame: clean | corrupted\n"
+            )
+            _make_grid(
+                factorial_grid_inputs,
+                factorial_comparison,
+                ffmpeg="ffmpeg",
+                fps=args.display_fps,
+                width=args.panel_width,
+                height=args.panel_height,
+                duration=args.duration,
+            )
+            sample_report["factorial_comparison"] = str(factorial_comparison)
         report["samples"].append(sample_report)
         print(f"wrote {comparison}")
 
