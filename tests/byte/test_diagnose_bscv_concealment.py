@@ -147,3 +147,37 @@ def test_shared_display_schedule_is_independent_of_packet_reordering():
     )
     assert [cut.selected_index for cut in cuts] == [2, 1]
     assert len(data) - len(corrupted) == 100
+
+
+def test_common_schedule_requires_full_cut_in_every_encoding():
+    positions = [index * 2000 for index in range(32)]
+    large_packets = [
+        {"pos": position, "size": 1500, "flags": "K__" if index % 16 == 0 else "___"}
+        for index, position in enumerate(positions)
+    ]
+    schedule, report = D.common_eligible_display_schedule(
+        {
+            "a": (large_packets, positions),
+            "b": (list(reversed(large_packets)), positions),
+        },
+        gop_size=16,
+        corr_prob=1,
+        corr_len_hex=2048,
+        seed=42,
+    )
+    assert len(schedule) == 2
+    assert report["actual_bytes_per_cut"] == 1024
+
+    small_packets = [dict(packet, size=100) for packet in large_packets]
+    try:
+        D.common_eligible_display_schedule(
+            {"large": (large_packets, positions), "small": (small_packets, positions)},
+            gop_size=16,
+            corr_prob=1,
+            corr_len_hex=2048,
+            seed=42,
+        )
+    except ValueError as error:
+        assert "will not use unequal short-frame fallbacks" in str(error)
+    else:
+        raise AssertionError("expected an unequal-cut rejection")

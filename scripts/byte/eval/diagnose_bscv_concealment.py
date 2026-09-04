@@ -321,6 +321,55 @@ def corrupt_display_frames(
     return _splice_hex(data, cuts), cuts
 
 
+def common_eligible_display_schedule(
+    streams: dict[str, tuple[list[dict[str, Any]], list[int | None]]],
+    *,
+    gop_size: int,
+    corr_prob: int,
+    corr_len_hex: int,
+    seed: int,
+) -> tuple[list[int], dict[str, Any]]:
+    """Choose identical full-length cuts that fit every encoding in a group."""
+    if not streams:
+        raise ValueError("common-cut schedule requires at least one stream")
+    num_frames = min(len(display_positions) for _, display_positions in streams.values())
+    packet_maps = {
+        name: {packet["pos"]: packet for packet in packets}
+        for name, (packets, _) in streams.items()
+    }
+    selected: list[int] = []
+    eligible_by_gop: dict[int, list[int]] = {}
+    for gop_index, first in enumerate(range(0, num_frames, gop_size)):
+        last = min(first + gop_size, num_frames)
+        eligible: list[int] = []
+        for display_index in range(first, last):
+            fits_all = True
+            for name, (_, display_positions) in streams.items():
+                position = display_positions[display_index]
+                packet = packet_maps[name].get(position) if position is not None else None
+                if packet is None or 2 * packet["size"] - 7 - corr_len_hex <= 0:
+                    fits_all = False
+                    break
+            if fits_all:
+                eligible.append(display_index)
+        eligible_by_gop[gop_index] = eligible
+        if len(eligible) < corr_prob:
+            names = ", ".join(streams)
+            raise ValueError(
+                f"strict common corruption cannot select {corr_prob} frame(s) in nominal GOP "
+                f"{gop_index}: only {len(eligible)} frame(s) can hold the full "
+                f"{corr_len_hex // 2}-byte cut across [{names}]. Lower --corr-len-hex; "
+                "the diagnostic will not use unequal short-frame fallbacks."
+            )
+        selected.extend(_choose_per_gop(eligible, corr_prob, seed, gop_index))
+    return selected, {
+        "num_common_frames": num_frames,
+        "eligible_display_frames_by_nominal_gop": eligible_by_gop,
+        "selected_display_frames": selected,
+        "actual_bytes_per_cut": corr_len_hex // 2,
+    }
+
+
 def _decode_default(
     source: Path, output: Path, *, ffmpeg: str, fps: int, width: int, height: int, duration: float
 ) -> dict[str, Any]:
@@ -562,7 +611,11 @@ def _measure_psnr(
             "-i",
             str(corrupted),
             "-lavfi",
-            f"[0:v][1:v]psnr=stats_file={stats_path}",
+            (
+                "[0:v]settb=AVTB,setpts=PTS-STARTPTS[a];"
+                "[1:v]settb=AVTB,setpts=PTS-STARTPTS[b];"
+                f"[a][b]psnr=stats_file={stats_path}"
+            ),
             "-f",
             "null",
             "-",
@@ -722,6 +775,11 @@ def main() -> None:
             "nominal_deleted_bytes_per_cut": args.corr_len_hex / 2,
             "seed": args.seed,
         },
+        "comparison_scopes": {
+            "comparison.mp4": "observational only; real presets intentionally differ in resolution/fps/codec",
+            "factorial_comparison.mp4": "controlled: common source geometry/fps/GOP and identical full-length cuts",
+            "bscv_ablation_comparison.mp4": "controlled: BSCV base geometry/fps/GOP and identical full-length cuts",
+        },
         "samples": [],
     }
 
@@ -743,18 +801,83 @@ def main() -> None:
         factorial_grid_inputs: list[tuple[Path, str]] = []
         bscv_ablation_grid_inputs: list[tuple[Path, str]] = []
 
+        # Encode and probe every stream before selecting controlled cuts. This
+        # is necessary because eligibility is an intersection across variants.
+        prepared: dict[str, dict[str, Any]] = {}
         for setting, (config, config_description) in settings.items():
             setting_dir = sample_dir / setting
             clean = setting_dir / "clean.h264"
-            corrupted = setting_dir / "corrupted.h264"
             setting_dir.mkdir(parents=True, exist_ok=True)
-
             if args.force or not clean.exists():
                 encode_video(source, clean, config)
+            prepared[setting] = {
+                "config": config,
+                "config_description": config_description,
+                "setting_dir": setting_dir,
+                "clean": clean,
+                "packets": _probe_packets(clean, config.ffmpeg.ffprobe_binary),
+                "display_positions": _probe_display_packet_positions(
+                    clean, config.ffmpeg.ffprobe_binary
+                ),
+            }
+
+        controlled_schedule_by_setting: dict[str, list[int]] = {}
+        controlled_group_by_setting: dict[str, str] = {}
+        controlled_schedule_reports: dict[str, Any] = {}
+        if args.corruption_unit == "frame":
+            controlled_groups = {}
+            if factorial_settings:
+                controlled_groups["cabac_by_slice_count"] = list(factorial_settings)
+            if bscv_ablation_settings:
+                controlled_groups["bscv_feature_ablation"] = ["bscv", *bscv_ablation_settings]
+            for group_name, group_settings in controlled_groups.items():
+                geometry = {
+                    (
+                        prepared[name]["config"].width,
+                        prepared[name]["config"].height,
+                        prepared[name]["config"].resize_mode,
+                        prepared[name]["config"].fps,
+                        prepared[name]["config"].gop,
+                        prepared[name]["config"].clip_duration_sec,
+                    )
+                    for name in group_settings
+                }
+                if len(geometry) != 1:
+                    raise ValueError(
+                        f"controlled group {group_name} differs in geometry, fps, GOP, or duration"
+                    )
+                group_streams = {
+                    name: (prepared[name]["packets"], prepared[name]["display_positions"])
+                    for name in group_settings
+                }
+                gop_sizes = {prepared[name]["config"].gop for name in group_settings}
+                if len(gop_sizes) != 1:
+                    raise ValueError(f"controlled group {group_name} does not share one GOP size")
+                schedule, schedule_report = common_eligible_display_schedule(
+                    group_streams,
+                    gop_size=gop_sizes.pop(),
+                    corr_prob=args.corr_prob,
+                    corr_len_hex=args.corr_len_hex,
+                    seed=args.seed + sample_index,
+                )
+                controlled_schedule_reports[group_name] = {
+                    "settings": group_settings,
+                    **schedule_report,
+                }
+                for name in group_settings:
+                    controlled_schedule_by_setting[name] = schedule
+                    controlled_group_by_setting[name] = group_name
+        sample_report["controlled_schedules"] = controlled_schedule_reports
+
+        for setting, (config, config_description) in settings.items():
+            item = prepared[setting]
+            setting_dir = item["setting_dir"]
+            clean = item["clean"]
+            corrupted = setting_dir / "corrupted.h264"
             clean_bytes = clean.read_bytes()
-            packets: list[dict[str, Any]] = []
+            packets: list[dict[str, Any]] = item["packets"]
             selected_display_frames: list[int] = []
-            display_positions = _probe_display_packet_positions(clean, config.ffmpeg.ffprobe_binary)
+            display_positions: list[int | None] = item["display_positions"]
             if args.corruption_unit == "original-vcl":
                 corrupted_bytes, cuts = corrupt_original_vcl(
                     clean_bytes,
@@ -764,14 +887,8 @@ def main() -> None:
                     seed=args.seed + sample_index,
                 )
             else:
-                packets = _probe_packets(clean, config.ffmpeg.ffprobe_binary)
-                if setting == "bscv" or setting in bscv_ablation_settings:
-                    selected_display_frames = shared_display_frame_schedule(
-                        len(display_positions),
-                        gop_size=config.gop,
-                        corr_prob=args.corr_prob,
-                        seed=args.seed + sample_index,
-                    )
+                if setting in controlled_schedule_by_setting:
+                    selected_display_frames = controlled_schedule_by_setting[setting]
                     corrupted_bytes, cuts = corrupt_display_frames(
                         clean_bytes,
                         packets,
@@ -781,6 +898,15 @@ def main() -> None:
                         corr_len_hex=args.corr_len_hex,
                         gop_size=config.gop,
                     )
+                    if any(cut.fallback for cut in cuts):
+                        raise AssertionError(f"controlled setting {setting} unexpectedly used a short fallback")
+                    expected_deleted = len(cuts) * (args.corr_len_hex // 2)
+                    actual_deleted = len(clean_bytes) - len(corrupted_bytes)
+                    if actual_deleted != expected_deleted:
+                        raise AssertionError(
+                            f"controlled setting {setting} deleted {actual_deleted} bytes; "
+                            f"expected exactly {expected_deleted}"
+                        )
                 else:
                     corrupted_bytes, cuts = corrupt_frames(
                         clean_bytes,
@@ -917,6 +1043,7 @@ def main() -> None:
                 "cut_packet_positions": cut_packet_positions,
                 "cut_display_frame_indices": sorted(cut_frames),
                 "requested_shared_display_frame_indices": selected_display_frames,
+                "controlled_comparison_group": controlled_group_by_setting.get(setting),
                 "affected_display_frame_ranges": affected_ranges,
                 "native_fps": native_fps,
                 "clean_decode": clean_decode,
