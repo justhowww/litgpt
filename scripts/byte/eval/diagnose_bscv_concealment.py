@@ -152,10 +152,17 @@ def _make_cut(
     selected_index: int,
     target_deleted_fraction: float | None = None,
 ) -> Cut:
-    # corrupt_Gen.py uses x + 7, not x + 8. Keep this nibble-level quirk.
-    available = span_end_hex - span_start_hex - 7 - corr_len_hex
+    # Use four complete bytes for the start-code/NAL-header guard.  The original
+    # corrupt_Gen.py used +7 hexadecimal characters, which places the splice on
+    # a half-byte boundary.  The semantic frame diagnostic is intentionally
+    # byte-aligned so it can be compared directly with the FIM byte-span task.
+    header_guard_hex = 8
+    available = span_end_hex - span_start_hex - header_guard_hex - corr_len_hex
     if available > 0:
-        start = int(span_start_hex + 7 + available * corr_pos)
+        start = int(span_start_hex + header_guard_hex + available * corr_pos)
+        # ``int`` can still return an odd hexadecimal position when ``available``
+        # is odd. Round down to the preceding complete-byte boundary.
+        start -= start % 2
         return Cut(
             gop_index,
             selected_index,

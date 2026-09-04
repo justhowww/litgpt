@@ -39,6 +39,22 @@ def test_frame_corruption_uses_fixed_hex_length_and_position():
     assert cuts[0].deleted_hex_chars == 2048
     assert not cuts[0].fallback
     assert len(data) - len(corrupted) == 1024
+    assert cuts[0].start_hex % 2 == 0
+    assert cuts[0].end_hex % 2 == 0
+
+
+def test_semantic_frame_cut_is_byte_aligned_when_interpolation_is_odd():
+    cut = D._make_cut(
+        span_start_hex=0,
+        span_end_hex=5001,
+        corr_pos=0.4,
+        corr_len_hex=200,
+        gop_index=0,
+        selected_index=0,
+    )
+
+    assert cut.start_hex % 2 == 0
+    assert cut.end_hex % 2 == 0
 
 
 def test_frame_corruption_can_delete_a_payload_fraction():
