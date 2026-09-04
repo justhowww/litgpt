@@ -33,6 +33,7 @@ P = _load_module("parse_mp4_to_h264")
 _DEFAULT_CONFIG = _PREPROC_DIR / "h264_preprocess_config.json"
 _AVCLM_CONFIG = _PREPROC_DIR / "h264_preprocess_config_avclm.json"
 _BSCV_CONFIG = _PREPROC_DIR / "h264_preprocess_config_bscv.json"
+_JPEGLM_CONFIG = _PREPROC_DIR / "h264_preprocess_config_jpeglm.json"
 
 
 def _cmd(config_path: Path) -> list[str]:
@@ -109,6 +110,33 @@ def test_build_video_filter_scale_pad():
         "scale=256:144:force_original_aspect_ratio=decrease,"
         "pad=256:144:(ow-iw)/2:(oh-ih)/2,fps=3"
     )
+
+
+def test_jpeglm_config_changes_only_fps_and_slice_layout_from_avclm():
+    avclm = P.load_config(_AVCLM_CONFIG)
+    jpeglm = P.load_config(_JPEGLM_CONFIG)
+
+    assert jpeglm == dataclasses.replace(
+        avclm,
+        fps=30,
+        ffmpeg=dataclasses.replace(
+            avclm.ffmpeg,
+            x264_params={
+                **{
+                    key: value
+                    for key, value in avclm.ffmpeg.x264_params.items()
+                    if key != "slice-max-mbs"
+                },
+                "slices": 1,
+            },
+        ),
+    )
+
+    cmd = _cmd(_JPEGLM_CONFIG)
+    assert cmd[cmd.index("-vf") + 1].endswith(",fps=30")
+    x264 = cmd[cmd.index("-x264-params") + 1]
+    assert "slices=1" in x264
+    assert "slice-max-mbs" not in x264
 
 
 def test_bitstream_filter_emitted_when_set():
