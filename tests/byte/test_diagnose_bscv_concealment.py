@@ -99,3 +99,51 @@ def test_factorial_changes_only_cabac_and_slice_count():
         assert config.ffmpeg.refs == reference.ffmpeg.refs
         assert config.ffmpeg.x264_params["cabac"] == int(name.startswith("cabac"))
         assert config.ffmpeg.x264_params["slices"] == (16 if "16slice" in name else 1)
+
+
+def test_bscv_ablation_changes_only_requested_factor():
+    configs = D._bscv_ablation_configs(duration=5.0)
+    base = D.replace(D.load_config(D.CONFIGS["bscv"]), clip_duration_sec=5.0)
+
+    no_b = configs["bscv_no_bframes"][0]
+    assert no_b.ffmpeg.disable_bframes
+    assert no_b.ffmpeg.x264_params["bframes"] == 0
+    assert no_b.ffmpeg.x264_params["b-pyramid"] == 0
+    assert no_b.qp == base.qp and no_b.ffmpeg.refs == base.ffmpeg.refs
+
+    ref1 = configs["bscv_ref1"][0]
+    assert ref1.ffmpeg.refs == 1
+    assert ref1.qp == base.qp and ref1.ffmpeg.x264_params == base.ffmpeg.x264_params
+
+    qp28 = configs["bscv_qp28"][0]
+    assert qp28.qp == 28
+    assert qp28.ffmpeg == base.ffmpeg
+
+    no_scenecut = configs["bscv_no_scenecut"][0]
+    assert no_scenecut.ffmpeg.scene_cut_threshold == 0
+    assert no_scenecut.qp == base.qp and no_scenecut.ffmpeg.refs == base.ffmpeg.refs
+
+
+def test_shared_display_schedule_is_independent_of_packet_reordering():
+    selected = D.shared_display_frame_schedule(40, gop_size=16, corr_prob=1, seed=42)
+    assert len(selected) == 3
+    assert selected == D.shared_display_frame_schedule(40, gop_size=16, corr_prob=1, seed=42)
+
+    positions = [2400, 0, 1200]
+    packets = [
+        {"pos": 0, "size": 1200, "flags": "___"},
+        {"pos": 1200, "size": 1200, "flags": "___"},
+        {"pos": 2400, "size": 1200, "flags": "K__"},
+    ]
+    data = bytes(range(256)) * 20
+    corrupted, cuts = D.corrupt_display_frames(
+        data,
+        packets,
+        positions,
+        [0, 2],
+        corr_pos=0.4,
+        corr_len_hex=100,
+        gop_size=16,
+    )
+    assert [cut.selected_index for cut in cuts] == [2, 1]
+    assert len(data) - len(corrupted) == 100

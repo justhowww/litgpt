@@ -274,6 +274,53 @@ def corrupt_frames(
     return _splice_hex(data, cuts), cuts
 
 
+def shared_display_frame_schedule(
+    num_frames: int, *, gop_size: int, corr_prob: int, seed: int
+) -> list[int]:
+    """Choose a deterministic schedule independent of encoder GOP decisions."""
+    selected: list[int] = []
+    for gop_index, first in enumerate(range(0, num_frames, gop_size)):
+        last = min(first + gop_size, num_frames)
+        selected.extend(
+            _choose_per_gop(list(range(first, last)), corr_prob, seed, gop_index)
+        )
+    return selected
+
+
+def corrupt_display_frames(
+    data: bytes,
+    packets: list[dict[str, Any]],
+    display_packet_positions: list[int | None],
+    selected_display_frames: list[int],
+    *,
+    corr_pos: float,
+    corr_len_hex: int,
+    gop_size: int,
+) -> tuple[bytes, list[Cut]]:
+    """Corrupt exact display-frame indices, including with reordered B-frames."""
+    packet_index_by_position = {packet["pos"]: index for index, packet in enumerate(packets)}
+    cuts: list[Cut] = []
+    for display_index in selected_display_frames:
+        if not 0 <= display_index < len(display_packet_positions):
+            continue
+        packet_position = display_packet_positions[display_index]
+        if packet_position is None or packet_position not in packet_index_by_position:
+            continue
+        packet_index = packet_index_by_position[packet_position]
+        packet = packets[packet_index]
+        cuts.append(
+            _make_cut(
+                span_start_hex=2 * packet["pos"],
+                span_end_hex=2 * (packet["pos"] + packet["size"]),
+                corr_pos=corr_pos,
+                corr_len_hex=corr_len_hex,
+                gop_index=display_index // gop_size,
+                selected_index=packet_index,
+            )
+        )
+    return _splice_hex(data, cuts), cuts
+
+
 def _decode_default(
     source: Path, output: Path, *, ffmpeg: str, fps: int, width: int, height: int, duration: float
 ) -> dict[str, Any]:
@@ -580,6 +627,30 @@ def _factorial_configs(duration: float, slices: int) -> dict[str, tuple[Any, str
     return out
 
 
+def _bscv_ablation_configs(duration: float) -> dict[str, tuple[Any, str]]:
+    base = replace(load_config(CONFIGS["bscv"]), clip_duration_sec=duration)
+
+    no_b_params = dict(base.ffmpeg.x264_params)
+    no_b_params["bframes"] = 0
+    no_b_params["b-pyramid"] = 0
+    no_b = replace(
+        base,
+        ffmpeg=replace(base.ffmpeg, disable_bframes=True, x264_params=no_b_params),
+    )
+    ref1 = replace(base, ffmpeg=replace(base.ffmpeg, refs=1))
+    qp28 = replace(base, qp=28)
+    no_scenecut = replace(
+        base,
+        ffmpeg=replace(base.ffmpeg, scene_cut_threshold=0),
+    )
+    return {
+        "bscv_no_bframes": (no_b, "BSCV exact except B-frames disabled"),
+        "bscv_ref1": (ref1, "BSCV exact except references reduced from 3 to 1"),
+        "bscv_qp28": (qp28, "BSCV exact except QP changed from 1 to 28"),
+        "bscv_no_scenecut": (no_scenecut, "BSCV exact except scene-cut keyframes disabled"),
+    }
+
+
 def _sample_sources(input_dir: Path, count: int, seed: int) -> list[Path]:
     candidates = sorted(
         path for path in input_dir.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
@@ -621,6 +692,11 @@ def parse_args() -> argparse.Namespace:
         help="frequent-slice level in the controlled CABAC/CAVLC x slice-count ablation",
     )
     parser.add_argument("--no-factorial", action="store_true")
+    parser.add_argument(
+        "--no-bscv-ablation",
+        action="store_true",
+        help="skip the BSCV-origin B-frame/reference/QP/scene-cut ablation",
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -659,9 +735,13 @@ def main() -> None:
         factorial_settings = (
             {} if args.no_factorial else _factorial_configs(args.duration, args.factorial_slices)
         )
-        settings = {**real_settings, **factorial_settings}
+        bscv_ablation_settings = (
+            {} if args.no_bscv_ablation else _bscv_ablation_configs(args.duration)
+        )
+        settings = {**real_settings, **factorial_settings, **bscv_ablation_settings}
         real_grid_inputs: list[tuple[Path, str]] = []
         factorial_grid_inputs: list[tuple[Path, str]] = []
+        bscv_ablation_grid_inputs: list[tuple[Path, str]] = []
 
         for setting, (config, config_description) in settings.items():
             setting_dir = sample_dir / setting
@@ -673,6 +753,8 @@ def main() -> None:
                 encode_video(source, clean, config)
             clean_bytes = clean.read_bytes()
             packets: list[dict[str, Any]] = []
+            selected_display_frames: list[int] = []
+            display_positions = _probe_display_packet_positions(clean, config.ffmpeg.ffprobe_binary)
             if args.corruption_unit == "original-vcl":
                 corrupted_bytes, cuts = corrupt_original_vcl(
                     clean_bytes,
@@ -683,17 +765,33 @@ def main() -> None:
                 )
             else:
                 packets = _probe_packets(clean, config.ffmpeg.ffprobe_binary)
-                corrupted_bytes, cuts = corrupt_frames(
-                    clean_bytes,
-                    packets,
-                    corr_prob=args.corr_prob,
-                    corr_pos=args.corr_pos,
-                    corr_len_hex=args.corr_len_hex,
-                    seed=args.seed + sample_index,
-                )
+                if setting == "bscv" or setting in bscv_ablation_settings:
+                    selected_display_frames = shared_display_frame_schedule(
+                        len(display_positions),
+                        gop_size=config.gop,
+                        corr_prob=args.corr_prob,
+                        seed=args.seed + sample_index,
+                    )
+                    corrupted_bytes, cuts = corrupt_display_frames(
+                        clean_bytes,
+                        packets,
+                        display_positions,
+                        selected_display_frames,
+                        corr_pos=args.corr_pos,
+                        corr_len_hex=args.corr_len_hex,
+                        gop_size=config.gop,
+                    )
+                else:
+                    corrupted_bytes, cuts = corrupt_frames(
+                        clean_bytes,
+                        packets,
+                        corr_prob=args.corr_prob,
+                        corr_pos=args.corr_pos,
+                        corr_len_hex=args.corr_len_hex,
+                        seed=args.seed + sample_index,
+                    )
             corrupted.write_bytes(corrupted_bytes)
 
-            display_positions = _probe_display_packet_positions(clean, config.ffmpeg.ffprobe_binary)
             position_to_display = {
                 position: index for index, position in enumerate(display_positions) if position is not None
             }
@@ -818,6 +916,7 @@ def main() -> None:
                 "cuts": [asdict(cut) for cut in cuts],
                 "cut_packet_positions": cut_packet_positions,
                 "cut_display_frame_indices": sorted(cut_frames),
+                "requested_shared_display_frame_indices": selected_display_frames,
                 "affected_display_frame_ranges": affected_ranges,
                 "native_fps": native_fps,
                 "clean_decode": clean_decode,
@@ -833,8 +932,12 @@ def main() -> None:
             pair = [(clean_mp4, f"{setting} clean"), (corrupt_mp4, f"{setting} corrupted default concealment")]
             if setting in real_settings:
                 real_grid_inputs += pair
-            else:
+                if setting == "bscv" and bscv_ablation_settings:
+                    bscv_ablation_grid_inputs += pair
+            elif setting in factorial_settings:
                 factorial_grid_inputs += pair
+            else:
+                bscv_ablation_grid_inputs += pair
 
         comparison = sample_dir / "comparison.mp4"
         (sample_dir / "layout.txt").write_text(
@@ -870,6 +973,25 @@ def main() -> None:
                 duration=args.duration,
             )
             sample_report["factorial_comparison"] = str(factorial_comparison)
+        if bscv_ablation_grid_inputs:
+            bscv_ablation_comparison = sample_dir / "bscv_ablation_comparison.mp4"
+            (sample_dir / "bscv_ablation_layout.txt").write_text(
+                "BSCV exact: clean | corrupted\n"
+                "BSCV without B-frames: clean | corrupted\n"
+                "BSCV with one reference: clean | corrupted\n"
+                "BSCV at QP 28: clean | corrupted\n"
+                "BSCV without scene cuts: clean | corrupted\n"
+            )
+            _make_grid(
+                bscv_ablation_grid_inputs,
+                bscv_ablation_comparison,
+                ffmpeg="ffmpeg",
+                fps=args.display_fps,
+                width=args.panel_width,
+                height=args.panel_height,
+                duration=args.duration,
+            )
+            sample_report["bscv_ablation_comparison"] = str(bscv_ablation_comparison)
         report["samples"].append(sample_report)
         print(f"wrote {comparison}")
 
