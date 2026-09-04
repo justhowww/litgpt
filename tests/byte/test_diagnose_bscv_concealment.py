@@ -41,6 +41,29 @@ def test_frame_corruption_uses_fixed_hex_length_and_position():
     assert len(data) - len(corrupted) == 1024
 
 
+def test_frame_corruption_can_delete_a_payload_fraction():
+    data = b"x" * 1000
+    packets = [{"pos": 0, "size": 1000, "flags": "K__"}]
+
+    corrupted, cuts = D.corrupt_frames(
+        data,
+        packets,
+        corr_prob=1,
+        corr_pos=0.4,
+        corr_len_hex=2048,
+        corr_fraction=0.01,
+        seed=42,
+    )
+
+    assert len(cuts) == 1
+    assert cuts[0].frame_payload_bytes == 1000
+    assert cuts[0].deleted_bytes == 10
+    assert cuts[0].deleted_fraction == 0.01
+    assert cuts[0].target_deleted_fraction == 0.01
+    assert not cuts[0].fallback
+    assert len(data) - len(corrupted) == 10
+
+
 def test_original_vcl_recognizes_three_and_four_byte_start_codes():
     stream = (
         b"\x00\x00\x00\x01\x67" + b"sps" * 5
@@ -181,3 +204,33 @@ def test_common_schedule_requires_full_cut_in_every_encoding():
         assert "will not use unequal short-frame fallbacks" in str(error)
     else:
         raise AssertionError("expected an unequal-cut rejection")
+
+
+def test_fractional_common_schedule_uses_same_frames_not_same_bytes():
+    positions = [index * 4000 for index in range(16)]
+    packets_a = [{"pos": position, "size": 1000, "flags": "___"} for position in positions]
+    packets_b = [{"pos": position, "size": 2000, "flags": "___"} for position in positions]
+    schedule, report = D.common_eligible_display_schedule(
+        {"a": (packets_a, positions), "b": (packets_b, positions)},
+        gop_size=16,
+        corr_prob=1,
+        corr_len_hex=2048,
+        corr_fraction=0.01,
+        seed=42,
+    )
+    assert len(schedule) == 1
+    assert report["actual_bytes_per_cut"] is None
+    assert report["target_deleted_fraction"] == 0.01
+
+    data = bytes(range(256)) * 400
+    _, cuts_a = D.corrupt_display_frames(
+        data, packets_a, positions, schedule,
+        corr_pos=0.4, corr_len_hex=2048, corr_fraction=0.01, gop_size=16,
+    )
+    _, cuts_b = D.corrupt_display_frames(
+        data, packets_b, positions, schedule,
+        corr_pos=0.4, corr_len_hex=2048, corr_fraction=0.01, gop_size=16,
+    )
+    assert cuts_a[0].deleted_bytes == 10
+    assert cuts_b[0].deleted_bytes == 20
+    assert cuts_a[0].deleted_fraction == cuts_b[0].deleted_fraction == 0.01

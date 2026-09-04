@@ -55,10 +55,22 @@ class Cut:
     start_hex: int
     end_hex: int
     fallback: bool
+    frame_payload_bytes: int | None = None
+    target_deleted_fraction: float | None = None
 
     @property
     def deleted_hex_chars(self) -> int:
         return self.end_hex - self.start_hex
+
+    @property
+    def deleted_bytes(self) -> float:
+        return self.deleted_hex_chars / 2
+
+    @property
+    def deleted_fraction(self) -> float | None:
+        if not self.frame_payload_bytes:
+            return None
+        return self.deleted_bytes / self.frame_payload_bytes
 
 
 def _run(cmd: list[str], *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -107,12 +119,21 @@ def _make_cut(
     corr_len_hex: int,
     gop_index: int,
     selected_index: int,
+    target_deleted_fraction: float | None = None,
 ) -> Cut:
     # corrupt_Gen.py uses x + 7, not x + 8. Keep this nibble-level quirk.
     available = span_end_hex - span_start_hex - 7 - corr_len_hex
     if available > 0:
         start = int(span_start_hex + 7 + available * corr_pos)
-        return Cut(gop_index, selected_index, start, start + corr_len_hex, False)
+        return Cut(
+            gop_index,
+            selected_index,
+            start,
+            start + corr_len_hex,
+            False,
+            (span_end_hex - span_start_hex) // 2,
+            target_deleted_fraction,
+        )
 
     # Its short-fragment fallback preserves roughly the start code/header and
     # removes the remainder. Keep endpoints equal-parity so unhexlify remains
@@ -124,7 +145,28 @@ def _make_cut(
     # equivalent to advancing the odd start by one nibble.
     if (end - start) % 2:
         start = min(start + 1, end)
-    return Cut(gop_index, selected_index, start, end, True)
+    return Cut(
+        gop_index,
+        selected_index,
+        start,
+        end,
+        True,
+        (span_end_hex - span_start_hex) // 2,
+        target_deleted_fraction,
+    )
+
+
+def _cut_length_hex(frame_payload_bytes: int, corr_len_hex: int, corr_fraction: float | None) -> int:
+    if corr_fraction is None:
+        return corr_len_hex
+    return 2 * max(1, round(frame_payload_bytes * corr_fraction))
+
+
+def _cut_report(cut: Cut) -> dict[str, Any]:
+    report = asdict(cut)
+    report["deleted_bytes"] = cut.deleted_bytes
+    report["actual_deleted_fraction"] = cut.deleted_fraction
+    return report
 
 
 def corrupt_original_vcl(
@@ -245,6 +287,7 @@ def corrupt_frames(
     corr_pos: float,
     corr_len_hex: int,
     seed: int,
+    corr_fraction: float | None = None,
 ) -> tuple[bytes, list[Cut]]:
     """Apply BSCV excision to semantic frame access units."""
     if not packets:
@@ -261,14 +304,16 @@ def corrupt_frames(
             packet = packets[packet_index]
             start_hex = 2 * packet["pos"]
             end_hex = 2 * (packet["pos"] + packet["size"])
+            cut_len_hex = _cut_length_hex(packet["size"], corr_len_hex, corr_fraction)
             cuts.append(
                 _make_cut(
                     span_start_hex=start_hex,
                     span_end_hex=end_hex,
                     corr_pos=corr_pos,
-                    corr_len_hex=corr_len_hex,
+                    corr_len_hex=cut_len_hex,
                     gop_index=gop_index,
                     selected_index=packet_index,
+                    target_deleted_fraction=corr_fraction,
                 )
             )
     return _splice_hex(data, cuts), cuts
@@ -296,6 +341,7 @@ def corrupt_display_frames(
     corr_pos: float,
     corr_len_hex: int,
     gop_size: int,
+    corr_fraction: float | None = None,
 ) -> tuple[bytes, list[Cut]]:
     """Corrupt exact display-frame indices, including with reordered B-frames."""
     packet_index_by_position = {packet["pos"]: index for index, packet in enumerate(packets)}
@@ -308,14 +354,16 @@ def corrupt_display_frames(
             continue
         packet_index = packet_index_by_position[packet_position]
         packet = packets[packet_index]
+        cut_len_hex = _cut_length_hex(packet["size"], corr_len_hex, corr_fraction)
         cuts.append(
             _make_cut(
                 span_start_hex=2 * packet["pos"],
                 span_end_hex=2 * (packet["pos"] + packet["size"]),
                 corr_pos=corr_pos,
-                corr_len_hex=corr_len_hex,
+                corr_len_hex=cut_len_hex,
                 gop_index=display_index // gop_size,
                 selected_index=packet_index,
+                target_deleted_fraction=corr_fraction,
             )
         )
     return _splice_hex(data, cuts), cuts
@@ -328,6 +376,7 @@ def common_eligible_display_schedule(
     corr_prob: int,
     corr_len_hex: int,
     seed: int,
+    corr_fraction: float | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     """Choose identical full-length cuts that fit every encoding in a group."""
     if not streams:
@@ -347,7 +396,12 @@ def common_eligible_display_schedule(
             for name, (_, display_positions) in streams.items():
                 position = display_positions[display_index]
                 packet = packet_maps[name].get(position) if position is not None else None
-                if packet is None or 2 * packet["size"] - 7 - corr_len_hex <= 0:
+                cut_len_hex = (
+                    _cut_length_hex(packet["size"], corr_len_hex, corr_fraction)
+                    if packet is not None
+                    else corr_len_hex
+                )
+                if packet is None or 2 * packet["size"] - 7 - cut_len_hex <= 0:
                     fits_all = False
                     break
             if fits_all:
@@ -358,7 +412,7 @@ def common_eligible_display_schedule(
             raise ValueError(
                 f"strict common corruption cannot select {corr_prob} frame(s) in nominal GOP "
                 f"{gop_index}: only {len(eligible)} frame(s) can hold the full "
-                f"{corr_len_hex // 2}-byte cut across [{names}]. Lower --corr-len-hex; "
+                f"the requested cut across [{names}]. Lower --corr-len-hex/--corr-fraction; "
                 "the diagnostic will not use unequal short-frame fallbacks."
             )
         selected.extend(_choose_per_gop(eligible, corr_prob, seed, gop_index))
@@ -366,7 +420,8 @@ def common_eligible_display_schedule(
         "num_common_frames": num_frames,
         "eligible_display_frames_by_nominal_gop": eligible_by_gop,
         "selected_display_frames": selected,
-        "actual_bytes_per_cut": corr_len_hex // 2,
+        "actual_bytes_per_cut": corr_len_hex // 2 if corr_fraction is None else None,
+        "target_deleted_fraction": corr_fraction,
     }
 
 
@@ -728,6 +783,15 @@ def parse_args() -> argparse.Namespace:
         default=2048,
         help="original BSCV unit: hexadecimal characters; 2048 means approximately 1024 bytes",
     )
+    parser.add_argument(
+        "--corr-fraction",
+        type=float,
+        default=None,
+        help=(
+            "delete this fraction of each selected frame access unit (for example 0.01 for 1%); "
+            "when set, overrides --corr-len-hex in frame mode"
+        ),
+    )
     parser.add_argument("--corruption-unit", choices=("frame", "original-vcl"), default="frame")
     parser.add_argument("--display-fps", type=int, default=6)
     parser.add_argument("--panel-width", type=int, default=640)
@@ -760,6 +824,10 @@ def main() -> None:
         raise ValueError("--corr-pos must be in [0, 1]")
     if args.corr_len_hex <= 0 or args.corr_len_hex % 2:
         raise ValueError("--corr-len-hex must be a positive even number")
+    if args.corr_fraction is not None and not 0.0 < args.corr_fraction < 1.0:
+        raise ValueError("--corr-fraction must be strictly between 0 and 1")
+    if args.corr_fraction is not None and args.corruption_unit != "frame":
+        raise ValueError("--corr-fraction is supported only with --corruption-unit frame")
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise RuntimeError("ffmpeg and ffprobe must be available on PATH")
 
@@ -772,7 +840,8 @@ def main() -> None:
             "corr_prob": args.corr_prob,
             "corr_pos": args.corr_pos,
             "corr_len_hex": args.corr_len_hex,
-            "nominal_deleted_bytes_per_cut": args.corr_len_hex / 2,
+            "nominal_deleted_bytes_per_cut": args.corr_len_hex / 2 if args.corr_fraction is None else None,
+            "target_deleted_fraction_per_frame": args.corr_fraction,
             "seed": args.seed,
         },
         "comparison_scopes": {
@@ -859,6 +928,7 @@ def main() -> None:
                     corr_prob=args.corr_prob,
                     corr_len_hex=args.corr_len_hex,
                     seed=args.seed + sample_index,
+                    corr_fraction=args.corr_fraction,
                 )
                 controlled_schedule_reports[group_name] = {
                     "settings": group_settings,
@@ -897,10 +967,11 @@ def main() -> None:
                         corr_pos=args.corr_pos,
                         corr_len_hex=args.corr_len_hex,
                         gop_size=config.gop,
+                        corr_fraction=args.corr_fraction,
                     )
                     if any(cut.fallback for cut in cuts):
                         raise AssertionError(f"controlled setting {setting} unexpectedly used a short fallback")
-                    expected_deleted = len(cuts) * (args.corr_len_hex // 2)
+                    expected_deleted = sum(cut.deleted_hex_chars for cut in cuts) // 2
                     actual_deleted = len(clean_bytes) - len(corrupted_bytes)
                     if actual_deleted != expected_deleted:
                         raise AssertionError(
@@ -915,7 +986,10 @@ def main() -> None:
                         corr_pos=args.corr_pos,
                         corr_len_hex=args.corr_len_hex,
                         seed=args.seed + sample_index,
+                        corr_fraction=args.corr_fraction,
                     )
+                if args.corr_fraction is not None and any(cut.fallback for cut in cuts):
+                    raise AssertionError(f"fractional corruption unexpectedly used a short fallback for {setting}")
             corrupted.write_bytes(corrupted_bytes)
 
             position_to_display = {
@@ -1039,7 +1113,7 @@ def main() -> None:
                 "corrupted_bytes": len(corrupted_bytes),
                 "actual_deleted_bytes": (len(clean_bytes) - len(corrupted_bytes)),
                 "actual_deleted_hex_chars_from_records": actual_deleted_hex,
-                "cuts": [asdict(cut) for cut in cuts],
+                "cuts": [_cut_report(cut) for cut in cuts],
                 "cut_packet_positions": cut_packet_positions,
                 "cut_display_frame_indices": sorted(cut_frames),
                 "requested_shared_display_frame_indices": selected_display_frames,
