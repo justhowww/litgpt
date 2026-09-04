@@ -112,13 +112,14 @@ def test_build_video_filter_scale_pad():
     )
 
 
-def test_jpeglm_config_changes_only_fps_and_slice_layout_from_avclm():
+def test_jpeglm_config_preserves_full_duration_at_30fps_and_one_slice_per_frame():
     avclm = P.load_config(_AVCLM_CONFIG)
     jpeglm = P.load_config(_JPEGLM_CONFIG)
 
     assert jpeglm == dataclasses.replace(
         avclm,
         fps=30,
+        clip_duration_sec=None,
         ffmpeg=dataclasses.replace(
             avclm.ffmpeg,
             x264_params={
@@ -134,6 +135,7 @@ def test_jpeglm_config_changes_only_fps_and_slice_layout_from_avclm():
 
     cmd = _cmd(_JPEGLM_CONFIG)
     assert cmd[cmd.index("-vf") + 1].endswith(",fps=30")
+    assert "-t" not in cmd
     x264 = cmd[cmd.index("-x264-params") + 1]
     assert "slices=1" in x264
     assert "slice-max-mbs" not in x264
