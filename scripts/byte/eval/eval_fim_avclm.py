@@ -20,6 +20,12 @@ hole can span many tiny per-MB NALs, so the result should be read as "can the
 AVC-LM FIM objective reconstruct held-out spans under its own data layout?", not
 as a one-slice-per-frame corruption-recovery product metric.
 
+``--hole-placement corrupt_gen_frame`` supplies the deployment-oriented AVC-LM
+variant: choose a complete frame access unit, remove an exact whole-byte span at
+a fixed relative position, and compare the repaired target frame with FFmpeg's
+default-concealment baseline. It intentionally stays byte-aligned because the
+model's repair target is a sequence of complete bytes.
+
 Usage:
     python scripts/byte/eval/eval_fim_avclm.py MANIFEST \
         --nal-index-path DATA/nal_index.sqlite \
@@ -34,6 +40,7 @@ import argparse
 import csv
 import hashlib
 import json
+import random
 import re
 import sys
 from collections import Counter
@@ -240,6 +247,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fim-max-gap", type=int, default=1400)
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
     parser.add_argument(
+        "--hole-placement",
+        choices=("training_random", "corrupt_gen_frame"),
+        default="training_random",
+        help=(
+            "training_random reproduces the training sampler. corrupt_gen_frame "
+            "chooses one complete frame access unit deterministically and removes "
+            "--corr-len-bytes at --corr-pos, as the byte-aligned AVC-LM adaptation "
+            "of corrupt_Gen.py."
+        ),
+    )
+    parser.add_argument(
+        "--corr-pos",
+        type=float,
+        default=0.4,
+        help="Relative deletion position for --hole-placement corrupt_gen_frame.",
+    )
+    parser.add_argument(
+        "--corr-len-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Exact whole-byte deletion length for --hole-placement "
+            "corrupt_gen_frame. Frames too small for the full cut are excluded; "
+            "the evaluator never shortens the deletion."
+        ),
+    )
+    parser.add_argument(
+        "--corr-header-guard-bytes",
+        type=int,
+        default=4,
+        help=(
+            "Whole-byte approximation of corrupt_Gen.py's x+7 hexadecimal-character "
+            "offset. Used only by corrupt_gen_frame."
+        ),
+    )
+    parser.add_argument(
+        "--corr-eligibility-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Optional larger cut length used only to choose eligible frames. Set "
+            "this to the largest deletion in a severity sweep so every run selects "
+            "the same frame while still deleting --corr-len-bytes."
+        ),
+    )
+    parser.add_argument(
         "--stop-modes",
         nargs="+",
         choices=("learned_eos", "parser_reconnect", "oracle_len"),
@@ -312,6 +365,28 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-gen-bytes must be positive")
     if args.heldout_holes_per_window <= 0:
         parser.error("--heldout-holes-per-window must be positive")
+    if not 0.0 <= args.corr_pos <= 1.0:
+        parser.error("--corr-pos must be in [0, 1]")
+    if args.corr_header_guard_bytes < 0:
+        parser.error("--corr-header-guard-bytes must be non-negative")
+    if args.hole_placement == "corrupt_gen_frame":
+        if args.corr_len_bytes is None or args.corr_len_bytes <= 0:
+            parser.error(
+                "--hole-placement corrupt_gen_frame requires positive "
+                "--corr-len-bytes"
+            )
+        if (
+            args.corr_eligibility_bytes is not None
+            and args.corr_eligibility_bytes < args.corr_len_bytes
+        ):
+            parser.error(
+                "--corr-eligibility-bytes must be at least --corr-len-bytes"
+            )
+        if args.hole_set not in ("auto", "sampled"):
+            parser.error(
+                "--hole-placement corrupt_gen_frame is incompatible with "
+                "--hole-set trained/heldout; use --hole-set sampled"
+            )
     return args
 
 
@@ -421,8 +496,77 @@ def _split_indices(
     return perm[train_size:] if args.eval_split == "val" else perm[:train_size]
 
 
+def _corrupt_gen_frame_hole_spec(
+    dataset: ByteStreamWindowDataset,
+    idx: int,
+    *,
+    corr_pos: float,
+    eligibility_bytes: int,
+    seed: int,
+) -> tuple[int, int, int, int] | None:
+    """Select one exact, byte-aligned corrupt_Gen-style frame deletion.
+
+    ``ByteStreamWindowDataset`` has already been configured with a fixed
+    ``fim_min_gap == fim_max_gap`` and the four-byte approximation of
+    corrupt_Gen.py's x+7-nibble header offset. Consequently every candidate can
+    hold the complete requested deletion and no short-frame fallback is possible.
+    """
+    if dataset.fim_min_gap != dataset.fim_max_gap:
+        raise ValueError("corrupt_gen_frame requires one fixed deletion length")
+    sample = dataset.samples[idx]
+    data = sample.h264_path.read_bytes()
+    candidates = dataset._fim_candidates(sample, data)
+    candidates = [
+        (frame_lo, frame_hi)
+        for frame_lo, frame_hi in candidates
+        if frame_hi
+        - (frame_lo + dataset.frame_guard_bytes)
+        - 1
+        >= eligibility_bytes
+    ]
+    if not candidates:
+        return None
+
+    # The seed is local to the window, so repeated checkpoint evaluations and
+    # severity runs are reproducible without depending on DataLoader RNG state.
+    rng = random.Random((int(seed) << 32) ^ int(idx))
+    frame_lo, frame_hi = rng.choice(candidates)
+    gap = dataset.fim_min_gap
+    first_start = frame_lo + dataset.frame_guard_bytes
+    available = frame_hi - first_start - gap
+    if available < 0:
+        raise AssertionError("eligible frame cannot hold the requested full cut")
+    split = first_start + int(available * corr_pos)
+    return frame_lo, frame_hi, split, gap
+
+
 def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
     args.fim_loss_scope = _resolve_fim_loss_scope(args)
+    hole_placement = getattr(args, "hole_placement", "training_random")
+    corr_len_bytes = getattr(args, "corr_len_bytes", None)
+    if hole_placement == "corrupt_gen_frame":
+        if corr_len_bytes is None or int(corr_len_bytes) <= 0:
+            raise ValueError(
+                "corrupt_gen_frame requires a positive --corr-len-bytes"
+            )
+        eval_min_gap = eval_max_gap = int(corr_len_bytes)
+        frame_guard_bytes = int(getattr(args, "corr_header_guard_bytes", 4))
+        corr_eligibility_bytes = int(
+            getattr(args, "corr_eligibility_bytes", None) or corr_len_bytes
+        )
+        if corr_eligibility_bytes < eval_max_gap:
+            raise ValueError(
+                "--corr-eligibility-bytes must be at least --corr-len-bytes"
+            )
+    else:
+        eval_min_gap = int(args.fim_min_gap)
+        eval_max_gap = int(args.fim_max_gap)
+        frame_guard_bytes = int(args.slice_header_guard_bytes)
+        corr_eligibility_bytes = eval_max_gap
+    args.effective_fim_min_gap = eval_min_gap
+    args.effective_fim_max_gap = eval_max_gap
+    args.effective_frame_guard_bytes = frame_guard_bytes
+    args.effective_corr_eligibility_bytes = corr_eligibility_bytes
     rows = load_manifest_rows(
         args.manifest, max_rows=args.max_manifest_rows or None, report_progress=True,
     )
@@ -443,9 +587,9 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         fim_format=args.fim_format,
         fim_loss_scope=args.fim_loss_scope,
         use_eos=args.use_eos,
-        fim_min_gap=args.fim_min_gap,
-        fim_max_gap=args.fim_max_gap,
-        frame_guard_bytes=args.slice_header_guard_bytes,
+        fim_min_gap=eval_min_gap,
+        fim_max_gap=eval_max_gap,
+        frame_guard_bytes=frame_guard_bytes,
         resample_fim=False,
         nal_index=nal_index,
         seed=args.seed,
@@ -485,7 +629,14 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         )
 
     requested_hole_set = getattr(args, "hole_set", "auto")
-    if requested_hole_set == "auto":
+    if hole_placement == "corrupt_gen_frame":
+        if requested_hole_set not in ("auto", "sampled"):
+            raise RuntimeError(
+                "corrupt_gen_frame placement cannot replay trained or held-out "
+                "random holes"
+            )
+        requested_hole_set = "sampled"
+    elif requested_hole_set == "auto":
         requested_hole_set = "trained" if fixed_holes else "sampled"
     if requested_hole_set == "trained" and not fixed_holes:
         raise RuntimeError(
@@ -503,7 +654,18 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
             dict[str, Any] | None,
         ]
     ] = []
-    if requested_hole_set == "trained":
+    if hole_placement == "corrupt_gen_frame":
+        for idx in indices:
+            hole = _corrupt_gen_frame_hole_spec(
+                dataset,
+                idx,
+                corr_pos=float(getattr(args, "corr_pos", 0.4)),
+                eligibility_bytes=corr_eligibility_bytes,
+                seed=int(args.seed),
+            )
+            if hole is not None:
+                requests.append((idx, hole, None))
+    elif requested_hole_set == "trained":
         indexed_holes: list[tuple[int, list[dict[str, Any]]]] = []
         for idx in indices:
             sample = dataset.samples[idx]
@@ -667,7 +829,8 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         len(holes) for holes in fixed_holes.values()
     )
     print(
-        f"Selected {len(selected)} FIM samples from hole_set={requested_hole_set}",
+        f"Selected {len(selected)} FIM samples from hole_set={requested_hole_set} "
+        f"placement={hole_placement}",
         flush=True,
     )
     return selected
@@ -1274,7 +1437,12 @@ def save_fim_videos(
                 },
                 "panel_stream_bytes": item["panel_stream_bytes"],
                 "visualization_stream_scope": "full sampled window",
-                "corrupted_concealed_is_metric": False,
+                "corrupted_concealed_is_metric": True,
+                "corrupted_concealed_psnr": item.get(
+                    "corrupted_concealed_psnr"
+                ),
+                "repaired_psnr": item.get("repaired_psnr"),
+                "repair_psnr_lift_db": item.get("repair_psnr_lift_db"),
                 "strict_valid": item["strict_valid"],
                 "h264_path": item["h264_path"],
             },
@@ -1312,6 +1480,10 @@ def summarize(
     stop_reasons = Counter(r.get("stop_reason") or "none" for r in details)
     strict_statuses = Counter(
         r.get("strict_decode_status") or "not_run" for r in details
+    )
+    corrupted_concealed_statuses = Counter(
+        r.get("corrupted_concealed_decode_status") or "not_run"
+        for r in details
     )
     mask_failure_reasons = Counter(
         r["mask_failure_reason"] for r in details if r.get("mask_failure_reason")
@@ -1360,6 +1532,26 @@ def summarize(
         float(r["cont_ssim_mean"])
         for r in details
         if r.get("cont_ssim_mean") is not None
+    ]
+    corrupted_psnr = [
+        float(r["corrupted_concealed_psnr"])
+        for r in details
+        if r.get("corrupted_concealed_psnr") is not None
+    ]
+    corrupted_ssim = [
+        float(r["corrupted_concealed_ssim"])
+        for r in details
+        if r.get("corrupted_concealed_ssim") is not None
+    ]
+    psnr_lift = [
+        float(r["repair_psnr_lift_db"])
+        for r in details
+        if r.get("repair_psnr_lift_db") is not None
+    ]
+    ssim_lift = [
+        float(r["repair_ssim_lift"])
+        for r in details
+        if r.get("repair_ssim_lift") is not None
     ]
     tf_rows = [r for r in details if r.get("tf_byte_acc") is not None]
     real_app = [
@@ -1464,6 +1656,28 @@ def summarize(
         "timeout_complete_frames_hist": dict(timeout_partial),
         "cont_psnr_mean": AR.mean(psnr),
         "cont_ssim_mean": AR.mean(ssim),
+        "repaired_psnr_mean": AR.mean(psnr),
+        "repaired_ssim_mean": AR.mean(ssim),
+        "corrupted_concealed_psnr_mean": AR.mean(corrupted_psnr),
+        "corrupted_concealed_ssim_mean": AR.mean(corrupted_ssim),
+        "repair_psnr_lift_db_mean": AR.mean(psnr_lift),
+        "repair_ssim_lift_mean": AR.mean(ssim_lift),
+        "repair_quality_paired_count": len(psnr_lift),
+        "corrupted_concealed_target_frame_rate": (
+            AR.mean(
+                [
+                    1.0
+                    if r.get("corrupted_concealed_target_frame_available")
+                    else 0.0
+                    for r in details
+                ]
+            )
+            if decode_enabled
+            else None
+        ),
+        "corrupted_concealed_decode_status_hist": dict(
+            corrupted_concealed_statuses.most_common()
+        ),
         "eos_stop_rate": (
             AR.mean([1.0 if r.get("eos_stopped") else 0.0 for r in details])
             if stop_mode == "learned_eos"
@@ -1605,6 +1819,28 @@ def main() -> None:
             "gap": s.gap,
             "hole_id": s.hole_id,
             "target_length": s.target_length,
+            "hole_placement": args.hole_placement,
+            "requested_corr_pos": (
+                args.corr_pos
+                if args.hole_placement == "corrupt_gen_frame"
+                else None
+            ),
+            "actual_corr_pos": (
+                (
+                    (s.split - (s.frame_lo + args.effective_frame_guard_bytes))
+                    / (
+                        s.frame_hi
+                        - (s.frame_lo + args.effective_frame_guard_bytes)
+                        - s.gap
+                    )
+                )
+                if args.hole_placement == "corrupt_gen_frame"
+                and s.frame_hi
+                - (s.frame_lo + args.effective_frame_guard_bytes)
+                - s.gap
+                > 0
+                else None
+            ),
             "gt_parser_reconnect_ok": gt_reconnect_ok[i],
         }
         for i, s in enumerate(samples)
@@ -1628,6 +1864,9 @@ def main() -> None:
             teacher_forced_span_metrics(model, sample, device) for sample in samples
         ]
         gt_cache: list[tuple[list[Tensor], str, dict[str, Any]]] = []
+        corrupted_concealed_cache: list[
+            tuple[list[Tensor], str, dict[str, Any]]
+        ] = []
         for sample in samples:
             if args.decode:
                 gt_cache.append(
@@ -1635,8 +1874,18 @@ def main() -> None:
                         sample.gt_truncated_stream, args, strict=True, max_frames=None,
                     )
                 )
+                corrupted_concealed_cache.append(
+                    AR.decode_h264(
+                        sample.corrupted_stream,
+                        args,
+                        strict=False,
+                        max_frames=None,
+                        keep_partial_on_error=True,
+                    )
+                )
             else:
                 gt_cache.append(([], "not_run", {}))
+                corrupted_concealed_cache.append(([], "not_run", {}))
         # Full-window GT and deleted-span inputs are checkpoint- and stopping-mode-
         # independent. Decode them lazily for visualization. The strict corrupted
         # view preserves complete frames emitted before failure; the concealed view
@@ -1664,6 +1913,11 @@ def main() -> None:
             for sample_id, sample in enumerate(samples):
                 tf_metrics = tf_cache[sample_id]
                 gt_frames, gt_status, gt_decode = gt_cache[sample_id]
+                (
+                    corrupted_concealed_frames,
+                    corrupted_concealed_status,
+                    corrupted_concealed_decode,
+                ) = corrupted_concealed_cache[sample_id]
                 if args.decode and (gt_status != "decoded" or not gt_frames):
                     skipped_gt_decode_short += 1
                     rows.append(
@@ -1757,6 +2011,18 @@ def main() -> None:
                     "first_desync": model_parse["first_desync"],
                     "gt_parse": gt_parse,
                     "model_parse": model_parse,
+                    "hole_placement": args.hole_placement,
+                    "requested_corr_pos": (
+                        args.corr_pos
+                        if args.hole_placement == "corrupt_gen_frame"
+                        else None
+                    ),
+                    "corrupted_concealed_decode_status": (
+                        corrupted_concealed_status
+                    ),
+                    "corrupted_concealed_ffmpeg_decode": (
+                        corrupted_concealed_decode
+                    ),
                 }
                 if tf_metrics is not None:
                     row.update(tf_metrics)
@@ -1804,6 +2070,28 @@ def main() -> None:
                         }
                     )
                     target_index = len(gt_frames) - 1
+                    corrupted_target_available = (
+                        target_index < len(corrupted_concealed_frames)
+                        and corrupted_concealed_frames[target_index].shape
+                        == gt_frames[target_index].shape
+                    )
+                    row["corrupted_concealed_target_frame_available"] = (
+                        corrupted_target_available
+                    )
+                    if corrupted_target_available:
+                        corrupted_psnr = AR.image_psnr(
+                            gt_frames[target_index],
+                            corrupted_concealed_frames[target_index],
+                        )
+                        row["corrupted_concealed_psnr"] = (
+                            AR.PSNR_PERFECT_CAP
+                            if corrupted_psnr == float("inf")
+                            else corrupted_psnr
+                        )
+                        row["corrupted_concealed_ssim"] = AR.image_ssim(
+                            gt_frames[target_index],
+                            corrupted_concealed_frames[target_index],
+                        )
                     row["real_appearance_features"] = AR.appearance_features(
                         gt_frames[target_index]
                     )
@@ -1825,6 +2113,16 @@ def main() -> None:
                         row["cont_ssim_mean"] = AR.image_ssim(
                             gt_frames[target_index], model_frames[target_index]
                         )
+                        if row.get("corrupted_concealed_psnr") is not None:
+                            row["repair_psnr_lift_db"] = (
+                                row["cont_psnr_mean"]
+                                - row["corrupted_concealed_psnr"]
+                            )
+                        if row.get("corrupted_concealed_ssim") is not None:
+                            row["repair_ssim_lift"] = (
+                                row["cont_ssim_mean"]
+                                - row["corrupted_concealed_ssim"]
+                            )
                         row["gen_appearance_features"] = AR.appearance_features(
                             model_frames[target_index]
                         )
@@ -1927,6 +2225,13 @@ def main() -> None:
                             },
                             "strict_valid": strict_valid,
                             "h264_path": str(sample.h264_path),
+                            "corrupted_concealed_psnr": row.get(
+                                "corrupted_concealed_psnr"
+                            ),
+                            "repaired_psnr": row.get("cont_psnr_mean"),
+                            "repair_psnr_lift_db": row.get(
+                                "repair_psnr_lift_db"
+                            ),
                         }
                         row["comparison_video_path"] = str(comparison_path)
                 else:
@@ -1950,6 +2255,13 @@ def main() -> None:
                 "mode": "fim_avclm",
                 "stop_mode": stop_mode,
                 "slice_layout": args.slice_layout,
+                "hole_placement": args.hole_placement,
+                "corr_len_bytes": args.corr_len_bytes,
+                "corr_pos": (
+                    args.corr_pos
+                    if args.hole_placement == "corrupt_gen_frame"
+                    else None
+                ),
                 "exact_training_holes_verified": int(
                     getattr(args, "exact_training_holes_verified", 0)
                 ),
