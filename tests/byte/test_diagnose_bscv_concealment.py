@@ -260,3 +260,12 @@ def test_fractional_common_schedule_uses_same_frames_not_same_bytes():
     assert cuts_a[0].deleted_bytes == 10
     assert cuts_b[0].deleted_bytes == 20
     assert cuts_a[0].deleted_fraction == cuts_b[0].deleted_fraction == 0.01
+
+
+def test_all_cli_setting_names_are_known_encoder_settings():
+    expected = {
+        "project", "avclm", "bscv",
+        "cavlc_01slice", "cavlc_16slice", "cabac_01slice", "cabac_16slice",
+        "bscv_no_bframes", "bscv_ref1", "bscv_qp28", "bscv_no_scenecut",
+    }
+    assert D.SETTING_NAMES == expected

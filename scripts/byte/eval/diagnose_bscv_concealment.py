@@ -48,6 +48,19 @@ CONFIGS = {
     "bscv": PREPROCESS_DIR / "h264_preprocess_config_bscv.json",
 }
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+SETTING_NAMES = {
+    "project",
+    "avclm",
+    "bscv",
+    "cavlc_01slice",
+    "cavlc_16slice",
+    "cabac_01slice",
+    "cabac_16slice",
+    "bscv_no_bframes",
+    "bscv_ref1",
+    "bscv_qp28",
+    "bscv_no_scenecut",
+}
 
 
 @dataclass(frozen=True)
@@ -924,6 +937,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip the BSCV-origin B-frame/reference/QP/scene-cut ablation",
     )
+    parser.add_argument(
+        "--settings",
+        nargs="+",
+        choices=sorted(SETTING_NAMES),
+        default=None,
+        help="encode only these named settings; useful with bscv-exact, which should target bscv",
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -975,7 +995,18 @@ def main() -> None:
         bscv_ablation_settings = (
             {} if args.no_bscv_ablation else _bscv_ablation_configs(args.duration)
         )
+        if args.settings is not None:
+            requested = set(args.settings)
+            real_settings = {name: value for name, value in real_settings.items() if name in requested}
+            factorial_settings = {
+                name: value for name, value in factorial_settings.items() if name in requested
+            }
+            bscv_ablation_settings = {
+                name: value for name, value in bscv_ablation_settings.items() if name in requested
+            }
         settings = {**real_settings, **factorial_settings, **bscv_ablation_settings}
+        if not settings:
+            raise ValueError("--settings did not select any enabled encoder setting")
         real_grid_inputs: list[tuple[Path, str]] = []
         factorial_grid_inputs: list[tuple[Path, str]] = []
         bscv_ablation_grid_inputs: list[tuple[Path, str]] = []
@@ -1260,9 +1291,10 @@ def main() -> None:
 
         comparison = sample_dir / "comparison.mp4"
         (sample_dir / "layout.txt").write_text(
-            "project clean | project corrupted (default concealment)\n"
-            "avclm clean   | avclm corrupted (default concealment)\n"
-            "bscv clean    | bscv corrupted (default concealment)\n"
+            "".join(
+                f"{name} clean | {name} corrupted (default concealment)\n"
+                for name in real_settings
+            )
         )
         _make_grid(
             real_grid_inputs,
