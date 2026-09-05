@@ -71,6 +71,16 @@ STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit_speed_pilot_microbatch2.sh
 ```
 
+If microbatch 2 passes, Speed Pilot 3 tests microbatch 4 under the same setup.
+The global batch remains 64 and gradient accumulation falls to 4.
+
+```bash
+cd /nfshomes/huangyh/litgpt
+
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_speed_pilot_microbatch4.sh
+```
+
 Compare optimizer-step time, not only the printed micro-iteration time: multiply
 the baseline micro-iteration median by 16 and the Pilot 2 median by 8. Because
 two variable-length GOPs share a batch, also check whether padding and peak
