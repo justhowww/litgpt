@@ -8,8 +8,13 @@ split. With the JPEG-LM encoder this is normally 16 frames; a final partial GOP
 may be shorter.
 
 The job uses 4 H100s with FSDP and Transformer-block activation checkpointing.
+The validated production batch is global batch 64 with per-GPU microbatch 8
+and gradient accumulation 2. On the matched pilot this reduced optimizer-step
+time from approximately 3.69 seconds at microbatch 1 to 0.97--1.00 seconds.
+Microbatch 16 did not improve throughput.
+
 Each full training-state checkpoint is approximately 65 GB. The full launcher
-therefore keeps one rolling `latest` checkpoint updated every 1,000 optimizer
+therefore keeps one rolling `latest` checkpoint updated every 10,000 optimizer
 steps and saves permanent `step-*` milestones only every 100,000 steps. When
 both intervals coincide, `latest` points to the milestone instead of duplicating
 it. Automatic resume prefers `latest`. Override these independently with
@@ -120,6 +125,10 @@ FIM_MIN_GAP=64 \
 FIM_MAX_GAP=1400 \
 SLICE_HEADER_GUARD_BYTES=0 \
 WINDOW_UNIT=gop \
+GLOBAL_BATCH_SIZE=64 \
+MICRO_BATCH_SIZE=8 \
+LATEST_SAVE_INTERVAL=10000 \
+SAVE_INTERVAL=100000 \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit.sh
 ```
 

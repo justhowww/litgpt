@@ -24,7 +24,9 @@ MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS:-8}
 STEPS=${STEPS:-1000000}
 WARMUP_STEPS=${WARMUP_STEPS:-2000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+# The matched 4xH100 sweep found microbatch 8 to be the best robust point:
+# ~3.8x faster than microbatch 1, while microbatch 16 had no clear gain.
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
 LEARNING_RATE=${LEARNING_RATE:-3e-4}
 MIN_LEARNING_RATE=${MIN_LEARNING_RATE:-3e-5}
 MAX_ROWS=${MAX_ROWS:-0}
@@ -50,7 +52,10 @@ EVAL_ITERS=${EVAL_ITERS:-20}
 # A full training-state checkpoint is ~65 GB. Keep permanent milestones sparse
 # while updating one rolling recovery checkpoint at the old cadence.
 SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
-LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-1000}
+# At ~1 optimizer step/s, 1,000-step rolling saves would write 65 GB about
+# every 17 minutes. Ten thousand steps limits checkpoint overhead while
+# bounding recoverable work to roughly 2.5--3 hours.
+LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-10000}
 SAVE_FINAL=${SAVE_FINAL:-1}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 COMPILE=${COMPILE:-1}
