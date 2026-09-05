@@ -42,6 +42,24 @@ eligibility because it is only a systems test. It saves only the final
 checkpoint, avoiding a duplicate 65 GB step checkpoint. If it passes, repeat
 once with `COMPILE=1`.
 
+After the compiled baseline passes, Speed Pilot 1 measures whether activation
+recomputation can be removed. It changes only
+`ACTIVATION_CHECKPOINTING=0`; the model, 256-video subset, global/micro batch,
+seed, compilation, and 20-step budget remain matched. Because this is a
+disposable speed/OOM test, it saves no 65 GB training-state checkpoint.
+
+```bash
+cd /nfshomes/huangyh/litgpt
+
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_speed_pilot_no_activation_checkpointing.sh
+```
+
+Compare steady-state `iter time` and peak memory with the compiled baseline. A
+pass on this small subset is only the first gate; disabling activation
+checkpointing for the full run still requires a near-maximum-length GOP stress
+test.
+
 The full launcher requires at least 900,000 manifest rows and refuses to submit
 if fewer than 50% of non-IDR slices can host the configured FIM hole. JPEG-LM
 uses no protected prefix by default (`SLICE_HEADER_GUARD_BYTES=0`), so FIM may

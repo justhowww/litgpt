@@ -102,6 +102,15 @@ def parse_args() -> argparse.Namespace:
             "0 disables it. This is independent of permanent --save-interval milestones."
         ),
     )
+    parser.add_argument(
+        "--save-final",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save the final model and optimizer state. Disable only for disposable "
+            "performance/OOM pilots."
+        ),
+    )
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-iters", type=int, default=10)
     parser.add_argument("--reconstruction-eval-interval", type=int, default=0)
@@ -665,6 +674,7 @@ def main() -> None:
     train = TrainArgs(
         save_interval=args.save_interval,
         latest_save_interval=args.latest_save_interval or None,
+        save_final=args.save_final,
         log_interval=1,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,

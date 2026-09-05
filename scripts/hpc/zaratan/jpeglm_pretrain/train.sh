@@ -51,6 +51,7 @@ EVAL_ITERS=${EVAL_ITERS:-20}
 # while updating one rolling recovery checkpoint at the old cadence.
 SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
 LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-1000}
+SAVE_FINAL=${SAVE_FINAL:-1}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 COMPILE=${COMPILE:-1}
 ACTIVATION_CHECKPOINTING=${ACTIVATION_CHECKPOINTING:-1}
@@ -94,6 +95,10 @@ if (( N_EMBD % BYTE_PATCH_SIZE != 0 )); then
 fi
 if (( MEGABYTE_LOCAL_EMBD % MEGABYTE_LOCAL_HEADS != 0 )); then
     echo "MEGABYTE_LOCAL_EMBD=${MEGABYTE_LOCAL_EMBD} must be divisible by MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS}" >&2
+    exit 1
+fi
+if [[ "${SAVE_FINAL}" != "0" && "${SAVE_FINAL}" != "1" ]]; then
+    echo "SAVE_FINAL must be 0 or 1" >&2
     exit 1
 fi
 WORLD_SIZE=$((DEVICES * NUM_NODES))
@@ -152,6 +157,10 @@ cmd=(
     --resume
 )
 
+if [[ "${SAVE_FINAL}" == "0" ]]; then
+    cmd+=(--no-save-final)
+fi
+
 if [[ "${MAX_ROWS}" != "0" ]]; then
     cmd+=(--max-manifest-rows "${MAX_ROWS}")
 fi
@@ -165,7 +174,7 @@ fi
 echo "[jpeglm] model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} raw_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
 echo "[jpeglm] rows=${MAX_ROWS} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} micro=${MICRO_BATCH_SIZE} devices=${DEVICES} activation_checkpointing=${ACTIVATION_CHECKPOINTING} compile=${COMPILE}"
 echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} EOS=on split=held-out-video"
-echo "[jpeglm] checkpoints: rolling latest every ${LATEST_SAVE_INTERVAL} steps; permanent milestone every ${SAVE_INTERVAL} steps"
+echo "[jpeglm] checkpoints: rolling latest every ${LATEST_SAVE_INTERVAL} steps; permanent milestone every ${SAVE_INTERVAL} steps; final=${SAVE_FINAL}"
 
 exec {training_lock_fd}>"${OUT_DIR}/.training.lock"
 if ! flock -n "${training_lock_fd}"; then

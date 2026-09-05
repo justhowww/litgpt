@@ -434,19 +434,23 @@ def main(
         byte_runtime=byte_runtime,
     )
 
-    # Save final checkpoint
-    final_checkpoint_dir = out_dir / "final"
-    save_checkpoint(
-        fabric,
-        state,
-        tokenizer_dir,
-        final_checkpoint_dir / "lit_model.pth",
-        checkpoint_hparams=checkpoint_hparams,
-    )
-    if train.latest_save_interval is not None:
-        # A cleanly completed run may stop between rolling intervals. Make
-        # automatic resume select the truly newest state in that case.
-        point_latest_checkpoint_at(fabric, out_dir, final_checkpoint_dir)
+    # Performance-only pilots can skip a many-gigabyte final checkpoint while
+    # ordinary training retains the existing save-on-completion behavior.
+    if train.save_final:
+        final_checkpoint_dir = out_dir / "final"
+        save_checkpoint(
+            fabric,
+            state,
+            tokenizer_dir,
+            final_checkpoint_dir / "lit_model.pth",
+            checkpoint_hparams=checkpoint_hparams,
+        )
+        if train.latest_save_interval is not None:
+            # A cleanly completed run may stop between rolling intervals. Make
+            # automatic resume select the truly newest state in that case.
+            point_latest_checkpoint_at(fabric, out_dir, final_checkpoint_dir)
+    else:
+        fabric.print("Skipping final checkpoint because train.save_final=False")
 
     total_tokens = state["step_count"] * train.global_batch_size * model.max_seq_length
     segment_tokens = (

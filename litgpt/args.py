@@ -12,6 +12,8 @@ class TrainArgs:
     """Number of optimizer steps between saving checkpoints"""
     latest_save_interval: int | None = None
     """Number of optimizer steps between updates to the single rolling ``latest`` checkpoint"""
+    save_final: bool = True
+    """Whether to save a final training-state checkpoint after successful completion"""
     log_interval: int = 1
     """Number of iterations between logging calls"""
     global_batch_size: int = 64
