@@ -9,7 +9,12 @@ Experiment launchers are grouped by training stage:
 ```text
 stage1_ar/   # AR smoke and convergence runs
 stage2_fim/  # mixed AR/FIM smoke and convergence runs
+jpeglm_pretrain/  # 4xH100 full-corpus 7B MEGABYTE AR+FIM run
 ```
+
+The JPEG-LM launcher has its own corpus/index preflight and an exact-shape
+20-step pilot. See `jpeglm_pretrain/README.md`; do not submit the full job until
+the pilot fits and the FIM-eligible-frame report passes.
 
 Shared corpus staging, encoding, environment, and NAL-index scripts remain in
 `scripts/hpc/zaratan/`.

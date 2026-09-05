@@ -64,6 +64,21 @@ def test_multi_gpu_grpo_selects_replicated_ddp():
     )
 
 
+def test_pretraining_activation_checkpointing_is_opt_in():
+    with mock.patch.object(pretrain, "FSDPStrategy") as strategy:
+        pretrain._select_training_strategy(
+            4, 1, None, activation_checkpointing=True
+        )
+
+    strategy.assert_called_once_with(
+        auto_wrap_policy={Block},
+        activation_checkpointing_policy={Block},
+        state_dict_type="full",
+        sharding_strategy="HYBRID_SHARD",
+        limit_all_gathers=True,
+    )
+
+
 def test_multi_gpu_grpo_freezes_only_inactive_megabyte_parameters():
     config = Config(
         block_size=4,

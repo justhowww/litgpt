@@ -293,6 +293,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-region-id", action="store_true")
     parser.add_argument("--no-offset-id", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--activation-checkpointing",
+        action="store_true",
+        help=(
+            "Recompute Transformer-block activations during backward to reduce "
+            "multi-GPU FSDP memory use. This trades additional compute for memory."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--initial-checkpoint-dir",
@@ -775,6 +783,7 @@ def main() -> None:
         free_run_eval=free_run_eval,
         grpo=grpo,
         grpo_reference_checkpoint_dir=args.grpo_reference_checkpoint_dir,
+        activation_checkpointing=args.activation_checkpointing,
     )
 
 

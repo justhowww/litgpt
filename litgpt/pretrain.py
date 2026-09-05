@@ -65,6 +65,7 @@ def _select_training_strategy(
     devices: int,
     num_nodes: int,
     grpo: GRPOConfig | None,
+    activation_checkpointing: bool = False,
 ):
     """Choose replicated DDP for GRPO and FSDP for ordinary pretraining.
 
@@ -77,10 +78,15 @@ def _select_training_strategy(
         return "auto"
     if grpo is not None and grpo.enabled:
         return "ddp"
+    fsdp_kwargs = {}
+    if activation_checkpointing:
+        fsdp_kwargs["activation_checkpointing_policy"] = {Block}
     return FSDPStrategy(
         auto_wrap_policy={Block},
         state_dict_type="full",
         sharding_strategy="HYBRID_SHARD",
+        limit_all_gathers=True,
+        **fsdp_kwargs,
     )
 
 
@@ -150,6 +156,7 @@ def setup(
     free_run_eval: FreeRunEvalConfig | None = None,
     grpo: GRPOConfig | None = None,
     grpo_reference_checkpoint_dir: Path | None = None,
+    activation_checkpointing: bool = False,
 ):
     """Pretrain a model.
 
@@ -220,7 +227,12 @@ def setup(
         log_args=asdict(log),
     )
 
-    strategy = _select_training_strategy(devices, num_nodes, grpo)
+    strategy = _select_training_strategy(
+        devices,
+        num_nodes,
+        grpo,
+        activation_checkpointing=activation_checkpointing,
+    )
 
     fabric = L.Fabric(devices=devices, num_nodes=num_nodes, strategy=strategy, precision=precision, loggers=[logger])
 
