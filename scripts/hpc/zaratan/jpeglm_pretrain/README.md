@@ -91,6 +91,16 @@ STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit_speed_pilot_microbatch8.sh
 ```
 
+Speed Pilot 5 tests microbatch 16, the maximum compatible with global batch 64
+on four GPUs. This removes gradient accumulation entirely.
+
+```bash
+cd /nfshomes/huangyh/litgpt
+
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_speed_pilot_microbatch16.sh
+```
+
 Compare optimizer-step time, not only the printed micro-iteration time: multiply
 the baseline micro-iteration median by 16 and the Pilot 2 median by 8. Because
 two variable-length GOPs share a batch, also check whether padding and peak
