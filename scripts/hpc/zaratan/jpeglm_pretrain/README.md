@@ -60,6 +60,22 @@ pass on this small subset is only the first gate; disabling activation
 checkpointing for the full run still requires a near-maximum-length GOP stress
 test.
 
+Speed Pilot 2 keeps activation checkpointing enabled and changes only the
+per-GPU microbatch from 1 to 2. The global batch remains 64, so gradient
+accumulation falls from 16 to 8. It also skips all 65 GB checkpoint writes.
+
+```bash
+cd /nfshomes/huangyh/litgpt
+
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_speed_pilot_microbatch2.sh
+```
+
+Compare optimizer-step time, not only the printed micro-iteration time: multiply
+the baseline micro-iteration median by 16 and the Pilot 2 median by 8. Because
+two variable-length GOPs share a batch, also check whether padding and peak
+memory erase the expected utilization gain.
+
 The full launcher requires at least 900,000 manifest rows and refuses to submit
 if fewer than 50% of non-IDR slices can host the configured FIM hole. JPEG-LM
 uses no protected prefix by default (`SLICE_HEADER_GUARD_BYTES=0`), so FIM may
