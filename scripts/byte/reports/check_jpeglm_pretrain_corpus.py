@@ -57,7 +57,11 @@ def main() -> None:
     if not args.nal_index_path.is_file():
         raise SystemExit(f"NAL index not found: {args.nal_index_path}")
 
+    print("JPEG-LM pretraining corpus preflight", flush=True)
+    print(f"  scanning manifest: {args.manifest}", flush=True)
     total_rows, usable_rows, unique_usable_paths = count_manifest_rows(args.manifest)
+    print(f"  manifest rows: {total_rows:,} total, {usable_rows:,} usable", flush=True)
+    print(f"  unique usable paths: {unique_usable_paths:,}", flush=True)
     if usable_rows < args.min_manifest_rows:
         raise SystemExit(
             f"Manifest has {usable_rows:,} usable rows; require at least "
@@ -83,46 +87,55 @@ def main() -> None:
             )
 
         indexed_files = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        stats: dict[int, tuple[int, int, float, int, int]] = {}
-        for nal_type in VCL_NAL_TYPES:
-            rows = connection.execute(
-                "SELECT start_code_len, (end - start) FROM nals WHERE nal_type = ?",
-                (nal_type,),
-            ).fetchall()
-            lengths = [length for _, length in rows]
-            eligible = [
-                length
-                for _, length in rows
-                if length - args.frame_guard_bytes - 1 >= args.fim_min_gap
-            ]
+        print(f"  indexed files: {indexed_files:,}", flush=True)
+        if indexed_files < unique_usable_paths:
+            raise SystemExit(
+                f"NAL index has {indexed_files:,} files but the manifest has "
+                f"{unique_usable_paths:,} unique usable paths. Resume indexing."
+            )
+        print("  aggregating VCL NAL statistics in SQLite...", flush=True)
+        minimum_eligible_bytes = (
+            args.frame_guard_bytes + args.fim_min_gap + 1
+        )
+        rows = connection.execute(
+            """
+            SELECT
+                nal_type,
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN (end - start) >= ? THEN 1 ELSE 0 END), 0),
+                COALESCE(MIN(end - start), 0),
+                COALESCE(MAX(end - start), 0)
+            FROM nals
+            WHERE nal_type IN (?, ?)
+            GROUP BY nal_type
+            """,
+            (minimum_eligible_bytes, *VCL_NAL_TYPES),
+        ).fetchall()
+        stats: dict[int, tuple[int, int, float, int, int]] = {
+            nal_type: (0, 0, 0.0, 0, 0) for nal_type in VCL_NAL_TYPES
+        }
+        for nal_type, total, eligible, minimum, maximum in rows:
             stats[nal_type] = (
-                len(lengths),
-                len(eligible),
-                len(eligible) / max(len(lengths), 1),
-                min(lengths, default=0),
-                max(lengths, default=0),
+                total,
+                eligible,
+                eligible / max(total, 1),
+                minimum,
+                maximum,
             )
 
-    print("JPEG-LM pretraining corpus preflight")
-    print(f"  manifest rows: {total_rows:,} total, {usable_rows:,} usable")
-    print(f"  unique usable paths: {unique_usable_paths:,}")
-    print(f"  indexed files: {indexed_files:,}")
-    if indexed_files < unique_usable_paths:
-        raise SystemExit(
-            f"NAL index has {indexed_files:,} files but the manifest has "
-            f"{unique_usable_paths:,} unique usable paths. Resume indexing."
-        )
     print(
         "  FIM requirement: frame bytes >= "
         f"{args.frame_guard_bytes + args.fim_min_gap + 1} "
-        f"(guard={args.frame_guard_bytes}, min_gap={args.fim_min_gap})"
+        f"(guard={args.frame_guard_bytes}, min_gap={args.fim_min_gap})",
+        flush=True,
     )
     labels = {1: "non-IDR", 5: "IDR"}
     for nal_type in VCL_NAL_TYPES:
         total, eligible, fraction, minimum, maximum = stats[nal_type]
         print(
             f"  {labels[nal_type]} VCL proxy: {eligible:,}/{total:,} eligible "
-            f"({fraction:.1%}); NAL bytes min={minimum:,}, max={maximum:,}"
+            f"({fraction:.1%}); NAL bytes min={minimum:,}, max={maximum:,}",
+            flush=True,
         )
 
     p_fraction = stats[1][2]
@@ -135,9 +148,9 @@ def main() -> None:
         )
         if not args.allow_low_fim_eligibility:
             raise SystemExit(message)
-        print(f"  WARNING: {message}")
+        print(f"  WARNING: {message}", flush=True)
 
-    print("preflight passed")
+    print("preflight passed", flush=True)
 
 
 if __name__ == "__main__":
