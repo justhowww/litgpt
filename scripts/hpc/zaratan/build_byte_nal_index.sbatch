@@ -19,6 +19,7 @@ REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 : "${MANIFEST:?Set MANIFEST to the scratch-resident manifest.jsonl}"
 NAL_INDEX=${NAL_INDEX:-"$(dirname "${MANIFEST}")/nal_index.sqlite"}
 INDEX_WORKERS=${INDEX_WORKERS:-"${SLURM_CPUS_PER_TASK}"}
+INDEX_MAX_PENDING=${INDEX_MAX_PENDING:-$((INDEX_WORKERS * 4))}
 REBUILD_INDEX=${REBUILD_INDEX:-0}
 PROJECT_SCRATCH=${PROJECT_SCRATCH:-"/home/${USER}/scratch.metzler-prj"}
 CONDA_ROOT=${CONDA_ROOT:-"${PROJECT_SCRATCH}/miniforge3"}
@@ -39,6 +40,7 @@ echo "Python: ${PYTHON_BIN}"
 echo "Manifest: ${MANIFEST}"
 echo "NAL index: ${NAL_INDEX}"
 echo "Workers: ${INDEX_WORKERS}"
+echo "Maximum pending scans: ${INDEX_MAX_PENDING}"
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable on the compute node: ${MANIFEST}" >&2
@@ -56,6 +58,7 @@ cmd=(
     "${MANIFEST}"
     --output "${NAL_INDEX}"
     --workers "${INDEX_WORKERS}"
+    --max-pending "${INDEX_MAX_PENDING}"
 )
 if [[ "${REBUILD_INDEX}" == "1" ]]; then
     cmd+=(--rebuild)

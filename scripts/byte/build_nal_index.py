@@ -6,7 +6,8 @@ import argparse
 import os
 import sqlite3
 import time
-from concurrent.futures import ProcessPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
 
 from litgpt.byte.data import (
@@ -17,7 +18,10 @@ from litgpt.byte.data import (
 )
 
 
-def scan_file(path_string: str) -> tuple[str, int, int, list[tuple[int, int, int, int]]]:
+ScanResult = tuple[str, int, int, list[tuple[int, int, int, int]]]
+
+
+def scan_file(path_string: str) -> ScanResult:
     path = Path(path_string)
     data = path.read_bytes()
     stat = path.stat()
@@ -26,6 +30,42 @@ def scan_file(path_string: str) -> tuple[str, int, int, list[tuple[int, int, int
         for nal in parse_annexb_nals(data)
     ]
     return path_string, stat.st_size, stat.st_mtime_ns, nals
+
+
+def scan_files_bounded(
+    paths: list[str], workers: int, max_pending: int
+) -> Iterator[ScanResult]:
+    """Scan files in parallel without queueing the entire corpus in memory.
+
+    ``ProcessPoolExecutor.map`` eagerly submits the input iterable and yields in
+    input order. On a million-file corpus, one slow file can therefore retain a
+    large backlog of completed NAL lists in the parent process. This unordered,
+    bounded producer keeps at most ``max_pending`` file results in flight.
+    """
+    if workers == 1:
+        yield from map(scan_file, paths)
+        return
+    if max_pending < workers:
+        raise ValueError("max_pending must be at least workers")
+
+    path_iterator = iter(paths)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending: set[Future[ScanResult]] = set()
+
+        def fill_pending() -> None:
+            while len(pending) < max_pending:
+                try:
+                    path = next(path_iterator)
+                except StopIteration:
+                    return
+                pending.add(executor.submit(scan_file, path))
+
+        fill_pending()
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                yield future.result()
+            fill_pending()
 
 
 def initialize_database(
@@ -102,9 +142,23 @@ def write_file_index(
 
 
 def build_index(
-    manifest_path: Path, index_path: Path, workers: int, rebuild: bool
+    manifest_path: Path,
+    index_path: Path,
+    workers: int,
+    rebuild: bool,
+    max_pending: int | None = None,
 ) -> None:
+    manifest_stat_before_read = manifest_path.stat()
     rows = load_manifest_rows(manifest_path, report_progress=True)
+    manifest_stat = manifest_path.stat()
+    if (
+        manifest_stat.st_size != manifest_stat_before_read.st_size
+        or manifest_stat.st_mtime_ns != manifest_stat_before_read.st_mtime_ns
+    ):
+        raise RuntimeError(
+            f"Manifest changed while it was being read: {manifest_path}. "
+            "Wait for encoding/manifest generation to finish, then rerun."
+        )
     paths = list(dict.fromkeys(str(Path(row["h264_path"])) for row in rows))
     index_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -139,32 +193,36 @@ def build_index(
             flush=True,
         )
 
-        if workers == 1:
-            results = map(scan_file, pending_paths)
-            executor = None
-        else:
-            executor = ProcessPoolExecutor(max_workers=workers)
-            results = executor.map(scan_file, pending_paths, chunksize=8)
-
-        try:
-            for result in results:
-                processed_bytes += write_file_index(connection, result)
-                processed_files += 1
-                if processed_files % 100 == 0:
-                    connection.commit()
-                    elapsed = time.perf_counter() - started_at
-                    print(
-                        f"Indexed {processed_files:,}/{len(pending_paths):,} new files, "
-                        f"{processed_bytes / 1e9:.2f} GB, "
-                        f"{processed_bytes / max(elapsed, 1e-9) / 1e6:.1f} MB/s",
-                        flush=True,
-                    )
-        finally:
-            if executor is not None:
-                executor.shutdown()
+        max_pending = max_pending or workers * 4
+        print(
+            f"Parallel scan: workers={workers}, max_pending={max_pending}",
+            flush=True,
+        )
+        for result in scan_files_bounded(pending_paths, workers, max_pending):
+            processed_bytes += write_file_index(connection, result)
+            processed_files += 1
+            if processed_files % 100 == 0:
+                connection.commit()
+                elapsed = time.perf_counter() - started_at
+                print(
+                    f"Indexed {processed_files:,}/{len(pending_paths):,} new files, "
+                    f"{processed_bytes / 1e9:.2f} GB, "
+                    f"{processed_bytes / max(elapsed, 1e-9) / 1e6:.1f} MB/s",
+                    flush=True,
+                )
         connection.commit()
 
-        manifest_stat = manifest_path.stat()
+        manifest_stat_after_scan = manifest_path.stat()
+        if (
+            manifest_stat_after_scan.st_size != manifest_stat.st_size
+            or manifest_stat_after_scan.st_mtime_ns != manifest_stat.st_mtime_ns
+        ):
+            raise RuntimeError(
+                f"Manifest changed during NAL indexing: {manifest_path}. Indexed "
+                "file rows were committed and will be reused, but completion "
+                "metadata was not written. Wait for encoding/manifest generation "
+                "to finish, then rerun."
+            )
         metadata = {
             "version": str(NAL_INDEX_VERSION),
             "manifest_path": str(manifest_path.resolve()),
@@ -185,6 +243,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1))
+    parser.add_argument(
+        "--max-pending",
+        type=int,
+        default=0,
+        help="Maximum parallel file scans in flight; 0 uses 4x --workers.",
+    )
     parser.add_argument("--rebuild", action="store_true")
     return parser.parse_args()
 
@@ -193,8 +257,18 @@ def main() -> None:
     args = parse_args()
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
+    if args.max_pending < 0:
+        raise ValueError("--max-pending must be non-negative")
+    if args.max_pending and args.max_pending < args.workers:
+        raise ValueError("--max-pending must be at least --workers")
     output = args.output or default_nal_index_path(args.manifest)
-    build_index(args.manifest, output, args.workers, args.rebuild)
+    build_index(
+        args.manifest,
+        output,
+        args.workers,
+        args.rebuild,
+        max_pending=args.max_pending or None,
+    )
 
 
 if __name__ == "__main__":
