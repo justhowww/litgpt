@@ -11,5 +11,8 @@ if (( $# > 1 )); then
 fi
 if (( $# == 1 )); then
     export AFTER_JOBID=$1
+    # A wall-time-limited training allocation commonly exits non-zero. Resume
+    # after it ends regardless; the newest complete checkpoint remains safe.
+    export DEPENDENCY_TYPE=afterany
 fi
 exec bash "${SCRIPT_DIR}/submit.sh"

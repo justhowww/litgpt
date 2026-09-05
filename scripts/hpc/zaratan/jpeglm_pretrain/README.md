@@ -15,6 +15,18 @@ STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit_pilot.sh
 ```
 
+To queue the pilot behind a corpus/index job and run it only if that job
+succeeds:
+
+```bash
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+AFTER_JOBID=INDEX_JOB_ID \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_pilot.sh
+```
+
+The preflight is deferred to the compute job in this case, after the dependency
+has produced the final manifest and index.
+
 The pilot intentionally disables `torch.compile` so an OOM can be attributed to
 the model rather than compilation. It warns rather than stops on low FIM
 eligibility because it is only a systems test. If it passes, repeat once with

@@ -20,6 +20,7 @@ SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
 MIN_P_FIM_ELIGIBILITY=${MIN_P_FIM_ELIGIBILITY:-0.5}
 MIN_MANIFEST_ROWS=${MIN_MANIFEST_ROWS:-900000}
 ALLOW_LOW_FIM_ELIGIBILITY=${ALLOW_LOW_FIM_ELIGIBILITY:-0}
+DEPENDENCY_TYPE=${DEPENDENCY_TYPE:-afterok}
 
 preflight=(
     python "${REPO_ROOT}/scripts/byte/reports/check_jpeglm_pretrain_corpus.py"
@@ -33,11 +34,16 @@ preflight=(
 if [[ "${ALLOW_LOW_FIM_ELIGIBILITY}" == "1" ]]; then
     preflight+=(--allow-low-fim-eligibility)
 fi
-"${preflight[@]}"
+if [[ -z "${AFTER_JOBID:-}" ]]; then
+    "${preflight[@]}"
+else
+    echo "Deferring corpus preflight until dependency job ${AFTER_JOBID} has completed."
+fi
 
 mkdir -p "${OUT_DIR}/logs"
 export REPO_ROOT STAGED_CORPUS MANIFEST NAL_INDEX MODEL_TAG OUT_DIR
 export FIM_MIN_GAP FIM_MAX_GAP SLICE_HEADER_GUARD_BYTES
+export MIN_P_FIM_ELIGIBILITY MIN_MANIFEST_ROWS ALLOW_LOW_FIM_ELIGIBILITY
 
 sbatch_args=(
     --parsable
@@ -50,9 +56,14 @@ if [[ -n "${EXCLUDE_NODES:-}" ]]; then
     sbatch_args+=(--exclude="${EXCLUDE_NODES}")
 fi
 if [[ -n "${AFTER_JOBID:-}" ]]; then
-    sbatch_args+=(--dependency=afterany:"${AFTER_JOBID}")
+    case "${DEPENDENCY_TYPE}" in
+        afterok|afterany) ;;
+        *) echo "DEPENDENCY_TYPE must be afterok or afterany" >&2; exit 2 ;;
+    esac
+    sbatch_args+=(--dependency="${DEPENDENCY_TYPE}:${AFTER_JOBID}")
 fi
 
 job_id=$(sbatch "${sbatch_args[@]}" "${JOB_SCRIPT}")
 echo "Submitted JPEG-LM pretraining job ${job_id}"
 echo "Output directory: ${OUT_DIR}"
+[[ -n "${AFTER_JOBID:-}" ]] && echo "Dependency: ${DEPENDENCY_TYPE}:${AFTER_JOBID}"

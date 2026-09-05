@@ -49,6 +49,9 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 COMPILE=${COMPILE:-1}
 ACTIVATION_CHECKPOINTING=${ACTIVATION_CHECKPOINTING:-1}
+MIN_P_FIM_ELIGIBILITY=${MIN_P_FIM_ELIGIBILITY:-0.5}
+MIN_MANIFEST_ROWS=${MIN_MANIFEST_ROWS:-900000}
+ALLOW_LOW_FIM_ELIGIBILITY=${ALLOW_LOW_FIM_ELIGIBILITY:-0}
 
 if [[ ! -r "${MANIFEST}" ]]; then
     echo "Manifest is not readable: ${MANIFEST}" >&2
@@ -58,6 +61,24 @@ if [[ ! -r "${NAL_INDEX}" ]]; then
     echo "NAL index is not readable: ${NAL_INDEX}" >&2
     exit 1
 fi
+
+# Repeat the corpus check inside the allocation. This is required for jobs
+# submitted with an afterok dependency, where the index may not exist yet at
+# submission time. It runs before model allocation and fails cheaply.
+preflight=(
+    python "${REPO_ROOT}/scripts/byte/reports/check_jpeglm_pretrain_corpus.py"
+    "${MANIFEST}"
+    --nal-index-path "${NAL_INDEX}"
+    --fim-min-gap "${FIM_MIN_GAP}"
+    --frame-guard-bytes "${SLICE_HEADER_GUARD_BYTES}"
+    --min-p-frame-eligibility "${MIN_P_FIM_ELIGIBILITY}"
+    --min-manifest-rows "${MIN_MANIFEST_ROWS}"
+)
+if [[ "${ALLOW_LOW_FIM_ELIGIBILITY}" == "1" ]]; then
+    preflight+=(--allow-low-fim-eligibility)
+fi
+"${preflight[@]}"
+
 if (( N_EMBD % N_HEAD != 0 )); then
     echo "N_EMBD=${N_EMBD} must be divisible by N_HEAD=${N_HEAD}" >&2
     exit 1
