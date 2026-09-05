@@ -3,6 +3,7 @@
 import math
 import os
 import pprint
+import shutil
 import time
 import warnings
 from dataclasses import asdict
@@ -434,13 +435,18 @@ def main(
     )
 
     # Save final checkpoint
+    final_checkpoint_dir = out_dir / "final"
     save_checkpoint(
         fabric,
         state,
         tokenizer_dir,
-        out_dir / "final" / "lit_model.pth",
+        final_checkpoint_dir / "lit_model.pth",
         checkpoint_hparams=checkpoint_hparams,
     )
+    if train.latest_save_interval is not None:
+        # A cleanly completed run may stop between rolling intervals. Make
+        # automatic resume select the truly newest state in that case.
+        point_latest_checkpoint_at(fabric, out_dir, final_checkpoint_dir)
 
     total_tokens = state["step_count"] * train.global_batch_size * model.max_seq_length
     segment_tokens = (
@@ -818,14 +824,39 @@ def fit(
             fabric.log_dict(metrics, step=state["step_count"])
             fabric.barrier()
 
-        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
+        milestone_due = (
+            train.save_interval is not None
+            and not is_accumulating
+            and state["step_count"] % train.save_interval == 0
+        )
+        latest_due = (
+            train.latest_save_interval is not None
+            and not is_accumulating
+            and state["step_count"] % train.latest_save_interval == 0
+        )
+        milestone_dir = out_dir / f"step-{state['step_count']:08d}"
+
+        if milestone_due:
             save_checkpoint(
                 fabric,
                 state,
                 tokenizer_dir,
-                out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth",
+                milestone_dir / "lit_model.pth",
                 checkpoint_hparams=checkpoint_hparams,
             )
+
+        if latest_due:
+            if milestone_due:
+                # Reuse the milestone rather than writing the same large state twice.
+                point_latest_checkpoint_at(fabric, out_dir, milestone_dir)
+            else:
+                save_rolling_checkpoint(
+                    fabric,
+                    state,
+                    tokenizer_dir,
+                    out_dir,
+                    checkpoint_hparams=checkpoint_hparams,
+                )
 
         if (
             byte_runtime.reconstruction_due(state["step_count"])
@@ -981,6 +1012,74 @@ def save_checkpoint(fabric, state, tokenizer_dir, checkpoint_file, checkpoint_hp
         if tokenizer_dir is not None:
             copy_config_files(tokenizer_dir, checkpoint_file.parent)
         save_config(model.config, checkpoint_file.parent)
+
+
+def _remove_checkpoint_path(path: Path) -> None:
+    """Remove a checkpoint directory or symlink without following symlinks."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def point_latest_checkpoint_at(fabric, out_dir: Path, checkpoint_dir: Path) -> None:
+    """Atomically repoint ``out_dir/latest`` at an already-complete checkpoint."""
+    fabric.barrier()
+    if fabric.global_rank == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        latest = out_dir / "latest"
+        next_link = out_dir / ".latest-next"
+        old_target = None
+
+        if latest.is_symlink():
+            candidate = latest.parent / os.readlink(latest)
+            if candidate.name.startswith(".latest-step-"):
+                old_target = candidate
+
+        _remove_checkpoint_path(next_link)
+        next_link.symlink_to(os.path.relpath(checkpoint_dir, out_dir), target_is_directory=True)
+
+        if latest.exists() and not latest.is_symlink():
+            # A legacy real directory cannot be atomically replaced by a symlink.
+            legacy = out_dir / ".latest-legacy"
+            _remove_checkpoint_path(legacy)
+            os.replace(latest, legacy)
+            os.replace(next_link, latest)
+            _remove_checkpoint_path(legacy)
+        else:
+            os.replace(next_link, latest)
+
+        if old_target is not None and old_target != checkpoint_dir:
+            _remove_checkpoint_path(old_target)
+
+        # Clean abandoned rolling slots from interrupted prior updates. Never
+        # touch permanent step-* checkpoints.
+        for candidate in out_dir.glob(".latest-step-*"):
+            if candidate != checkpoint_dir:
+                _remove_checkpoint_path(candidate)
+    fabric.barrier()
+
+
+def save_rolling_checkpoint(
+    fabric,
+    state,
+    tokenizer_dir,
+    out_dir: Path,
+    checkpoint_hparams=None,
+) -> None:
+    """Write a recoverable checkpoint, then atomically replace ``latest``."""
+    rolling_dir = out_dir / f".latest-step-{state['step_count']:08d}"
+    if fabric.global_rank == 0:
+        _remove_checkpoint_path(rolling_dir)
+    fabric.barrier()
+    save_checkpoint(
+        fabric,
+        state,
+        tokenizer_dir,
+        rolling_dir / "lit_model.pth",
+        checkpoint_hparams=checkpoint_hparams,
+    )
+    point_latest_checkpoint_at(fabric, out_dir, rolling_dir)
 
 
 def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resume) -> None:

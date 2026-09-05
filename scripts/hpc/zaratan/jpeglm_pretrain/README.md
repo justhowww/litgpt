@@ -3,9 +3,18 @@
 This launcher trains the planned mixed AR/FIM MEGABYTE model on the JPEG-LM
 corpus: 32 layers, width 4096, 64 heads (~7B global parameters), patch size 8,
 16,384 global positions (~131K raw-byte capacity), full-sequence PSM FIM,
-learned EOS, and a held-out-video validation split.
+learned EOS, one IDR-anchored GOP per sample, and a held-out-video validation
+split. With the JPEG-LM encoder this is normally 16 frames; a final partial GOP
+may be shorter.
 
 The job uses 4 H100s with FSDP and Transformer-block activation checkpointing.
+Each full training-state checkpoint is approximately 65 GB. The full launcher
+therefore keeps one rolling `latest` checkpoint updated every 1,000 optimizer
+steps and saves permanent `step-*` milestones only every 100,000 steps. When
+both intervals coincide, `latest` points to the milestone instead of duplicating
+it. Automatic resume prefers `latest`. Override these independently with
+`LATEST_SAVE_INTERVAL` and `SAVE_INTERVAL`.
+
 Run the exact-shape pilot before the full job:
 
 ```bash
@@ -29,15 +38,15 @@ has produced the final manifest and index.
 
 The pilot intentionally disables `torch.compile` so an OOM can be attributed to
 the model rather than compilation. It warns rather than stops on low FIM
-eligibility because it is only a systems test. If it passes, repeat once with
-`COMPILE=1`.
+eligibility because it is only a systems test. It saves only the final
+checkpoint, avoiding a duplicate 65 GB step checkpoint. If it passes, repeat
+once with `COMPILE=1`.
 
 The full launcher requires at least 900,000 manifest rows and refuses to submit
-if fewer than 50% of non-IDR slices can host the configured FIM hole. The latter
-guard matters because JPEG-LM P frames can be much smaller than the previous
-BSCV-style slices. Inspect the report and set `FIM_MIN_GAP` and
-`SLICE_HEADER_GUARD_BYTES` deliberately; do not override the check merely to get
-the job into the queue.
+if fewer than 50% of non-IDR slices can host the configured FIM hole. JPEG-LM
+uses no protected prefix by default (`SLICE_HEADER_GUARD_BYTES=0`), so FIM may
+reconstruct the frame's start code and headers as well as its payload. With a
+64-byte minimum hole, a frame needs at least 65 bytes to be eligible.
 
 ```bash
 cd /nfshomes/huangyh/litgpt
@@ -45,13 +54,14 @@ cd /nfshomes/huangyh/litgpt
 STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
 FIM_MIN_GAP=64 \
 FIM_MAX_GAP=1400 \
-SLICE_HEADER_GUARD_BYTES=64 \
+SLICE_HEADER_GUARD_BYTES=0 \
+WINDOW_UNIT=gop \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit.sh
 ```
 
-The exact settings above are the old experimental defaults, not yet validated
-for JPEG-LM. The preflight is expected to reject them if they select mainly IDR
-frames. Change the values only after inspecting the finished corpus statistics.
+This intentionally makes header-crossing and whole-frame-prefix holes part of
+the training distribution. The deployment corruption placement remains an
+evaluation choice and need not use the same guard.
 
 To resume immediately after a wall-time stop:
 

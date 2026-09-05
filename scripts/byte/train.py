@@ -20,6 +20,7 @@ from litgpt.byte.data import (
     FIM_FORMATS,
     FIM_LOSS_SCOPES,
     REFERENCE_MODES,
+    WINDOW_UNITS,
     ByteDataConfig,
     ByteDataModule,
     vocab_size_for_fim_format,
@@ -92,6 +93,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate", type=float, default=3e-5)
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=50)
+    parser.add_argument(
+        "--latest-save-interval",
+        type=int,
+        default=0,
+        help=(
+            "Update one rolling latest checkpoint at this optimizer-step interval; "
+            "0 disables it. This is independent of permanent --save-interval milestones."
+        ),
+    )
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-iters", type=int, default=10)
     parser.add_argument("--reconstruction-eval-interval", type=int, default=0)
@@ -188,6 +198,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Minimum VCL frames per stream window (dataset-mode=window).",
+    )
+    parser.add_argument(
+        "--window-unit",
+        choices=WINDOW_UNITS,
+        default="byte_budget",
+        help=(
+            "Window boundary policy for dataset-mode=window. byte_budget preserves "
+            "legacy multi-GOP packing; gop emits exactly one IDR-anchored GOP per "
+            "sample and never splits a GOP."
+        ),
     )
     parser.add_argument("--p-fim", type=float, default=0.0)
     parser.add_argument(
@@ -630,6 +650,7 @@ def main() -> None:
         split_by_video=args.split_by_video,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
+        window_unit=args.window_unit,
     )
     max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
     data = ByteDataModule(
@@ -643,6 +664,7 @@ def main() -> None:
     )
     train = TrainArgs(
         save_interval=args.save_interval,
+        latest_save_interval=args.latest_save_interval or None,
         log_interval=1,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,

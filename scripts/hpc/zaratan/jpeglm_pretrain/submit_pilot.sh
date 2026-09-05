@@ -12,7 +12,10 @@ export STEPS=${STEPS:-20}
 export WARMUP_STEPS=${WARMUP_STEPS:-2}
 export EVAL_INTERVAL=${EVAL_INTERVAL:-10}
 export EVAL_ITERS=${EVAL_ITERS:-2}
-export SAVE_INTERVAL=${SAVE_INTERVAL:-20}
+# The final checkpoint already verifies saving. Avoid a second 65 GB milestone
+# and intermediate rolling writes during this 20-step systems pilot.
+export SAVE_INTERVAL=${SAVE_INTERVAL:-1000000}
+export LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-1000000}
 export COMPILE=${COMPILE:-0}
 export MIN_MANIFEST_ROWS=${MIN_MANIFEST_ROWS:-1}
 # This pilot tests the model's memory/throughput shape, not the final data

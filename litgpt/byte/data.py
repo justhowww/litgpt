@@ -66,6 +66,8 @@ FIM_LOSS_SCOPES = ("span", "full")
 FIMLossScope = Literal["span", "full"]
 DATASET_MODES = ("slice", "window")
 DatasetMode = Literal["slice", "window"]
+WINDOW_UNITS = ("byte_budget", "gop")
+WindowUnit = Literal["byte_budget", "gop"]
 
 
 def vocab_size_for_fim_format(fim_format: FIMFormat, use_eos: bool = False) -> int:
@@ -145,6 +147,10 @@ class ByteDataConfig:
     # only in masking, so H0 is the p_fim=0 case of one pipeline. See 0616.md.
     dataset_mode: DatasetMode = "slice"
     window_min_frames: int = 2  # Minimum VCL NALs per stream window ("window" mode).
+    # "byte_budget" preserves the legacy behavior of packing across GOPs until the
+    # byte budget is full. "gop" makes every window one IDR-anchored GOP and never
+    # exposes an earlier GOP as context for a later repair target.
+    window_unit: WindowUnit = "byte_budget"
     # NB: counts VCL NALs, which == frames only for one-slice-per-frame corpora. Under
     # AVC-LM's slice-max-mbs=1 (one slice per macroblock) this becomes a min-slices gate.
 
@@ -1044,6 +1050,7 @@ class ByteStreamWindowDataset(Dataset):
         fim_min_gap: int = 64,
         fim_max_gap: int = 1400,
         frame_guard_bytes: int = 64,
+        window_unit: WindowUnit = "byte_budget",
         resample_fim: bool = False,
         fixed_fim_holes_per_window: int = 0,
         nal_index: dict[str, list[NALUnit]] | None = None,
@@ -1064,6 +1071,8 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError("require 1 <= fim_min_gap <= fim_max_gap")
         if frame_guard_bytes < 0:
             raise ValueError("frame_guard_bytes must be non-negative")
+        if window_unit not in WINDOW_UNITS:
+            raise ValueError(f"window_unit must be one of {WINDOW_UNITS}")
         if fixed_fim_holes_per_window < 0:
             raise ValueError("fixed_fim_holes_per_window must be non-negative")
         self.rows = rows
@@ -1076,6 +1085,7 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_min_gap = fim_min_gap
         self.fim_max_gap = fim_max_gap
         self.frame_guard_bytes = frame_guard_bytes
+        self.window_unit = window_unit
         self.resample_fim = resample_fim
         self.fixed_fim_holes_per_window = fixed_fim_holes_per_window
         self._fixed_hole_cache: dict[
@@ -1088,11 +1098,22 @@ class ByteStreamWindowDataset(Dataset):
         self.fixed_indices: frozenset[int] = frozenset()
         self.seed = seed
         self.ignore_index = ignore_index
+        self.gops_seen = 0
+        self.gops_oversized = 0
+        self.gops_too_short = 0
         self.samples, self.nal_index = self._build_index(nal_index)
         if not self.samples:
             raise ValueError(
                 "No usable stream windows found. Check max_seq_length, min_frames, "
                 "and that the corpus contains IDR-anchored GOPs."
+            )
+        if self.window_unit == "gop":
+            print(
+                f"[window-gop] usable={len(self.samples):,}/{self.gops_seen:,} "
+                f"oversized={self.gops_oversized:,} "
+                f"below_min_frames={self.gops_too_short:,} "
+                f"byte_budget={self.max_seq_length - (1 if self.use_eos else 0):,}",
+                flush=True,
             )
         if self.p_fim > 0:
             self._assert_fim_reachable()
@@ -1122,16 +1143,45 @@ class ByteStreamWindowDataset(Dataset):
         return samples, nal_index
 
     def _windows_for_video(self, path: Path, nals: list[NALUnit]) -> list[WindowSample]:
-        """Non-overlapping windows, each beginning at an IDR boundary and packed
-        forward by whole NALs until the byte budget is hit."""
+        """Build IDR-anchored windows without ever splitting a NAL.
+
+        ``byte_budget`` preserves the original behavior: start at an IDR access
+        unit and pack across later GOPs until the byte budget is full. ``gop`` ends
+        immediately before the parameter sets/SEI leading the next IDR, so the
+        window contains exactly one independently decodable GOP.
+        """
         windows: list[WindowSample] = []
         # Window AR predicts one extra SEQ_EOS token when enabled. Reserve its
         # position here so collate never truncates that final supervised label.
         window_byte_budget = self.max_seq_length - (1 if self.use_eos else 0)
         n = len(nals)
         idr_positions = [k for k, nal in enumerate(nals) if nal.nal_type == 5]
-        used_until = 0  # next window must start at or after this NAL index
+        anchors: list[tuple[int, int]] = []
         for k in idr_positions:
+            start = k
+            while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
+                start -= 1
+            anchors.append((start, k))
+
+        if self.window_unit == "gop":
+            for index, (start, _) in enumerate(anchors):
+                self.gops_seen += 1
+                end = anchors[index + 1][0] if index + 1 < len(anchors) else n
+                if end <= start:
+                    continue
+                total = sum(nal.end - nal.start for nal in nals[start:end])
+                if total > window_byte_budget:
+                    self.gops_oversized += 1
+                    continue
+                vcl = sum(nal.nal_type in VCL_NAL_TYPES for nal in nals[start:end])
+                if vcl >= self.min_frames:
+                    windows.append(WindowSample(path, start, end, vcl))
+                else:
+                    self.gops_too_short += 1
+            return windows
+
+        used_until = 0  # next window must start at or after this NAL index
+        for start, k in anchors:
             # Back up to include the access unit's leading non-VCL NALs (SPS/PPS, plus
             # any SEI/AUD wedged between them and the IDR) so the window carries its
             # parameter sets and is self-contained/decodable from its first byte. Stop at
@@ -1139,9 +1189,6 @@ class ByteStreamWindowDataset(Dataset):
             # version stepped back only over PARAMETER_SET_NAL_TYPES; when an SEI sat
             # between the PPS and the IDR that stopped the backup at the SEI, so those
             # windows silently omitted SPS/PPS (baselines up to and including xl-avclm).
-            start = k
-            while start - 1 >= 0 and nals[start - 1].nal_type not in VCL_NAL_TYPES:
-                start -= 1
             if start < used_until:
                 continue  # this GOP is already inside a previously packed window
             total = 0
@@ -1941,6 +1988,7 @@ class ByteDataModule(DataModule):
                     fim_min_gap=self.config.fim_min_gap,
                     fim_max_gap=self.config.fim_max_gap,
                     frame_guard_bytes=self.config.slice_header_guard_bytes,
+                    window_unit=self.config.window_unit,
                     fixed_fim_holes_per_window=(
                         self.config.fixed_fim_holes_per_window
                     ),
@@ -2087,6 +2135,7 @@ class ByteDataModule(DataModule):
             "val_fraction": self.config.val_fraction,
             "seed": self.config.seed,
             "dataset_mode": self.config.dataset_mode,
+            "window_unit": self.config.window_unit,
             "p_fim": self.config.p_fim,
             "fim_format": self.config.fim_format,
             "fim_loss_scope": self.config.fim_loss_scope,

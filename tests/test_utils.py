@@ -383,6 +383,12 @@ def test_find_resume_path(tmp_path):
     assert find_resume_path(resume=True, out_dir=tmp_path) == (tmp_path / "step-003" / "lit_model.pth")
     assert find_resume_path(resume="auto", out_dir=tmp_path) == (tmp_path / "step-003" / "lit_model.pth")
 
+    (tmp_path / ".latest-step-004").mkdir()
+    (tmp_path / ".latest-step-004" / "lit_model.pth").touch()
+    (tmp_path / "latest").symlink_to(".latest-step-004", target_is_directory=True)
+    assert find_resume_path(resume=True, out_dir=tmp_path) == (tmp_path / "latest" / "lit_model.pth")
+    assert find_resume_path(resume="auto", out_dir=tmp_path) == (tmp_path / "latest" / "lit_model.pth")
+
 
 @pytest.fixture
 def model_parameters():

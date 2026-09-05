@@ -40,12 +40,17 @@ FIM_SPAN_LOSS_WEIGHT=${FIM_SPAN_LOSS_WEIGHT:-0}
 EOS_AUX_LOSS_WEIGHT=${EOS_AUX_LOSS_WEIGHT:-0}
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
 FIM_MAX_GAP=${FIM_MAX_GAP:-1400}
-SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-64}
+# Deliberately expose start-code and header reconstruction during JPEG-LM FIM.
+SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-0}
 WINDOW_MIN_FRAMES=${WINDOW_MIN_FRAMES:-2}
+WINDOW_UNIT=${WINDOW_UNIT:-gop}
 
 EVAL_INTERVAL=${EVAL_INTERVAL:-250}
 EVAL_ITERS=${EVAL_ITERS:-20}
-SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
+# A full training-state checkpoint is ~65 GB. Keep permanent milestones sparse
+# while updating one rolling recovery checkpoint at the old cadence.
+SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
+LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-1000}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 COMPILE=${COMPILE:-1}
 ACTIVATION_CHECKPOINTING=${ACTIVATION_CHECKPOINTING:-1}
@@ -110,6 +115,7 @@ cmd=(
     --n-head "${N_HEAD}"
     --dataset-mode window
     --window-min-frames "${WINDOW_MIN_FRAMES}"
+    --window-unit "${WINDOW_UNIT}"
     --p-fim "${P_FIM}"
     --fim-format "${FIM_FORMAT}"
     --fim-loss-scope "${FIM_LOSS_SCOPE}"
@@ -142,6 +148,7 @@ cmd=(
     --eval-interval "${EVAL_INTERVAL}"
     --eval-iters "${EVAL_ITERS}"
     --save-interval "${SAVE_INTERVAL}"
+    --latest-save-interval "${LATEST_SAVE_INTERVAL}"
     --resume
 )
 
@@ -157,7 +164,8 @@ fi
 
 echo "[jpeglm] model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} raw_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
 echo "[jpeglm] rows=${MAX_ROWS} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} micro=${MICRO_BATCH_SIZE} devices=${DEVICES} activation_checkpointing=${ACTIVATION_CHECKPOINTING} compile=${COMPILE}"
-echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} EOS=on split=held-out-video"
+echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} EOS=on split=held-out-video"
+echo "[jpeglm] checkpoints: rolling latest every ${LATEST_SAVE_INTERVAL} steps; permanent milestone every ${SAVE_INTERVAL} steps"
 
 exec {training_lock_fd}>"${OUT_DIR}/.training.lock"
 if ! flock -n "${training_lock_fd}"; then

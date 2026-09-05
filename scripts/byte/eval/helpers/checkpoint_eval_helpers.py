@@ -26,6 +26,7 @@ from litgpt.byte.data import (
     BYTE_VOCAB_SIZE,
     FIM_FORMATS,
     REFERENCE_MODES,
+    WINDOW_UNITS,
     ByteDataConfig,
     ByteDataModule,
 )
@@ -59,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=("fim",), default="fim")
     parser.add_argument("--dataset-mode", choices=("slice", "window"), default="slice")
     parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument(
+        "--window-unit",
+        choices=WINDOW_UNITS,
+        default="byte_budget",
+        help="Use gop for checkpoints trained with one IDR-anchored GOP per sample.",
+    )
     parser.add_argument("--fixed-fim-holes", action="store_true")
     parser.add_argument("--fixed-fim-holes-per-window", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.05)
@@ -151,6 +158,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[ReconstructionSample]:
         # architecturally mismatched) FIM samples.
         dataset_mode=getattr(args, "dataset_mode", "slice"),
         window_min_frames=getattr(args, "window_min_frames", 2),
+        window_unit=getattr(args, "window_unit", "byte_budget"),
         fixed_fim_holes=getattr(args, "fixed_fim_holes", False),
         fixed_fim_holes_per_window=getattr(args, "fixed_fim_holes_per_window", 0),
     )

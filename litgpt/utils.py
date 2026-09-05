@@ -57,7 +57,15 @@ def find_resume_path(resume: bool | Literal["auto"] | Path, out_dir: Path) -> Pa
     if not resume or isinstance(resume, Path):
         return resume
 
-    resume_path = max(out_dir.rglob("step-*/*.pth"), key=(lambda p: int(p.parent.name.split("-")[1])), default=None)
+    # A rolling checkpoint is newer than or equal to the latest permanent
+    # milestone by construction. Prefer it without loading a potentially huge
+    # checkpoint merely to inspect its saved step counter.
+    latest_path = out_dir / "latest" / "lit_model.pth"
+    resume_path = latest_path if latest_path.is_file() else max(
+        out_dir.rglob("step-*/*.pth"),
+        key=(lambda p: int(p.parent.name.split("-")[1])),
+        default=None,
+    )
     if resume == "auto":
         return resume_path
     if resume is True and resume_path is None:

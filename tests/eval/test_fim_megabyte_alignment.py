@@ -98,6 +98,7 @@ def test_build_eval_samples_uses_recorded_full_sequence_layout(
 
         def __init__(self, *args, **kwargs) -> None:
             assert kwargs["fim_loss_scope"] == "full"
+            assert kwargs["window_unit"] == "gop"
 
         def __getitem__(self, idx: int) -> dict:
             assert idx == 0
@@ -111,7 +112,7 @@ def test_build_eval_samples_uses_recorded_full_sequence_layout(
 
     split_file = tmp_path / "train_split.json"
     split_file.write_text(
-        '{"fim_loss_scope": "full", "windows": '
+        '{"fim_loss_scope": "full", "window_unit": "gop", "windows": '
         '[{"h264_path": "synthetic.h264", "start_nal": 0, "end_nal": 1}]}\n',
         encoding="utf-8",
     )
@@ -125,6 +126,7 @@ def test_build_eval_samples_uses_recorded_full_sequence_layout(
 
     args = SimpleNamespace(
         fim_loss_scope="auto",
+        window_unit="auto",
         manifest=tmp_path / "manifest.jsonl",
         max_manifest_rows=0,
         nal_index_path=None,
@@ -145,6 +147,7 @@ def test_build_eval_samples_uses_recorded_full_sequence_layout(
 
     samples = FIM.build_eval_samples(args)
     assert args.fim_loss_scope == "full"
+    assert args.window_unit == "gop"
     assert len(samples) == 1
     sample = samples[0]
     assert sample.target_bytes == window[split : split + gap]

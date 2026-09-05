@@ -39,6 +39,7 @@ if str(_REPO_ROOT) not in sys.path:
 from litgpt.byte.data import (  # noqa: E402
     BYTE_VOCAB_SIZE,
     SEQ_EOS_ID,
+    WINDOW_UNITS,
     ByteDataConfig,
     ByteDataModule,
 )
@@ -96,6 +97,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument("--window-unit", choices=WINDOW_UNITS, default="byte_budget")
     parser.add_argument(
         "--ar-prefix-frames",
         type=int,
@@ -470,6 +472,7 @@ def build_ar_verify_samples(args: argparse.Namespace) -> list[FreeRunSample]:
         seed=args.seed,
         dataset_mode="window",
         window_min_frames=args.window_min_frames,
+        window_unit=args.window_unit,
     )
     data = ByteDataModule(
         manifest_path=args.manifest,

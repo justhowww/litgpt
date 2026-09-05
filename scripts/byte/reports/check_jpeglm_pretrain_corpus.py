@@ -8,6 +8,7 @@ This report checks the persistent index before an expensive GPU job is submitted
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 from pathlib import Path
 
@@ -27,9 +28,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def count_manifest_rows(path: Path) -> int:
-    with path.open("rb") as handle:
-        return sum(1 for line in handle if line.strip())
+def count_manifest_rows(path: Path) -> tuple[int, int, int]:
+    total = 0
+    usable = 0
+    usable_paths: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            total += 1
+            row = json.loads(line)
+            if row.get("status") == "ok" and row.get("h264_path"):
+                usable += 1
+                usable_paths.add(str(row["h264_path"]))
+    return total, usable, len(usable_paths)
 
 
 def main() -> None:
@@ -45,10 +57,10 @@ def main() -> None:
     if not args.nal_index_path.is_file():
         raise SystemExit(f"NAL index not found: {args.nal_index_path}")
 
-    row_count = count_manifest_rows(args.manifest)
-    if row_count < args.min_manifest_rows:
+    total_rows, usable_rows, unique_usable_paths = count_manifest_rows(args.manifest)
+    if usable_rows < args.min_manifest_rows:
         raise SystemExit(
-            f"Manifest has {row_count:,} rows; require at least "
+            f"Manifest has {usable_rows:,} usable rows; require at least "
             f"{args.min_manifest_rows:,} for this launch"
         )
 
@@ -92,8 +104,14 @@ def main() -> None:
             )
 
     print("JPEG-LM pretraining corpus preflight")
-    print(f"  manifest rows: {row_count:,}")
+    print(f"  manifest rows: {total_rows:,} total, {usable_rows:,} usable")
+    print(f"  unique usable paths: {unique_usable_paths:,}")
     print(f"  indexed files: {indexed_files:,}")
+    if indexed_files < unique_usable_paths:
+        raise SystemExit(
+            f"NAL index has {indexed_files:,} files but the manifest has "
+            f"{unique_usable_paths:,} unique usable paths. Resume indexing."
+        )
     print(
         "  FIM requirement: frame bytes >= "
         f"{args.frame_guard_bytes + args.fim_min_gap + 1} "

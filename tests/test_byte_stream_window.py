@@ -149,3 +149,42 @@ def test_multi_gop_two_nonoverlapping_windows(tmp_path):
     assert (b.start_nal, b.end_nal) == (5, 10)
     # Non-overlapping.
     assert a.end_nal <= b.start_nal
+
+
+def test_gop_window_unit_stops_at_next_idr_with_large_budget(tmp_path):
+    # A large legacy byte-budget window would absorb both GOPs. GOP mode must
+    # still emit two independent windows and assign each SPS/PPS pair to the IDR
+    # that follows it.
+    specs = [
+        (7, 8), (8, 4), (5, 40), (1, 20), (1, 20),  # GOP 1
+        (7, 8), (8, 4), (5, 40), (1, 20), (1, 20),  # GOP 2
+    ]
+    data = _make_stream(specs)
+    path, nal_index = _write(tmp_path, "two_gops.h264", data)
+    rows = [{"h264_path": str(path), "status": "ok"}]
+
+    legacy = ByteStreamWindowDataset(
+        rows,
+        max_seq_length=len(data) + 1,
+        min_frames=2,
+        nal_index=nal_index,
+    )
+    assert [(s.start_nal, s.end_nal) for s in legacy.samples] == [(0, 10)]
+
+    per_gop = ByteStreamWindowDataset(
+        rows,
+        max_seq_length=len(data) + 1,
+        min_frames=2,
+        window_unit="gop",
+        nal_index=nal_index,
+    )
+    assert [(s.start_nal, s.end_nal, s.num_frames) for s in per_gop.samples] == [
+        (0, 5, 3),
+        (5, 10, 3),
+    ]
+    assert per_gop.gops_seen == 2
+    assert per_gop.gops_oversized == 0
+    assert per_gop.gops_too_short == 0
+    for sample in per_gop.samples:
+        sample_nals = nal_index[str(path)][sample.start_nal : sample.end_nal]
+        assert sum(nal.nal_type == 5 for nal in sample_nals) == 1

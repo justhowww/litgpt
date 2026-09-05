@@ -10,6 +10,8 @@ class TrainArgs:
 
     save_interval: int | None = 1000
     """Number of optimizer steps between saving checkpoints"""
+    latest_save_interval: int | None = None
+    """Number of optimizer steps between updates to the single rolling ``latest`` checkpoint"""
     log_interval: int = 1
     """Number of iterations between logging calls"""
     global_batch_size: int = 64
@@ -39,6 +41,10 @@ class TrainArgs:
     min_lr: float = 6e-5
 
     def __post_init__(self) -> None:
+        if self.save_interval is not None and self.save_interval <= 0:
+            raise ValueError("save_interval must be positive or None")
+        if self.latest_save_interval is not None and self.latest_save_interval <= 0:
+            raise ValueError("latest_save_interval must be positive or None")
         if self.lr_warmup_fraction and self.lr_warmup_steps:
             raise ValueError(
                 "Can't provide both `--train.lr_warmup_fraction` and `--train.lr_warmup_steps`. Choose one."

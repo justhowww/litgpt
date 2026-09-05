@@ -46,6 +46,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from litgpt.byte.data import (  # noqa: E402
     FIM_FORMATS,
+    WINDOW_UNITS,
     ByteStreamWindowDataset,
     default_nal_index_path,
     load_manifest_rows,
@@ -109,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-window-bytes", type=int, default=16384)
     parser.add_argument("--block-size", type=int, default=16384)
     parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument("--window-unit", choices=WINDOW_UNITS, default="byte_budget")
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="psm")
     parser.add_argument(
         "--use-eos",
@@ -167,6 +169,7 @@ def build_dataset(args: argparse.Namespace) -> ByteStreamWindowDataset:
         rows,
         max_seq_length=args.max_window_bytes,
         min_frames=args.window_min_frames,
+        window_unit=args.window_unit,
         p_fim=1.0,
         fim_format=args.fim_format,
         use_eos=args.use_eos,
@@ -276,6 +279,7 @@ def summarize(rows: list[ContextWindowRow], args: argparse.Namespace) -> dict[st
         "max_manifest_rows": args.max_manifest_rows,
         "num_samples": len(rows),
         "context_frames": args.context_frames,
+        "window_unit": args.window_unit,
         "include_metadata": args.include_metadata,
         "fim_format": args.fim_format,
         "use_eos": args.use_eos,

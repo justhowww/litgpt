@@ -67,6 +67,7 @@ from litgpt.byte.data import (  # noqa: E402
     SEQ_EOS_ID,
     VCL_NAL_TYPES,
     ByteStreamWindowDataset,
+    WINDOW_UNITS,
     default_nal_index_path,
     load_manifest_rows,
     load_nal_index,
@@ -226,6 +227,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-window-bytes", type=int, default=16384)
     parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument(
+        "--window-unit",
+        choices=("auto", *WINDOW_UNITS),
+        default="auto",
+        help=(
+            "Window boundary policy. auto reads train_split.json and falls back "
+            "to the legacy byte_budget policy for older checkpoints."
+        ),
+    )
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--split-by-video", action="store_true")
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="psm")
@@ -453,6 +463,27 @@ def _resolve_fim_loss_scope(args: argparse.Namespace) -> str:
     return "span"
 
 
+def _resolve_window_unit(args: argparse.Namespace) -> str:
+    """Recover the training window policy before rebuilding exact eval samples."""
+    requested = getattr(args, "window_unit", "auto")
+    if requested != "auto":
+        return str(requested)
+    if args.train_split_file is not None:
+        split = json.loads(args.train_split_file.read_text(encoding="utf-8"))
+        recorded = split.get("window_unit")
+        if recorded in WINDOW_UNITS:
+            print(
+                f"Window unit: {recorded} (from {args.train_split_file})",
+                flush=True,
+            )
+            return str(recorded)
+    print(
+        "Window unit: byte_budget (auto fallback; split file has no recorded policy)",
+        flush=True,
+    )
+    return "byte_budget"
+
+
 def _verify_fixed_hole_replay(
     expected: dict[str, Any],
     meta: dict[str, Any],
@@ -606,6 +637,7 @@ def _corruption_frame_type(
 
 def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
     args.fim_loss_scope = _resolve_fim_loss_scope(args)
+    args.window_unit = _resolve_window_unit(args)
     hole_placement = getattr(args, "hole_placement", "training_random")
     corr_len_bytes = getattr(args, "corr_len_bytes", None)
     if hole_placement == "corrupt_gen_frame":
@@ -654,6 +686,7 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
         fim_min_gap=eval_min_gap,
         fim_max_gap=eval_max_gap,
         frame_guard_bytes=frame_guard_bytes,
+        window_unit=args.window_unit,
         resample_fim=False,
         nal_index=nal_index,
         seed=args.seed,
@@ -2410,6 +2443,7 @@ def main() -> None:
                 "mode": "fim_avclm",
                 "stop_mode": stop_mode,
                 "slice_layout": args.slice_layout,
+                "window_unit": args.window_unit,
                 "hole_placement": args.hole_placement,
                 "corr_frame_type": args.corr_frame_type,
                 "corr_len_bytes": args.corr_len_bytes,

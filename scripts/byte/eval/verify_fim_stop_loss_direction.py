@@ -20,6 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from litgpt.byte.data import WINDOW_UNITS  # noqa: E402
 from litgpt.byte.grpo import (  # noqa: E402
     build_fim_stop_patch_inputs,
     build_group_patch_inputs,
@@ -63,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slice-header-guard-bytes", type=int, default=64)
     parser.add_argument("--max-target-bytes", type=int, default=1400)
     parser.add_argument("--window-min-frames", type=int, default=2)
+    parser.add_argument("--window-unit", choices=WINDOW_UNITS, default="byte_budget")
     parser.add_argument("--fim-slice-layout", choices=("macroblock", "frame"), default="macroblock")
     parser.add_argument("--ar-prefix-frames", type=int, default=4)
     parser.add_argument("--ar-cont-frames", type=int, default=2)
