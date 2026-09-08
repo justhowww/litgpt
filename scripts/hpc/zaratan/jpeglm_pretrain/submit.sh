@@ -12,6 +12,7 @@ NAL_INDEX=${NAL_INDEX:-"${STAGED_CORPUS}/nal_index.sqlite"}
 MODEL_TAG=${MODEL_TAG:-byte-jpeglm-7b-megabyte-patch8-fim-p050-fullseq-eos-1m}
 OUT_DIR=${OUT_DIR:-"${STAGED_CORPUS}/runs/${MODEL_TAG}"}
 SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-metzler-prj-cmsc}
+SBATCH_MEM=${SBATCH_MEM:-320G}
 JOB_SCRIPT=${JOB_SCRIPT:-"${SCRIPT_DIR}/train_h100_4gpu.sbatch"}
 
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
@@ -50,6 +51,7 @@ sbatch_args=(
     --parsable
     --export=ALL
     --account="${SBATCH_ACCOUNT}"
+    --mem="${SBATCH_MEM}"
     --output="${OUT_DIR}/logs/%x-%j.out"
     --error="${OUT_DIR}/logs/%x-%j.err"
 )
@@ -67,4 +69,5 @@ fi
 job_id=$(sbatch "${sbatch_args[@]}" "${JOB_SCRIPT}")
 echo "Submitted JPEG-LM pretraining job ${job_id}"
 echo "Output directory: ${OUT_DIR}"
+echo "Requested memory: ${SBATCH_MEM}"
 [[ -n "${AFTER_JOBID:-}" ]] && echo "Dependency: ${DEPENDENCY_TYPE}:${AFTER_JOBID}"

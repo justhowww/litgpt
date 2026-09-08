@@ -8,7 +8,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=256G
+#SBATCH --mem=320G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=slurm-%x-%j.out
 
