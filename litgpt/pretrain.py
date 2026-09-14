@@ -356,7 +356,17 @@ def main(
         free_run_config=free_run_eval,
         grpo_config=grpo,
     )
-    train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
+    if getattr(data, "uses_distributed_train_batch_sampler", False):
+        # Byte length bucketing already partitions each global microbatch across
+        # ranks. Asking Fabric to inject another DistributedSampler would either
+        # double-shard or replace that ordering. Validation still uses Fabric's
+        # ordinary distributed sampler.
+        train_dataloader = fabric.setup_dataloaders(
+            train_dataloader, use_distributed_sampler=False
+        )
+        val_dataloader = fabric.setup_dataloaders(val_dataloader)
+    else:
+        train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     state = {
         "model": model,
@@ -771,6 +781,18 @@ def fit(
                 supervised_tokens = (targets != -100).sum()
                 metrics["supervised_tokens"] = supervised_tokens
                 metrics["raw_tokens"] = model_inputs["idx"].numel()
+                token_counts = train_data.get("token_counts")
+                if isinstance(token_counts, dict) and "transformer_positions" in token_counts:
+                    valid_positions = token_counts["transformer_positions"].sum()
+                    allocated_positions = (
+                        model_inputs["idx"].shape[0] * model_inputs["idx"].shape[1]
+                    )
+                    metrics["training/padding_efficiency"] = (
+                        valid_positions / allocated_positions
+                    )
+                    metrics["training/padding_fraction"] = (
+                        1.0 - valid_positions / allocated_positions
+                    )
             # Peak GPU memory so far -- use it to size micro_batch_size. `reserved` is what
             # actually counts against the card (e.g. 48 GB a6000); it stabilizes within a
             # few steps, so the first log lines tell you the headroom. If reserved is well
@@ -911,6 +933,9 @@ def get_dataloaders(
     fabric: L.Fabric, data: DataModule, tokenizer: Tokenizer, train: TrainArgs, block_size: int
 ) -> tuple[DataLoader, DataLoader]:
     data.connect(tokenizer=tokenizer, batch_size=train.micro_batch_size, max_seq_length=block_size)
+    configure_distributed = getattr(data, "configure_distributed", None)
+    if configure_distributed is not None:
+        configure_distributed(rank=fabric.global_rank, world_size=fabric.world_size)
     with fabric.rank_zero_first():
         data.prepare_data()
     data.setup()

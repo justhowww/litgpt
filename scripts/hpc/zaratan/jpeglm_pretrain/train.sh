@@ -34,6 +34,10 @@ VAL_FRACTION=${VAL_FRACTION:-0.01}
 NUM_WORKERS=${NUM_WORKERS:-4}
 DEVICES=${DEVICES:-4}
 NUM_NODES=${NUM_NODES:-1}
+# Sort shuffled finite pools by GOP byte length before forming microbatches.
+# This reduces padding while preserving the examples and training objective.
+ENABLE_LENGTH_BUCKETING=${ENABLE_LENGTH_BUCKETING:-1}
+LENGTH_BUCKET_POOL_SIZE=${LENGTH_BUCKET_POOL_SIZE:-8192}
 
 P_FIM=${P_FIM:-0.5}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -106,6 +110,14 @@ if [[ "${SAVE_FINAL}" != "0" && "${SAVE_FINAL}" != "1" ]]; then
     echo "SAVE_FINAL must be 0 or 1" >&2
     exit 1
 fi
+if [[ "${ENABLE_LENGTH_BUCKETING}" != "0" && "${ENABLE_LENGTH_BUCKETING}" != "1" ]]; then
+    echo "ENABLE_LENGTH_BUCKETING must be 0 or 1" >&2
+    exit 1
+fi
+if (( LENGTH_BUCKET_POOL_SIZE < 1 )); then
+    echo "LENGTH_BUCKET_POOL_SIZE must be positive" >&2
+    exit 1
+fi
 WORLD_SIZE=$((DEVICES * NUM_NODES))
 if (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * WORLD_SIZE) != 0 )); then
     echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by MICRO_BATCH_SIZE*WORLD_SIZE=$((MICRO_BATCH_SIZE * WORLD_SIZE))" >&2
@@ -162,6 +174,13 @@ cmd=(
     --resume
 )
 
+if [[ "${ENABLE_LENGTH_BUCKETING}" == "1" ]]; then
+    cmd+=(
+        --length-bucketing
+        --length-bucket-pool-size "${LENGTH_BUCKET_POOL_SIZE}"
+    )
+fi
+
 if [[ "${SAVE_FINAL}" == "0" ]]; then
     cmd+=(--no-save-final)
 fi
@@ -178,6 +197,7 @@ fi
 
 echo "[jpeglm] model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} raw_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
 echo "[jpeglm] rows=${MAX_ROWS} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} micro=${MICRO_BATCH_SIZE} devices=${DEVICES} activation_checkpointing=${ACTIVATION_CHECKPOINTING} compile=${COMPILE}"
+echo "[jpeglm] length_bucketing=${ENABLE_LENGTH_BUCKETING} pool_size=${LENGTH_BUCKET_POOL_SIZE} (training only)"
 echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} EOS=on split=held-out-video"
 echo "[jpeglm] checkpoints: rolling latest every ${LATEST_SAVE_INTERVAL} steps; permanent milestone every ${SAVE_INTERVAL} steps; final=${SAVE_FINAL}"
 

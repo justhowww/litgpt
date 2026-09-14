@@ -218,6 +218,22 @@ def parse_args() -> argparse.Namespace:
             "sample and never splits a GOP."
         ),
     )
+    parser.add_argument(
+        "--length-bucketing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Sort shuffled finite pools of training windows by byte length before "
+            "forming microbatches. Reduces padding without changing examples, loss, "
+            "or batch size. Window mode only."
+        ),
+    )
+    parser.add_argument(
+        "--length-bucket-pool-size",
+        type=int,
+        default=8192,
+        help="Number of shuffled windows sorted per length-bucketing pool.",
+    )
     parser.add_argument("--p-fim", type=float, default=0.0)
     parser.add_argument(
         "--fixed-fim-holes",
@@ -660,6 +676,8 @@ def main() -> None:
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
         window_unit=args.window_unit,
+        length_bucketing=args.length_bucketing,
+        length_bucket_pool_size=args.length_bucket_pool_size,
     )
     max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
     data = ByteDataModule(

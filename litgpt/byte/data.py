@@ -28,6 +28,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from litgpt.byte import h264_syntax as HS
+from litgpt.byte.sampling import DistributedLengthBucketBatchSampler
 from litgpt.data.base import DataModule
 from litgpt.tokenizer import Tokenizer
 
@@ -151,6 +152,13 @@ class ByteDataConfig:
     # byte budget is full. "gop" makes every window one IDR-anchored GOP and never
     # exposes an earlier GOP as context for a later repair target.
     window_unit: WindowUnit = "byte_budget"
+    # Group similarly sized window samples before collation so less compute is
+    # spent on padding. This changes only training-sample order; examples, loss,
+    # local/global batch sizes, and validation remain unchanged.
+    length_bucketing: bool = False
+    # Number of shuffled samples sorted at a time. A finite pool preserves
+    # stochastic order while making neighboring microbatches similar in length.
+    length_bucket_pool_size: int = 8192
     # NB: counts VCL NALs, which == frames only for one-slice-per-frame corpora. Under
     # AVC-LM's slice-max-mbs=1 (one slice per macroblock) this becomes a min-slices gate.
 
@@ -974,6 +982,10 @@ class WindowSample:
     end_nal: int  # exclusive NAL index where the window ends
     num_frames: int  # number of VCL NALs in the window (== frames iff one slice/frame;
     # under slice-max-mbs=1 this is a slice count, not a frame count)
+    # Retain the length already computed while indexing. Re-deriving it in a
+    # shuffled sampler would defeat LazyNalIndex's bounded cache and issue one
+    # SQLite query for nearly every sampled window.
+    byte_length: int = 0
 
 
 class ByteStreamWindowDataset(Dataset):
@@ -1121,6 +1133,20 @@ class ByteStreamWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def sample_length(self, index: int) -> int:
+        """Return a window's byte length without reading its H.264 file."""
+        sample = self.samples[index]
+        byte_length = int(getattr(sample, "byte_length", 0))
+        if byte_length > 0:
+            return byte_length
+        # Backward compatibility for WindowSample objects restored from an old
+        # checkpoint that predates the cached byte_length field.
+        nals = self.nal_index[str(sample.h264_path)]
+        # Annex-B entries are contiguous: each NAL ends where the next starts.
+        # Endpoint subtraction is therefore the same as summing all NAL sizes,
+        # but remains O(1) when the corpus contains millions of windows.
+        return nals[sample.end_nal - 1].end - nals[sample.start_nal].start
+
     def _build_index(
         self, cached_nal_index: dict[str, list[NALUnit]] | None
     ) -> tuple[list[WindowSample], dict[str, list[NALUnit]]]:
@@ -1175,7 +1201,7 @@ class ByteStreamWindowDataset(Dataset):
                     continue
                 vcl = sum(nal.nal_type in VCL_NAL_TYPES for nal in nals[start:end])
                 if vcl >= self.min_frames:
-                    windows.append(WindowSample(path, start, end, vcl))
+                    windows.append(WindowSample(path, start, end, vcl, total))
                 else:
                     self.gops_too_short += 1
             return windows
@@ -1203,7 +1229,7 @@ class ByteStreamWindowDataset(Dataset):
                     vcl += 1
                 end += 1
             if vcl >= self.min_frames:
-                windows.append(WindowSample(path, start, end, vcl))
+                windows.append(WindowSample(path, start, end, vcl, total))
             used_until = max(used_until, end)
         return windows
 
@@ -1918,6 +1944,8 @@ class ByteDataModule(DataModule):
     )
     train_dataset: Dataset | None = field(default=None, init=False, repr=False)
     val_dataset: Dataset | None = field(default=None, init=False, repr=False)
+    distributed_rank: int = field(default=0, init=False, repr=False)
+    distributed_world_size: int = field(default=1, init=False, repr=False)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -1926,6 +1954,10 @@ class ByteDataModule(DataModule):
             raise ValueError("byte_patch_size must be positive")
         if self.config.fixed_fim_holes_per_window < 0:
             raise ValueError("fixed_fim_holes_per_window must be non-negative")
+        if self.config.length_bucket_pool_size < 1:
+            raise ValueError("length_bucket_pool_size must be positive")
+        if self.config.length_bucketing and self.config.dataset_mode != "window":
+            raise ValueError("length bucketing requires dataset_mode='window'")
         if (
             self.config.fixed_fim_holes
             and self.config.fixed_fim_holes_per_window == 0
@@ -1954,6 +1986,15 @@ class ByteDataModule(DataModule):
             if max_seq_length is None
             else max_seq_length
         )
+
+    def configure_distributed(self, *, rank: int, world_size: int) -> None:
+        """Provide topology before constructing a rank-aware train sampler."""
+        self.distributed_rank = int(rank)
+        self.distributed_world_size = int(world_size)
+
+    @property
+    def uses_distributed_train_batch_sampler(self) -> bool:
+        return self.config.length_bucketing
 
     def setup(self, stage: str = "") -> None:
         rows = load_manifest_rows(self.manifest_path, max_rows=self.max_manifest_rows)
@@ -2136,6 +2177,8 @@ class ByteDataModule(DataModule):
             "seed": self.config.seed,
             "dataset_mode": self.config.dataset_mode,
             "window_unit": self.config.window_unit,
+            "length_bucketing": self.config.length_bucketing,
+            "length_bucket_pool_size": self.config.length_bucket_pool_size,
             "p_fim": self.config.p_fim,
             "fim_format": self.config.fim_format,
             "fim_loss_scope": self.config.fim_loss_scope,
@@ -2159,6 +2202,22 @@ class ByteDataModule(DataModule):
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             self.setup()
+        if self.config.length_bucketing:
+            batch_sampler = DistributedLengthBucketBatchSampler(
+                self.train_dataset,
+                local_batch_size=self.batch_size,
+                num_replicas=self.distributed_world_size,
+                rank=self.distributed_rank,
+                pool_size=self.config.length_bucket_pool_size,
+                seed=self.config.seed,
+            )
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=batch_sampler,
+                num_workers=self.config.num_workers,
+                pin_memory=True,
+                collate_fn=self._collate_fn,
+            )
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
