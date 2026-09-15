@@ -1444,11 +1444,19 @@ def byte_training_loss_terms(
     target_region_ids: torch.Tensor | None = None,
     fim_span_loss_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
-    """Return raw loss terms and their weighted training objective."""
+    """Return raw loss terms and their weighted training objective.
+
+    Full-sequence CE, FIM-span CE, and the balanced EOS auxiliary objective
+    all require the same vocabulary normalization.  Compute that normalization
+    once here instead of independently scanning the (potentially very large)
+    logits tensor for every term.
+    """
     if eos_aux_loss_weight < 0:
         raise ValueError("eos_aux_loss_weight must be non-negative")
     if fim_span_loss_weight < 0:
         raise ValueError("fim_span_loss_weight must be non-negative")
+    if eos_loss_weight <= 0:
+        raise ValueError("eos_loss_weight must be positive")
     if ce_byte_only:
         supervised_targets = targets[targets != IGNORE_INDEX]
         if bool((supervised_targets >= BYTE_VOCAB_SIZE).any()):
@@ -1458,20 +1466,95 @@ def byte_training_loss_terms(
         # Exclude EOS and all structural/control tokens from CE normalization.
         # This gives their logits zero CE gradient in oracle-length ablations.
         logits = logits[..., :BYTE_VOCAB_SIZE]
-    full_ce = byte_weighted_cross_entropy(logits, targets, eos_loss_weight)
-    zero = logits.sum() * 0.0
+
+    flat_logits = logits.reshape(-1, logits.size(-1)).float()
+    flat_targets = targets.reshape(-1)
+    supervised = flat_targets != IGNORE_INDEX
+
+    # Ignored targets still need an in-range gather index. Their losses are
+    # removed below, so the chosen replacement value has no effect.
+    safe_targets = flat_targets.masked_fill(~supervised, 0)
+    eos_binary_logits = None
+    if eos_aux_loss_weight > 0:
+        if SEQ_EOS_ID >= flat_logits.size(-1):
+            raise ValueError("EOS auxiliary loss requires the EOS logit")
+        eos_logits = flat_logits[:, SEQ_EOS_ID]
+        non_eos_parts = []
+        if SEQ_EOS_ID > 0:
+            non_eos_parts.append(
+                torch.logsumexp(flat_logits[:, :SEQ_EOS_ID], dim=-1)
+            )
+        if SEQ_EOS_ID + 1 < flat_logits.size(-1):
+            non_eos_parts.append(
+                torch.logsumexp(flat_logits[:, SEQ_EOS_ID + 1 :], dim=-1)
+            )
+        if not non_eos_parts:
+            raise ValueError("EOS auxiliary loss requires at least one non-EOS logit")
+        non_eos_log_normalizer = non_eos_parts[0]
+        for part in non_eos_parts[1:]:
+            non_eos_log_normalizer = torch.logaddexp(
+                non_eos_log_normalizer, part
+            )
+        # Partitioning EOS from the remaining vocabulary lets the same
+        # normalization serve token CE and the stable binary EOS objective.
+        log_normalizer = torch.logaddexp(eos_logits, non_eos_log_normalizer)
+        eos_binary_logits = eos_logits - non_eos_log_normalizer
+    else:
+        log_normalizer = torch.logsumexp(flat_logits, dim=-1)
+    target_logits = flat_logits.gather(1, safe_targets.unsqueeze(1)).squeeze(1)
+    token_nll = log_normalizer - target_logits
+
+    full_weights = torch.ones_like(token_nll)
+    if eos_loss_weight != 1.0:
+        full_weights = torch.where(
+            flat_targets == SEQ_EOS_ID,
+            full_weights * eos_loss_weight,
+            full_weights,
+        )
+    supervised_float = supervised.to(token_nll.dtype)
+    supervised_count = supervised_float.sum().clamp_min(1)
+    full_ce = (token_nll * full_weights * supervised_float).sum() / supervised_count
+
+    # Reuse the much smaller per-position reduction for differentiable zero
+    # placeholders instead of scanning the full logits tensor again.
+    zero = log_normalizer.sum() * 0.0
     fim_span_ce = zero
     if fim_span_loss_weight > 0:
         if target_region_ids is None:
             raise ValueError(
                 "target_region_ids are required when fim_span_loss_weight is positive"
             )
-        fim_span_ce = fim_span_byte_cross_entropy(
-            logits, targets, target_region_ids
+        if target_region_ids.shape != targets.shape:
+            raise ValueError("target_region_ids must have the same shape as targets")
+        selected = (
+            (target_region_ids.reshape(-1) == REGION_BRIDGE)
+            & supervised
+            & (flat_targets >= 0)
+            & (flat_targets < BYTE_VOCAB_SIZE)
         )
+        selected_float = selected.to(token_nll.dtype)
+        fim_span_ce = (token_nll * selected_float).sum() / selected_float.sum().clamp_min(1)
+
     eos_aux = zero
     if eos_aux_loss_weight > 0:
-        eos_aux = balanced_eos_auxiliary_loss(logits, targets)
+        assert eos_binary_logits is not None
+        positive = supervised & (flat_targets == SEQ_EOS_ID)
+        negative = supervised & (flat_targets != SEQ_EOS_ID)
+        positive_float = positive.to(token_nll.dtype)
+        negative_float = negative.to(token_nll.dtype)
+        binary_targets = positive.to(flat_logits.dtype)
+        eos_losses = torch.nn.functional.binary_cross_entropy_with_logits(
+            eos_binary_logits,
+            binary_targets,
+            reduction="none",
+        )
+        positive_loss = (
+            eos_losses * positive_float
+        ).sum() / positive_float.sum().clamp_min(1)
+        negative_loss = (
+            eos_losses * negative_float
+        ).sum() / negative_float.sum().clamp_min(1)
+        eos_aux = 0.5 * (positive_loss + negative_loss)
     objective = (
         full_ce
         + fim_span_loss_weight * fim_span_ce

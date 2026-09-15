@@ -2,8 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from litgpt.data.byte_data import IGNORE_INDEX, SEQ_EOS_ID
 from litgpt.byte.data import REGION_BRIDGE, REGION_PREFIX
+from litgpt.byte.training import byte_training_loss_terms
+from litgpt.data.byte_data import IGNORE_INDEX, SEQ_EOS_ID
 from litgpt.pretrain import (
     balanced_eos_auxiliary_loss,
     byte_training_loss,
@@ -122,6 +123,71 @@ def test_byte_training_loss_adds_normalized_fim_span_objective():
     )
 
     assert torch.allclose(actual, full_ce + 0.5 * span_ce)
+
+
+def test_shared_loss_computation_matches_independent_terms_and_gradients():
+    torch.manual_seed(123)
+    shape = (2, 3, 4, SEQ_EOS_ID + 1)
+    targets = torch.tensor(
+        [
+            [[1, 2, 3, 4], [5, SEQ_EOS_ID, IGNORE_INDEX, 7], [8, 9, 10, 11]],
+            [[12, 13, 14, 15], [16, 17, SEQ_EOS_ID, 19], [20, IGNORE_INDEX, 22, 23]],
+        ]
+    )
+    regions = torch.tensor(
+        [
+            [[REGION_PREFIX] * 4, [REGION_BRIDGE] * 4, [REGION_PREFIX] * 4],
+            [[REGION_BRIDGE] * 4, [REGION_PREFIX] * 4, [REGION_BRIDGE] * 4],
+        ]
+    )
+    optimized_logits = torch.randn(shape, dtype=torch.float32, requires_grad=True)
+    reference_logits = optimized_logits.detach().clone().requires_grad_(True)
+
+    optimized = byte_training_loss_terms(
+        optimized_logits,
+        targets,
+        eos_loss_weight=1.7,
+        eos_aux_loss_weight=0.4,
+        target_region_ids=regions,
+        fim_span_loss_weight=0.6,
+    )
+    reference_full = byte_weighted_cross_entropy(
+        reference_logits, targets, eos_loss_weight=1.7
+    )
+    reference_span = fim_span_byte_cross_entropy(reference_logits, targets, regions)
+    reference_eos = balanced_eos_auxiliary_loss(reference_logits, targets)
+    reference_objective = reference_full + 0.6 * reference_span + 0.4 * reference_eos
+
+    assert torch.allclose(optimized["full_ce"], reference_full, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(optimized["fim_span_ce"], reference_span, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(optimized["eos_aux"], reference_eos, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        optimized["objective"], reference_objective, atol=1e-6, rtol=1e-6
+    )
+
+    optimized["objective"].backward()
+    reference_objective.backward()
+    assert torch.allclose(
+        optimized_logits.grad, reference_logits.grad, atol=1e-6, rtol=1e-6
+    )
+
+
+def test_shared_loss_computation_keeps_confident_wrong_eos_finite():
+    logits = torch.full((1, 2, SEQ_EOS_ID + 1), -100.0)
+    logits[0, 0, SEQ_EOS_ID] = 100.0
+    logits.requires_grad_(True)
+    targets = torch.tensor([[7, SEQ_EOS_ID]])
+
+    terms = byte_training_loss_terms(
+        logits,
+        targets,
+        eos_aux_loss_weight=1.0,
+    )
+
+    assert torch.isfinite(terms["eos_aux"])
+    terms["objective"].backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
 
 
 def test_byte_only_ce_excludes_eos_and_control_logits():
