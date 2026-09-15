@@ -117,6 +117,22 @@ uses no protected prefix by default (`SLICE_HEADER_GUARD_BYTES=0`), so FIM may
 reconstruct the frame's start code and headers as well as its payload. With a
 64-byte minimum hole, a frame needs at least 65 bytes to be eligible.
 
+The official patch-256 run also applies the span and EOS auxiliary weights
+validated by the BSCV FIM experiments. Its objective is full-sequence CE plus
+`1.0 * span CE + 1.0 * EOS auxiliary loss`. Use the dedicated launcher so this
+configuration cannot silently fall back to the unweighted defaults:
+
+```bash
+cd /nfshomes/huangyh/litgpt
+
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_patch256_weighted.sh
+```
+
+The run keeps `P_FIM=0.5`, changing 64--1,400-byte holes, one GOP per sample,
+zero training header guard, length bucketing, and the 131,072-byte raw context.
+Free-run generation and FFmpeg decoding remain offline checkpoint evaluations.
+
 ```bash
 cd /nfshomes/huangyh/litgpt
 
