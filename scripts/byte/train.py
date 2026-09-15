@@ -58,12 +58,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--byte-patch-size",
         type=int,
-        choices=(1, 4, 8),
         default=1,
         help=(
             "Consecutive byte/control ids per transformer position. Values above "
             "one use a MEGABYTE global/local Transformer and require training "
-            "from scratch."
+            "from scratch. The value must be positive and divide --n-embd; "
+            "larger patches also increase the local Transformer's sequence length."
         ),
     )
     parser.add_argument(

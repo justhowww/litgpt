@@ -15,8 +15,21 @@ N_LAYER=${N_LAYER:-32}
 N_EMBD=${N_EMBD:-4096}
 N_HEAD=${N_HEAD:-64}
 MODEL_TAG=${MODEL_TAG:-byte-jpeglm-7b-megabyte-patch8-fim-p050-fullseq-eos-1m}
-BLOCK_SIZE=${BLOCK_SIZE:-16384}
 BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE:-8}
+if (( BYTE_PATCH_SIZE < 1 )); then
+    echo "BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE} must be positive" >&2
+    exit 1
+fi
+# Keep patch-size experiments on the same raw-byte window by default. An
+# explicit BLOCK_SIZE remains authoritative for intentional context changes.
+RAW_CONTEXT_BYTES=${RAW_CONTEXT_BYTES:-131072}
+if [[ -z "${BLOCK_SIZE+x}" ]]; then
+    if (( RAW_CONTEXT_BYTES % BYTE_PATCH_SIZE != 0 )); then
+        echo "RAW_CONTEXT_BYTES=${RAW_CONTEXT_BYTES} must be divisible by BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE}; alternatively set BLOCK_SIZE explicitly" >&2
+        exit 1
+    fi
+    BLOCK_SIZE=$((RAW_CONTEXT_BYTES / BYTE_PATCH_SIZE))
+fi
 MEGABYTE_LOCAL_LAYERS=${MEGABYTE_LOCAL_LAYERS:-4}
 MEGABYTE_LOCAL_EMBD=${MEGABYTE_LOCAL_EMBD:-512}
 MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS:-8}
@@ -96,6 +109,10 @@ fi
 
 if (( N_EMBD % N_HEAD != 0 )); then
     echo "N_EMBD=${N_EMBD} must be divisible by N_HEAD=${N_HEAD}" >&2
+    exit 1
+fi
+if (( BLOCK_SIZE < 1 )); then
+    echo "BLOCK_SIZE=${BLOCK_SIZE} must be positive" >&2
     exit 1
 fi
 if (( N_EMBD % BYTE_PATCH_SIZE != 0 )); then
@@ -195,7 +212,7 @@ if [[ "${COMPILE}" == "1" ]]; then
     cmd+=(--compile)
 fi
 
-echo "[jpeglm] model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} raw_capacity~=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
+echo "[jpeglm] model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} global_positions=${BLOCK_SIZE} raw_capacity=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
 echo "[jpeglm] rows=${MAX_ROWS} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} micro=${MICRO_BATCH_SIZE} devices=${DEVICES} activation_checkpointing=${ACTIVATION_CHECKPOINTING} compile=${COMPILE}"
 echo "[jpeglm] length_bucketing=${ENABLE_LENGTH_BUCKETING} pool_size=${LENGTH_BUCKET_POOL_SIZE} (training only)"
 echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} EOS=on split=held-out-video"

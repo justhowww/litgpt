@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from litgpt.byte.data import (
@@ -340,6 +341,58 @@ def test_megabyte_global_and_local_towers_receive_gradients():
     assert model.megabyte_global_to_local.weight.grad is not None
     assert model.megabyte_local.h[0].attn.qkv.weight.grad is not None
     assert model.megabyte_local.wte.weight.grad is not None
+
+
+@pytest.mark.parametrize("patch_size", (8, 32, 64))
+def test_megabyte_larger_patch_sizes_preserve_shape_causality_and_gradients(
+    patch_size: int,
+):
+    """The model path is generic beyond patch 8, including its local mask."""
+    torch.manual_seed(23)
+    config = Config(
+        block_size=2,
+        n_layer=1,
+        n_embd=patch_size,
+        n_head=4,
+        vocab_size=VOCAB_SIZE,
+        padding_multiple=8,
+        byte_patch_size=patch_size,
+        megabyte_local_n_layer=1,
+        megabyte_local_n_embd=16,
+        megabyte_local_n_head=4,
+    )
+    model = GPT(config).eval()
+    input_ids = torch.randint(0, 256, (1, 2, patch_size))
+    targets_a = torch.randint(0, 256, (1, 2, patch_size))
+    targets_b = targets_a.clone()
+    changed_index = patch_size // 2
+    targets_b[..., changed_index] = (targets_b[..., changed_index] + 1) % 256
+
+    logits_a = model(input_ids, patch_targets=targets_a)
+    logits_b = model(input_ids, patch_targets=targets_b)
+
+    assert logits_a.shape == (
+        1,
+        2,
+        patch_size,
+        config.padded_vocab_size,
+    )
+    # A changed byte may influence only later local predictions in its patch.
+    assert torch.equal(
+        logits_a[..., : changed_index + 1, :],
+        logits_b[..., : changed_index + 1, :],
+    )
+    assert not torch.equal(
+        logits_a[..., changed_index + 1 :, :],
+        logits_b[..., changed_index + 1 :, :],
+    )
+
+    model.train()
+    byte_training_loss(
+        model(input_ids, patch_targets=targets_a), targets_a
+    ).backward()
+    assert model.transformer.h[0].attn.qkv.weight.grad is not None
+    assert model.megabyte_local.h[0].attn.qkv.weight.grad is not None
 
 
 def test_byte_loss_accepts_patch_shaped_logits_and_targets():
