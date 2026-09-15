@@ -64,15 +64,15 @@ SLICE_HEADER_GUARD_BYTES=${SLICE_HEADER_GUARD_BYTES:-0}
 WINDOW_MIN_FRAMES=${WINDOW_MIN_FRAMES:-2}
 WINDOW_UNIT=${WINDOW_UNIT:-gop}
 
-EVAL_INTERVAL=${EVAL_INTERVAL:-250}
+EVAL_INTERVAL=${EVAL_INTERVAL:-1000}
 EVAL_ITERS=${EVAL_ITERS:-20}
 # A full training-state checkpoint is ~65 GB. Keep permanent milestones sparse
-# while updating one rolling recovery checkpoint at the old cadence.
+# while updating one rolling recovery checkpoint at a reduced cadence.
 SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
-# At ~1 optimizer step/s, 1,000-step rolling saves would write 65 GB about
-# every 17 minutes. Ten thousand steps limits checkpoint overhead while
-# bounding recoverable work to roughly 2.5--3 hours.
-LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-10000}
+# At roughly one optimizer step per second, frequent 65 GB recovery writes add
+# avoidable I/O. Twenty-five thousand steps bounds lost work while keeping the
+# checkpoint overhead small relative to a multi-epoch run.
+LATEST_SAVE_INTERVAL=${LATEST_SAVE_INTERVAL:-25000}
 SAVE_FINAL=${SAVE_FINAL:-1}
 LOGGER_NAME=${LOGGER_NAME:-tensorboard}
 COMPILE=${COMPILE:-1}

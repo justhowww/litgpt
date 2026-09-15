@@ -14,7 +14,7 @@ time from approximately 3.69 seconds at microbatch 1 to 0.97--1.00 seconds.
 Microbatch 16 did not improve throughput.
 
 Each full training-state checkpoint is approximately 65 GB. The full launcher
-therefore keeps one rolling `latest` checkpoint updated every 10,000 optimizer
+therefore keeps one rolling `latest` checkpoint updated every 25,000 optimizer
 steps and saves permanent `step-*` milestones only every 100,000 steps. When
 both intervals coincide, `latest` points to the milestone instead of duplicating
 it. Automatic resume prefers `latest`. Override these independently with
@@ -129,6 +129,22 @@ STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit_patch256_weighted.sh
 ```
 
+Before disabling activation checkpointing in that production launcher, run the
+matched patch-256 pilot below. It keeps the production model, batch, objective,
+full corpus, and length bucketing, changes only activation checkpointing, runs
+200 optimizer steps, and saves no model checkpoint:
+
+```bash
+cd /nfshomes/huangyh/litgpt
+
+STAGED_CORPUS=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm \
+bash scripts/hpc/zaratan/jpeglm_pretrain/submit_patch256_no_activation_checkpointing_pilot.sh
+```
+
+Adopt the change only if the pilot completes without OOM, leaves comfortable
+headroom below 80 GB on every rank, and improves steady-state optimizer-step
+time relative to the checkpointed patch-256 baseline.
+
 The run keeps `P_FIM=0.5`, changing 64--1,400-byte holes, one GOP per sample,
 zero training header guard, length bucketing, and the 131,072-byte raw context.
 Free-run generation and FFmpeg decoding remain offline checkpoint evaluations.
@@ -143,7 +159,8 @@ SLICE_HEADER_GUARD_BYTES=0 \
 WINDOW_UNIT=gop \
 GLOBAL_BATCH_SIZE=64 \
 MICRO_BATCH_SIZE=8 \
-LATEST_SAVE_INTERVAL=10000 \
+EVAL_INTERVAL=1000 \
+LATEST_SAVE_INTERVAL=25000 \
 SAVE_INTERVAL=100000 \
 bash scripts/hpc/zaratan/jpeglm_pretrain/submit.sh
 ```
