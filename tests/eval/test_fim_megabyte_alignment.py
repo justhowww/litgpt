@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from litgpt.byte.data import (
@@ -15,6 +17,120 @@ from litgpt.byte.data import (
     patch_byte_sample,
 )
 from scripts.byte.eval import eval_fim_avclm as FIM
+
+
+def test_gt_automaton_preflight_runs_for_masked_learned_eos(monkeypatch) -> None:
+    samples = [object(), object()]
+    monkeypatch.setattr(FIM, "gt_parser_reconnects", lambda *args, **kwargs: True)
+
+    result = FIM.validate_parser_reconnection(
+        SimpleNamespace(mask_illegal_bytes=True, stop_modes=["learned_eos"]),
+        samples,
+        slice_max_mbs=None,
+    )
+
+    assert result == [True, True]
+
+
+def test_gt_automaton_preflight_fails_closed_for_masked_eval(monkeypatch) -> None:
+    samples = [object(), object()]
+    results = iter((True, False))
+    monkeypatch.setattr(
+        FIM, "gt_parser_reconnects", lambda *args, **kwargs: next(results)
+    )
+
+    with pytest.raises(RuntimeError, match="only 1/2 samples passed"):
+        FIM.validate_parser_reconnection(
+            SimpleNamespace(mask_illegal_bytes=True, stop_modes=["learned_eos"]),
+            samples,
+            slice_max_mbs=None,
+        )
+
+
+def test_gt_automaton_preflight_skips_unmasked_learned_eos(monkeypatch) -> None:
+    monkeypatch.setattr(
+        FIM,
+        "gt_parser_reconnects",
+        lambda *args, **kwargs: pytest.fail("unexpected automaton preflight"),
+    )
+
+    result = FIM.validate_parser_reconnection(
+        SimpleNamespace(mask_illegal_bytes=False, stop_modes=["learned_eos"]),
+        [object()],
+        slice_max_mbs=None,
+    )
+
+    assert result == [None]
+
+
+def test_recorded_video_split_selects_disjoint_train_and_val(tmp_path: Path) -> None:
+    train_path = str(tmp_path / "train.h264")
+    val_path = str(tmp_path / "val.h264")
+    dataset = SimpleNamespace(
+        samples=[
+            SimpleNamespace(h264_path=Path(train_path), start_nal=0, end_nal=10),
+            SimpleNamespace(h264_path=Path(val_path), start_nal=0, end_nal=10),
+        ]
+    )
+    split_file = tmp_path / "train_split.json"
+    split_file.write_text(
+        json.dumps(
+            {
+                "split_by_video": True,
+                "videos": [train_path],
+                "windows": [
+                    {"h264_path": train_path, "start_nal": 0, "end_nal": 10}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = SimpleNamespace(hole_placement="training_random")
+
+    train_indices, _ = FIM._select_eval_windows(
+        SimpleNamespace(train_split_file=split_file, eval_split="train"),
+        dataset,
+        policy,
+    )
+    val_indices, _ = FIM._select_eval_windows(
+        SimpleNamespace(train_split_file=split_file, eval_split="val"),
+        dataset,
+        policy,
+    )
+
+    assert train_indices == [0]
+    assert val_indices == [1]
+
+
+def test_recorded_window_split_selects_exact_complement(tmp_path: Path) -> None:
+    path = str(tmp_path / "shared.h264")
+    dataset = SimpleNamespace(
+        samples=[
+            SimpleNamespace(h264_path=Path(path), start_nal=0, end_nal=10),
+            SimpleNamespace(h264_path=Path(path), start_nal=10, end_nal=20),
+        ]
+    )
+    split_file = tmp_path / "train_split.json"
+    split_file.write_text(
+        json.dumps(
+            {
+                "split_by_video": False,
+                "videos": [path],
+                "windows": [
+                    {"h264_path": path, "start_nal": 0, "end_nal": 10}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    val_indices, _ = FIM._select_eval_windows(
+        SimpleNamespace(train_split_file=split_file, eval_split="val"),
+        dataset,
+        SimpleNamespace(hole_placement="training_random"),
+    )
+
+    assert val_indices == [1]
 
 
 def _full_fim_item() -> tuple[dict, bytes, int, int]:
@@ -83,7 +199,7 @@ def test_full_sequence_metric_keeps_native_patch_phase() -> None:
     assert not torch.equal(full["input_ids"], repatched_span["input_ids"])
 
 
-def test_build_eval_samples_uses_recorded_full_sequence_layout(
+def test_build_eval_sample_selection_uses_recorded_full_sequence_layout(
     monkeypatch, tmp_path: Path,
 ) -> None:
     item, window, split, gap = _full_fim_item()
@@ -145,9 +261,12 @@ def test_build_eval_samples_uses_recorded_full_sequence_layout(
         num_clips=1,
     )
 
-    samples = FIM.build_eval_samples(args)
-    assert args.fim_loss_scope == "full"
-    assert args.window_unit == "gop"
+    selection = FIM.build_eval_sample_selection(args)
+    assert args.fim_loss_scope == "auto"
+    assert args.window_unit == "auto"
+    assert selection.policy.fim_loss_scope == "full"
+    assert selection.policy.window_unit == "gop"
+    samples = selection.samples
     assert len(samples) == 1
     sample = samples[0]
     assert sample.target_bytes == window[split : split + gap]

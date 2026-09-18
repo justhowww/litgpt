@@ -10,6 +10,7 @@ import pytest
 from scripts.byte.eval.eval_fim_avclm import (
     _corruption_frame_type,
     _corrupt_gen_frame_hole_spec,
+    _corrupt_gen_frame_hole_spec_with_reason,
     _load_train_split,
     _verify_fixed_hole_replay,
     summarize,
@@ -122,6 +123,31 @@ def test_corrupt_gen_frame_hole_is_exact_positioned_and_reproducible(tmp_path):
     # placement range. floor(272 * 0.4) = 108.
     assert first == (0, 1300, 112, 1024)
     assert second == first
+
+
+def test_corrupt_gen_frame_hole_explains_undersized_frame(tmp_path):
+    stream = tmp_path / "clip.h264"
+    stream.write_bytes(b"x" * 4096)
+
+    class FakeDataset:
+        fim_min_gap = 1024
+        fim_max_gap = 1024
+        frame_guard_bytes = 4
+        samples = [SimpleNamespace(h264_path=Path(stream))]
+
+        @staticmethod
+        def _fim_candidates(sample, data):
+            return [(0, 1300)]
+
+    hole, reason = _corrupt_gen_frame_hole_spec_with_reason(
+        FakeDataset(), 0, corr_pos=0.4, eligibility_bytes=2048, seed=42
+    )
+
+    assert hole is None
+    assert reason == (
+        "frame_too_small("
+        "required=2048,max_available=1295,header_guard=4,frame_type=any)"
+    )
 
 
 def test_corruption_frame_type_reads_idr_and_p_slice_type(tmp_path):

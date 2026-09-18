@@ -44,7 +44,7 @@ import random
 import re
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -136,8 +136,7 @@ class WindowFimSample:
     def corrupted_full_stream(self) -> bytes:
         """The full sampled window with the FIM span physically removed."""
         return (
-            self.window_bytes[: self.split]
-            + self.window_bytes[self.split + self.gap :]
+            self.window_bytes[: self.split] + self.window_bytes[self.split + self.gap :]
         )
 
     def repaired_stream(self, generated: bytes) -> bytes:
@@ -177,6 +176,56 @@ class GenerationResult:
     first_mask_intervention: dict[str, Any] | None = None
 
 
+DecodedStream = tuple[list[Tensor], str, dict[str, Any]]
+
+
+@dataclass
+class CheckpointInputs:
+    """Checkpoint-dependent inputs computed once and reused by every stop mode."""
+
+    teacher_forced: list[dict[str, Any] | None]
+    ground_truth: list[DecodedStream]
+    corrupted_concealed: list[DecodedStream]
+    visualization: dict[int, tuple[Any, ...]]
+
+
+HoleSpec = tuple[int, int, int, int]
+FixedHoleMap = dict[tuple[str, int, int], list[dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class EvalSamplePolicy:
+    """Resolved data-window and corruption policy used to build eval samples."""
+
+    fim_loss_scope: str
+    window_unit: str
+    hole_placement: str
+    hole_set: str
+    min_gap: int
+    max_gap: int
+    frame_guard_bytes: int
+    corruption_eligibility_bytes: int
+
+
+@dataclass(frozen=True)
+class HoleRequest:
+    """One requested FIM hole, optionally tied to a recorded training hole."""
+
+    dataset_index: int
+    hole_spec: HoleSpec | None
+    expected_training_hole: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class SampleSelection:
+    """Materialized samples plus the resolved policy and replay statistics."""
+
+    samples: list[WindowFimSample]
+    policy: EvalSamplePolicy
+    exact_training_holes_verified: int
+    fixed_training_holes_available: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -193,8 +242,9 @@ def parse_args() -> argparse.Namespace:
         choices=("train", "val", "all"),
         default="train",
         help=(
-            "Subset to evaluate when --train-split-file is absent. With a split file, "
-            "'train' uses the dumped train windows exactly."
+            "Subset to evaluate. With --train-split-file, train replays the dumped "
+            "training windows, val selects the recorded held-out complement, and "
+            "all uses every rebuilt window."
         ),
     )
     parser.add_argument("--num-clips", type=int, default=20)
@@ -403,9 +453,7 @@ def parse_args() -> argparse.Namespace:
             args.corr_eligibility_bytes is not None
             and args.corr_eligibility_bytes < args.corr_len_bytes
         ):
-            parser.error(
-                "--corr-eligibility-bytes must be at least --corr-len-bytes"
-            )
+            parser.error("--corr-eligibility-bytes must be at least --corr-len-bytes")
         if args.hole_set not in ("auto", "sampled"):
             parser.error(
                 "--hole-placement corrupt_gen_frame is incompatible with "
@@ -552,35 +600,78 @@ def _corrupt_gen_frame_hole_spec(
     seed: int,
     frame_type: str = "any",
 ) -> tuple[int, int, int, int] | None:
+    """Compatibility wrapper returning only the selected corruption span."""
+
+    hole, _reason = _corrupt_gen_frame_hole_spec_with_reason(
+        dataset,
+        idx,
+        corr_pos=corr_pos,
+        eligibility_bytes=eligibility_bytes,
+        seed=seed,
+        frame_type=frame_type,
+    )
+    return hole
+
+
+def _corrupt_gen_frame_hole_spec_with_reason(
+    dataset: ByteStreamWindowDataset,
+    idx: int,
+    *,
+    corr_pos: float,
+    eligibility_bytes: int,
+    seed: int,
+    frame_type: str = "any",
+) -> tuple[tuple[int, int, int, int] | None, str | None]:
     """Select one exact, byte-aligned corrupt_Gen-style frame deletion.
 
     ``ByteStreamWindowDataset`` has already been configured with a fixed
-    ``fim_min_gap == fim_max_gap`` and the diagnostic's four-byte header guard.
-    Consequently every candidate can hold the complete requested deletion and
-    no short-frame fallback is possible.
+    ``fim_min_gap == fim_max_gap`` and the diagnostic's header guard. A returned
+    span always has the full requested length; otherwise the reason explains why
+    this window is ineligible instead of silently shortening the deletion.
     """
     if dataset.fim_min_gap != dataset.fim_max_gap:
         raise ValueError("corrupt_gen_frame requires one fixed deletion length")
     sample = dataset.samples[idx]
     data = sample.h264_path.read_bytes()
     candidates = dataset._fim_candidates(sample, data)
-    candidates = [
-        (frame_lo, frame_hi)
-        for frame_lo, frame_hi in candidates
-        if frame_hi
-        - (frame_lo + dataset.frame_guard_bytes)
-        - 1
-        >= eligibility_bytes
-    ]
+    if not candidates:
+        return None, "no_fim_eligible_frame_boundary"
+
     if frame_type != "any":
         wanted = str(frame_type)
-        candidates = [
-            bounds
-            for bounds in candidates
-            if _corruption_frame_type(dataset, idx, bounds[0], data=data) == wanted
-        ]
-    if not candidates:
-        return None
+        candidates_by_type: dict[str, list[tuple[int, int]]] = {}
+        for bounds in candidates:
+            actual = _corruption_frame_type(dataset, idx, bounds[0], data=data)
+            candidates_by_type.setdefault(actual, []).append(bounds)
+        candidates = candidates_by_type.get(wanted, [])
+        if not candidates:
+            available = ",".join(
+                f"{name}:{len(bounds)}"
+                for name, bounds in sorted(candidates_by_type.items())
+            )
+            return (
+                None,
+                f"no_matching_frame_type(requested={wanted},available={available})",
+            )
+
+    sized_candidates = [
+        (frame_lo, frame_hi)
+        for frame_lo, frame_hi in candidates
+        if frame_hi - (frame_lo + dataset.frame_guard_bytes) - 1 >= eligibility_bytes
+    ]
+    if not sized_candidates:
+        max_available = max(
+            frame_hi - (frame_lo + dataset.frame_guard_bytes) - 1
+            for frame_lo, frame_hi in candidates
+        )
+        return (
+            None,
+            "frame_too_small("
+            f"required={eligibility_bytes},max_available={max_available},"
+            f"header_guard={dataset.frame_guard_bytes},frame_type={frame_type})",
+        )
+
+    candidates = sized_candidates
 
     # The seed is local to the window, so repeated checkpoint evaluations and
     # severity runs are reproducible without depending on DataLoader RNG state.
@@ -592,7 +683,25 @@ def _corrupt_gen_frame_hole_spec(
     if available < 0:
         raise AssertionError("eligible frame cannot hold the requested full cut")
     split = first_start + int(available * corr_pos)
-    return frame_lo, frame_hi, split, gap
+    return (frame_lo, frame_hi, split, gap), None
+
+
+def _log_sample_skip(
+    dataset: ByteStreamWindowDataset,
+    dataset_index: int,
+    reason: str,
+) -> None:
+    """Emit one reproducible explanation for an excluded evaluation window."""
+
+    sample = dataset.samples[dataset_index]
+    print(
+        "[sample-skip] "
+        f"dataset_index={dataset_index} "
+        f"path={sample.h264_path} "
+        f"nals={sample.start_nal}:{sample.end_nal} "
+        f"reason={reason}",
+        flush=True,
+    )
 
 
 def _corruption_frame_type(
@@ -614,9 +723,7 @@ def _corruption_frame_type(
                 return "idr"
             nal_bytes = data[nal.start + nal.start_code_len : nal.end]
             try:
-                rbsp, _byte_map, _epb = HS.unescape_rbsp(
-                    nal_bytes, 1, len(nal_bytes)
-                )
+                rbsp, _byte_map, _epb = HS.unescape_rbsp(nal_bytes, 1, len(nal_bytes))
                 reader = HS.BitReader(rbsp)
                 reader.read_ue()  # first_mb_in_slice
                 slice_type = reader.read_ue() % 5
@@ -635,36 +742,61 @@ def _corruption_frame_type(
     )
 
 
-def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
-    args.fim_loss_scope = _resolve_fim_loss_scope(args)
-    args.window_unit = _resolve_window_unit(args)
-    hole_placement = getattr(args, "hole_placement", "training_random")
+def _resolve_sample_policy(args: argparse.Namespace) -> EvalSamplePolicy:
+    """Resolve every training-layout and corruption setting before loading data."""
+
+    fim_loss_scope = _resolve_fim_loss_scope(
+        args
+    )  # str, "span" or "full". We use "full" most of the times
+    window_unit = _resolve_window_unit(
+        args
+    )  # defines what the data sample looks like. We use one "GoP" as a sample.
+    hole_placement = str(
+        getattr(args, "hole_placement", "training_random")
+    )  # "corrupt_gen_frame" for fixed corruption control / "training_random" for random corruption control
     corr_len_bytes = getattr(args, "corr_len_bytes", None)
     if hole_placement == "corrupt_gen_frame":
         if corr_len_bytes is None or int(corr_len_bytes) <= 0:
-            raise ValueError(
-                "corrupt_gen_frame requires a positive --corr-len-bytes"
-            )
-        eval_min_gap = eval_max_gap = int(corr_len_bytes)
+            raise ValueError("corrupt_gen_frame requires a positive --corr-len-bytes")
+        min_gap = max_gap = int(corr_len_bytes)
         frame_guard_bytes = int(getattr(args, "corr_header_guard_bytes", 4))
-        corr_eligibility_bytes = int(
+        eligibility_bytes = int(
             getattr(args, "corr_eligibility_bytes", None) or corr_len_bytes
         )
-        if corr_eligibility_bytes < eval_max_gap:
+        if eligibility_bytes < max_gap:
             raise ValueError(
                 "--corr-eligibility-bytes must be at least --corr-len-bytes"
             )
-    else:
-        eval_min_gap = int(args.fim_min_gap)
-        eval_max_gap = int(args.fim_max_gap)
+    elif hole_placement == "training_random":
+        min_gap = int(args.fim_min_gap)
+        max_gap = int(args.fim_max_gap)
         frame_guard_bytes = int(args.slice_header_guard_bytes)
-        corr_eligibility_bytes = eval_max_gap
-    args.effective_fim_min_gap = eval_min_gap
-    args.effective_fim_max_gap = eval_max_gap
-    args.effective_frame_guard_bytes = frame_guard_bytes
-    args.effective_corr_eligibility_bytes = corr_eligibility_bytes
+        eligibility_bytes = max_gap
+    else:
+        raise ValueError(f"Unknown --hole-placement {hole_placement}")
+
+    return EvalSamplePolicy(
+        fim_loss_scope=fim_loss_scope,
+        window_unit=window_unit,
+        hole_placement=hole_placement,
+        hole_set=str(getattr(args, "hole_set", "auto")),
+        min_gap=min_gap,
+        max_gap=max_gap,
+        frame_guard_bytes=frame_guard_bytes,
+        corruption_eligibility_bytes=eligibility_bytes,
+    )
+
+
+def _load_eval_dataset(
+    args: argparse.Namespace,
+    policy: EvalSamplePolicy,
+) -> ByteStreamWindowDataset:
+    """Load the manifest/index and rebuild the training-time window dataset."""
+
     rows = load_manifest_rows(
-        args.manifest, max_rows=args.max_manifest_rows or None, report_progress=True,
+        args.manifest,
+        max_rows=args.max_manifest_rows or None,
+        report_progress=True,
     )
     index_path = args.nal_index_path or default_nal_index_path(args.manifest)
     nal_index = (
@@ -675,124 +807,239 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
     if args.nal_index_path is not None and nal_index is None:
         raise FileNotFoundError(f"NAL index does not exist: {index_path}")
 
-    dataset = ByteStreamWindowDataset(
+    return ByteStreamWindowDataset(
         rows,
         max_seq_length=args.max_window_bytes,
         min_frames=args.window_min_frames,
         p_fim=1.0,
         fim_format=args.fim_format,
-        fim_loss_scope=args.fim_loss_scope,
+        fim_loss_scope=policy.fim_loss_scope,
         use_eos=args.use_eos,
-        fim_min_gap=eval_min_gap,
-        fim_max_gap=eval_max_gap,
-        frame_guard_bytes=frame_guard_bytes,
-        window_unit=args.window_unit,
+        fim_min_gap=policy.min_gap,
+        fim_max_gap=policy.max_gap,
+        frame_guard_bytes=policy.frame_guard_bytes,
+        window_unit=policy.window_unit,
         resample_fim=False,
         nal_index=nal_index,
         seed=args.seed,
     )
 
-    fixed_holes: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+
+def _select_eval_windows(
+    args: argparse.Namespace,
+    dataset: ByteStreamWindowDataset,
+    policy: EvalSamplePolicy,
+) -> tuple[list[int], FixedHoleMap]:
+    """Select dataset windows using the recorded split or deterministic split logic."""
+
+    fixed_holes: FixedHoleMap = {}
     if args.train_split_file is not None:
+        split_metadata = json.loads(
+            args.train_split_file.read_text(encoding="utf-8")
+        )
         train_windows, train_videos, fixed_holes = _load_train_split(
             args.train_split_file
         )
-        if train_windows:
-            indices = [
-                i
-                for i, s in enumerate(dataset.samples)
-                if (str(s.h264_path), int(s.start_nal), int(s.end_nal)) in train_windows
-            ]
-            split_desc = (
-                f"{len(indices)} exact train windows from {args.train_split_file}"
-            )
+        recorded_split_by_video = bool(split_metadata.get("split_by_video", False))
+        if args.eval_split == "all":
+            indices = list(range(len(dataset.samples)))
+            split_desc = f"all {len(indices)} rebuilt windows"
+        elif args.eval_split == "train":
+            if train_windows:
+                indices = [
+                    index
+                    for index, sample in enumerate(dataset.samples)
+                    if (
+                        str(sample.h264_path),
+                        int(sample.start_nal),
+                        int(sample.end_nal),
+                    )
+                    in train_windows
+                ]
+                split_desc = (
+                    f"{len(indices)} exact train windows from {args.train_split_file}"
+                )
+            else:
+                indices = [
+                    index
+                    for index, sample in enumerate(dataset.samples)
+                    if str(sample.h264_path) in train_videos
+                ]
+                split_desc = (
+                    f"{len(indices)} train videos from {args.train_split_file}"
+                )
         else:
-            indices = [
-                i
-                for i, s in enumerate(dataset.samples)
-                if str(s.h264_path) in train_videos
-            ]
-            split_desc = f"{len(indices)} train videos from {args.train_split_file}"
+            if recorded_split_by_video:
+                if not train_videos:
+                    raise RuntimeError(
+                        "train_split.json records split_by_video=true but contains "
+                        "no training video identities"
+                    )
+                indices = [
+                    index
+                    for index, sample in enumerate(dataset.samples)
+                    if str(sample.h264_path) not in train_videos
+                ]
+                if any(
+                    str(dataset.samples[index].h264_path) in train_videos
+                    for index in indices
+                ):
+                    raise AssertionError("validation videos overlap training videos")
+                split_desc = (
+                    f"{len(indices)} held-out video windows complementary to "
+                    f"{args.train_split_file}"
+                )
+            else:
+                if not train_windows:
+                    raise RuntimeError(
+                        "train_split.json contains no exact training windows; "
+                        "cannot reconstruct a disjoint window-level validation set"
+                    )
+                indices = [
+                    index
+                    for index, sample in enumerate(dataset.samples)
+                    if (
+                        str(sample.h264_path),
+                        int(sample.start_nal),
+                        int(sample.end_nal),
+                    )
+                    not in train_windows
+                ]
+                if any(
+                    (
+                        str(dataset.samples[index].h264_path),
+                        int(dataset.samples[index].start_nal),
+                        int(dataset.samples[index].end_nal),
+                    )
+                    in train_windows
+                    for index in indices
+                ):
+                    raise AssertionError("validation windows overlap training windows")
+                split_desc = (
+                    f"{len(indices)} held-out windows complementary to "
+                    f"{args.train_split_file}"
+                )
         if not indices:
             raise RuntimeError(
-                "No dataset windows matched -- check manifest/max rows against train_split.json"
+                f"No {args.eval_split} dataset windows matched -- check manifest, "
+                "max rows, window settings, and train_split.json"
             )
-        print(f"train-split filter: {split_desc}", flush=True)
+        print(
+            f"recorded-split filter: eval_split={args.eval_split} {split_desc}",
+            flush=True,
+        )
     else:
         indices = _split_indices(dataset, args)
         print(
-            f"split filter: eval_split={args.eval_split} selected {len(indices)}/{len(dataset)} windows",
+            f"split filter: eval_split={args.eval_split} "
+            f"selected {len(indices)}/{len(dataset)} windows",
             flush=True,
         )
 
-    if hole_placement == "corrupt_gen_frame":
-        # Filtering by a recorded train split preserves manifest order. Shuffle
-        # before taking NUM_CLIPS so visualizations do not cluster in the first
-        # few source videos. This remains reproducible across severity runs.
+    if policy.hole_placement == "corrupt_gen_frame":
+        # Preserve the historical deterministic shuffle so severity sweeps select
+        # the same source frames without clustering in the first manifest entries.
         indices = list(indices)
         random.Random(int(args.seed)).shuffle(indices)
         print(
             f"corrupt_gen_frame window order shuffled with seed={args.seed}",
             flush=True,
         )
+    return indices, fixed_holes
 
-    requested_hole_set = getattr(args, "hole_set", "auto")
-    if hole_placement == "corrupt_gen_frame":
-        if requested_hole_set not in ("auto", "sampled"):
+
+def _resolve_hole_set(
+    args: argparse.Namespace,
+    policy: EvalSamplePolicy,
+    fixed_holes: FixedHoleMap,
+) -> EvalSamplePolicy:
+    """Resolve auto/trained/heldout/sampled after inspecting recorded holes."""
+
+    hole_set = policy.hole_set
+    if policy.hole_placement == "corrupt_gen_frame":
+        if hole_set not in ("auto", "sampled"):
             raise RuntimeError(
                 "corrupt_gen_frame placement cannot replay trained or held-out "
                 "random holes"
             )
-        requested_hole_set = "sampled"
-    elif requested_hole_set == "auto":
-        requested_hole_set = "trained" if fixed_holes else "sampled"
-    if requested_hole_set == "trained" and not fixed_holes:
+        hole_set = "sampled"
+    elif args.eval_split != "train":
+        if hole_set == "trained":
+            raise RuntimeError(
+                "--hole-set trained is only valid with --eval-split train"
+            )
+        if hole_set == "auto":
+            hole_set = "sampled"
+    elif hole_set == "auto":
+        hole_set = "trained" if fixed_holes else "sampled"
+
+    if hole_set == "trained" and not fixed_holes:
         raise RuntimeError(
             "--hole-set trained requires cached fixed_fim_holes in train_split.json"
         )
-    args.hole_set = requested_hole_set
+    return replace(policy, hole_set=hole_set)
 
-    # Requests are round-robin by hole id, then window. Thus NUM_CLIPS=number of
-    # windows evaluates one trained hole per window rather than exhausting all K
-    # holes from the first window.
-    requests: list[
-        tuple[
-            int,
-            tuple[int, int, int, int] | None,
-            dict[str, Any] | None,
-        ]
-    ] = []
-    if hole_placement == "corrupt_gen_frame":
-        for idx in indices:
-            hole = _corrupt_gen_frame_hole_spec(
+
+def _build_hole_requests(
+    args: argparse.Namespace,
+    dataset: ByteStreamWindowDataset,
+    policy: EvalSamplePolicy,
+    indices: list[int],
+    fixed_holes: FixedHoleMap,
+) -> list[HoleRequest]:
+    """Choose exact corruption spans without yet constructing model tensors."""
+
+    requests: list[HoleRequest] = []
+    if policy.hole_placement == "corrupt_gen_frame":
+        skip_reasons: Counter[str] = Counter()
+        for index in indices:
+            hole, skip_reason = _corrupt_gen_frame_hole_spec_with_reason(
                 dataset,
-                idx,
+                index,
                 corr_pos=float(getattr(args, "corr_pos", 0.4)),
-                eligibility_bytes=corr_eligibility_bytes,
+                eligibility_bytes=policy.corruption_eligibility_bytes,
                 seed=int(args.seed),
                 frame_type=str(getattr(args, "corr_frame_type", "any")),
             )
-            if hole is not None:
-                requests.append((idx, hole, None))
-    elif requested_hole_set == "trained":
+            if hole is None:
+                reason = skip_reason or "unknown_hole_selection_failure"
+                skip_reasons[reason] += 1
+                _log_sample_skip(dataset, index, reason)
+                continue
+            requests.append(HoleRequest(index, hole, None))
+        if skip_reasons:
+            print(
+                "Hole-selection skip summary: "
+                + ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(skip_reasons.items())
+                ),
+                flush=True,
+            )
+        return requests
+
+    if policy.hole_set == "trained":
         indexed_holes: list[tuple[int, list[dict[str, Any]]]] = []
-        for idx in indices:
-            sample = dataset.samples[idx]
+        for index in indices:
+            sample = dataset.samples[index]
             key = (str(sample.h264_path), sample.start_nal, sample.end_nal)
             holes = fixed_holes.get(key)
             if not holes:
                 raise RuntimeError(
                     f"Cached training holes are missing for train window: {key}"
                 )
-            indexed_holes.append((idx, holes))
+            indexed_holes.append((index, holes))
+
+        # Round-robin by hole id, then window. NUM_CLIPS equal to the number of
+        # windows therefore evaluates one hole per window before advancing to K=2.
         for hole_slot in range(max(len(holes) for _, holes in indexed_holes)):
-            for idx, holes in indexed_holes:
+            for index, holes in indexed_holes:
                 if hole_slot >= len(holes):
                     continue
                 expected = holes[hole_slot]
                 requests.append(
-                    (
-                        idx,
+                    HoleRequest(
+                        index,
                         (
                             int(expected["frame_lo"]),
                             int(expected["frame_hi"]),
@@ -802,152 +1049,257 @@ def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
                         expected,
                     )
                 )
-    elif requested_hole_set == "heldout":
-        for idx in indices:
-            sample = dataset.samples[idx]
+        return requests
+
+    if policy.hole_set == "heldout":
+        for index in indices:
+            sample = dataset.samples[index]
             key = (str(sample.h264_path), sample.start_nal, sample.end_nal)
             excluded = tuple(
                 (
-                    int(h["frame_lo"]),
-                    int(h["frame_hi"]),
-                    int(h["fim_split"]),
-                    int(h["fim_gap"]),
+                    int(hole["frame_lo"]),
+                    int(hole["frame_hi"]),
+                    int(hole["fim_split"]),
+                    int(hole["fim_gap"]),
                 )
-                for h in fixed_holes.get(key, [])
+                for hole in fixed_holes.get(key, [])
             )
             for hole in dataset.heldout_fim_hole_specs(
-                idx,
+                index,
                 getattr(args, "heldout_holes_per_window", 1),
                 exclude=excluded,
             ):
-                requests.append((idx, hole, None))
-    else:
-        requests = [(idx, None, None) for idx in indices]
+                requests.append(HoleRequest(index, hole, None))
+        return requests
+
+    return [HoleRequest(index, None, None) for index in indices]
+
+
+def _materialize_fim_sample(
+    args: argparse.Namespace,
+    dataset: ByteStreamWindowDataset,
+    policy: EvalSamplePolicy,
+    request: HoleRequest,
+) -> tuple[WindowFimSample | None, bool, str | None]:
+    """Turn one hole request into the exact prompt, labels, and byte streams."""
+
+    index = request.dataset_index
+    expected = request.expected_training_hole
+    item = (
+        dataset[index]
+        if request.hole_spec is None
+        else dataset.fim_item_for_hole(
+            index,
+            request.hole_spec,
+            hole_id=(int(expected.get("hole_id", 0)) if expected is not None else None),
+        )
+    )
+    if item["sample_meta"].get("task") != "fim":
+        return None, False, "dataset_item_is_not_fim"
+
+    labels: Tensor = item["labels"]
+    if not bool((labels != IGNORE_INDEX).any()):
+        return None, False, "fim_item_has_no_supervised_labels"
+
+    meta = item["sample_meta"]
+    gap = int(meta["fim_gap"])
+    split = int(meta["fim_split"])
+    ar_labels = dataset.ar_item(index)["labels"]
+    if dataset.use_eos:
+        if int(ar_labels[-1]) != SEQ_EOS_ID:
+            raise RuntimeError("window AR item is missing its configured SEQ_EOS")
+        ar_labels = ar_labels[:-1]
+    window_bytes = bytes(ar_labels.tolist())
+    target_ids = list(window_bytes[split : split + gap])
+    if len(target_ids) != gap or any(
+        token < 0 or token >= BYTE_VOCAB_SIZE for token in target_ids
+    ):
+        return None, False, "missing_span_is_truncated_or_not_byte_tokens"
+
+    # Generation starts immediately after FIM_END. Full-sequence supervision
+    # starts earlier, so the prompt boundary must be derived from the known tail.
+    target_token_count = gap + int(args.use_eos)
+    prompt_end = item["input_ids"].numel() - target_token_count + 1
+    if prompt_end <= 0:
+        raise RuntimeError("invalid FIM prompt/target boundary")
+    native_tail = labels[-target_token_count:]
+    expected_tail = torch.tensor(
+        target_ids + ([SEQ_EOS_ID] if args.use_eos else []),
+        dtype=labels.dtype,
+    )
+    if not torch.equal(native_tail, expected_tail):
+        raise RuntimeError(
+            "FIM training labels do not end in the expected missing span; "
+            "evaluation cannot preserve the training patch alignment"
+        )
+
+    window_key = (
+        str(Path(meta["h264_path"])),
+        int(meta["start_nal"]),
+        int(meta["end_nal"]),
+    )
+    replay_verified = expected is not None
+    if expected is not None:
+        _verify_fixed_hole_replay(expected, meta, target_ids, window_key)
+
+    sample = WindowFimSample(
+        sample_index=index,
+        h264_path=Path(meta["h264_path"]),
+        start_nal=int(meta["start_nal"]),
+        end_nal=int(meta["end_nal"]),
+        frame_lo=int(meta["frame_lo"]),
+        frame_hi=int(meta["frame_hi"]),
+        split=int(meta["fim_split"]),
+        gap=int(meta["fim_gap"]),
+        prompt_ids=item["input_ids"][:prompt_end].clone(),
+        prompt_region_ids=item["region_ids"][:prompt_end].clone(),
+        prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
+        teacher_input_ids=item["input_ids"].clone(),
+        teacher_region_ids=item["region_ids"].clone(),
+        teacher_offset_ids=item["offset_ids"].clone(),
+        teacher_labels=item["labels"].clone(),
+        target_bytes=bytes(target_ids),
+        window_bytes=window_bytes,
+        hole_id=(
+            int(meta["fim_hole_id"]) if int(meta.get("fim_hole_id", -1)) >= 0 else None
+        ),
+        corruption_frame_type=(
+            _corruption_frame_type(dataset, index, int(meta["frame_lo"]))
+            if policy.hole_placement == "corrupt_gen_frame"
+            else None
+        ),
+    )
+    return sample, replay_verified, None
+
+
+def _materialize_fim_samples(
+    args: argparse.Namespace,
+    dataset: ByteStreamWindowDataset,
+    policy: EvalSamplePolicy,
+    requests: list[HoleRequest],
+) -> tuple[list[WindowFimSample], int]:
+    """Materialize validated samples in request order up to --num-clips."""
 
     selected: list[WindowFimSample] = []
     verified_fixed_holes = 0
-    for idx, explicit_hole, expected in requests:
-        item = (
-            dataset[idx]
-            if explicit_hole is None
-            else dataset.fim_item_for_hole(
-                idx,
-                explicit_hole,
-                hole_id=(
-                    int(expected.get("hole_id", 0))
-                    if expected is not None
-                    else None
-                ),
-            )
+    skip_reasons: Counter[str] = Counter()
+    for request in requests:
+        sample, replay_verified, skip_reason = _materialize_fim_sample(
+            args, dataset, policy, request
         )
-        if item["sample_meta"].get("task") != "fim":
+        if sample is None:
+            reason = skip_reason or "unknown_materialization_failure"
+            skip_reasons[reason] += 1
+            _log_sample_skip(dataset, request.dataset_index, reason)
             continue
-        labels: Tensor = item["labels"]
-        if not bool((labels != IGNORE_INDEX).any()):
-            continue
-        meta = item["sample_meta"]
-        gap = int(meta["fim_gap"])
-        split = int(meta["fim_split"])
-        ar_labels = dataset.ar_item(idx)["labels"]
-        if dataset.use_eos:
-            if int(ar_labels[-1]) != SEQ_EOS_ID:
-                raise RuntimeError(
-                    "window AR item is missing its configured SEQ_EOS"
-                )
-            ar_labels = ar_labels[:-1]
-        window_bytes = bytes(ar_labels.tolist())
-        target_ids = list(window_bytes[split : split + gap])
-        if len(target_ids) != gap or any(
-            t < 0 or t >= BYTE_VOCAB_SIZE for t in target_ids
-        ):
-            continue
-
-        # Generation always starts immediately after FIM_END. In span-loss mode
-        # this is the first supervised position. In full-loss mode supervision
-        # starts at serialized position zero, so deriving the prompt from the first
-        # supervised label would incorrectly reduce it to one token.
-        target_token_count = gap + int(args.use_eos)
-        prompt_end = item["input_ids"].numel() - target_token_count + 1
-        if prompt_end <= 0:
-            raise RuntimeError("invalid FIM prompt/target boundary")
-        native_tail = labels[-target_token_count:]
-        expected_tail = torch.tensor(
-            target_ids + ([SEQ_EOS_ID] if args.use_eos else []),
-            dtype=labels.dtype,
-        )
-        if not torch.equal(native_tail, expected_tail):
-            raise RuntimeError(
-                "FIM training labels do not end in the expected missing span; "
-                "evaluation cannot preserve the training patch alignment"
-            )
-        window_key = (
-            str(Path(meta["h264_path"])),
-            int(meta["start_nal"]),
-            int(meta["end_nal"]),
-        )
-        if expected is not None:
-            _verify_fixed_hole_replay(expected, meta, target_ids, window_key)
-            verified_fixed_holes += 1
-        selected.append(
-            WindowFimSample(
-                sample_index=idx,
-                h264_path=Path(meta["h264_path"]),
-                start_nal=int(meta["start_nal"]),
-                end_nal=int(meta["end_nal"]),
-                frame_lo=int(meta["frame_lo"]),
-                frame_hi=int(meta["frame_hi"]),
-                split=int(meta["fim_split"]),
-                gap=int(meta["fim_gap"]),
-                prompt_ids=item["input_ids"][:prompt_end].clone(),
-                prompt_region_ids=item["region_ids"][:prompt_end].clone(),
-                prompt_offset_ids=item["offset_ids"][:prompt_end].clone(),
-                teacher_input_ids=item["input_ids"].clone(),
-                teacher_region_ids=item["region_ids"].clone(),
-                teacher_offset_ids=item["offset_ids"].clone(),
-                teacher_labels=item["labels"].clone(),
-                target_bytes=bytes(target_ids),
-                window_bytes=window_bytes,
-                hole_id=(
-                    int(meta["fim_hole_id"])
-                    if int(meta.get("fim_hole_id", -1)) >= 0
-                    else None
-                ),
-                corruption_frame_type=(
-                    _corruption_frame_type(dataset, idx, int(meta["frame_lo"]))
-                    if hole_placement == "corrupt_gen_frame"
-                    else None
-                ),
-            )
-        )
+        selected.append(sample)
+        verified_fixed_holes += int(replay_verified)
         if len(selected) >= args.num_clips:
             break
+    if skip_reasons:
+        print(
+            "Materialization skip summary: "
+            + ", ".join(
+                f"{reason}={count}" for reason, count in sorted(skip_reasons.items())
+            ),
+            flush=True,
+        )
+    if len(selected) < args.num_clips:
+        print(
+            "WARNING: requested "
+            f"{args.num_clips} samples but selected {len(selected)}; "
+            f"eligible_requests={len(requests)}",
+            flush=True,
+        )
+    return selected, verified_fixed_holes
 
-    if not selected:
+
+def _validate_sample_selection(selection: SampleSelection) -> None:
+    """Reject empty selections and print reproducibility checks."""
+
+    if not selection.samples:
         raise RuntimeError(
-            "No FIM samples selected. Lower gap/guard constraints or check that window-FIM is reachable."
+            "No FIM samples selected. Lower gap/guard constraints or check that "
+            "window-FIM is reachable."
         )
-    if requested_hole_set == "trained":
+    if selection.policy.hole_set == "trained":
         print(
-            f"Exact fixed training holes verified: "
-            f"{verified_fixed_holes}/{len(selected)}",
+            "Exact fixed training holes verified: "
+            f"{selection.exact_training_holes_verified}/{len(selection.samples)}",
             flush=True,
         )
-    elif requested_hole_set == "heldout":
+    elif selection.policy.hole_set == "heldout":
         print(
-            f"Held-out holes verified disjoint from cached training pool: "
-            f"{len(selected)}/{len(selected)}",
+            "Held-out holes verified disjoint from cached training pool: "
+            f"{len(selection.samples)}/{len(selection.samples)}",
             flush=True,
         )
-    args.exact_training_holes_verified = verified_fixed_holes
-    args.fixed_training_holes_available = sum(
-        len(holes) for holes in fixed_holes.values()
-    )
     print(
-        f"Selected {len(selected)} FIM samples from hole_set={requested_hole_set} "
-        f"placement={hole_placement}",
+        f"Selected {len(selection.samples)} FIM samples from "
+        f"hole_set={selection.policy.hole_set} "
+        f"placement={selection.policy.hole_placement}",
         flush=True,
     )
-    return selected
+
+
+def build_eval_sample_selection(args: argparse.Namespace) -> SampleSelection:
+    """Build evaluation samples as an explicit six-stage data pipeline."""
+
+    print("[data 1/6] Resolve window and corruption policy", flush=True)
+    policy = _resolve_sample_policy(args)
+
+    print("[data 2/6] Load manifest, NAL index, and window dataset", flush=True)
+    dataset = _load_eval_dataset(args, policy)
+
+    print("[data 3/6] Select evaluation windows", flush=True)
+    indices, fixed_holes = _select_eval_windows(args, dataset, policy)
+
+    print("[data 4/6] Select trained, held-out, or sampled holes", flush=True)
+    policy = _resolve_hole_set(args, policy, fixed_holes)
+    requests = _build_hole_requests(args, dataset, policy, indices, fixed_holes)
+
+    print("[data 5/6] Materialize FIM prompts, targets, and labels", flush=True)
+    samples, verified_fixed_holes = _materialize_fim_samples(
+        args, dataset, policy, requests
+    )
+    selection = SampleSelection(
+        samples=samples,
+        policy=policy,
+        exact_training_holes_verified=verified_fixed_holes,
+        fixed_training_holes_available=sum(
+            len(holes) for holes in fixed_holes.values()
+        ),
+    )
+
+    print("[data 6/6] Validate the final sample set", flush=True)
+    _validate_sample_selection(selection)
+    return selection
+
+
+def _copy_selection_to_args(
+    args: argparse.Namespace,
+    selection: SampleSelection,
+) -> None:
+    """Maintain the legacy list-returning API for external callers and tests."""
+
+    policy = selection.policy
+    args.fim_loss_scope = policy.fim_loss_scope
+    args.window_unit = policy.window_unit
+    args.hole_set = policy.hole_set
+    args.effective_fim_min_gap = policy.min_gap
+    args.effective_fim_max_gap = policy.max_gap
+    args.effective_frame_guard_bytes = policy.frame_guard_bytes
+    args.effective_corr_eligibility_bytes = policy.corruption_eligibility_bytes
+    args.exact_training_holes_verified = selection.exact_training_holes_verified
+    args.fixed_training_holes_available = selection.fixed_training_holes_available
+
+
+def build_eval_samples(args: argparse.Namespace) -> list[WindowFimSample]:
+    """Compatibility wrapper returning only samples as the historical API did."""
+
+    selection = build_eval_sample_selection(args)
+    _copy_selection_to_args(args, selection)
+    return selection.samples
 
 
 def _sample_token(logits: Tensor, temperature: float, top_k: int, top_p: float) -> int:
@@ -987,9 +1339,7 @@ def _seed_parser_state(
     return state
 
 
-def gt_parser_reconnects(
-    sample: WindowFimSample, *, slice_max_mbs: int | None
-) -> bool:
+def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int | None) -> bool:
     """Check that the automaton accepts the unmodified GT middle and suffix."""
     state = _seed_parser_state(sample, slice_max_mbs=slice_max_mbs)
     for byte in sample.target_bytes:
@@ -1033,9 +1383,9 @@ def generate_span(
     region_ids = sample.prompt_region_ids.to(device).unsqueeze(0)
     offset_ids = sample.prompt_offset_ids.to(device).unsqueeze(0)
     prompt_len = prompt.size(1)
-    supervised = (sample.teacher_labels != IGNORE_INDEX).nonzero(
-        as_tuple=False
-    ).flatten()
+    supervised = (
+        (sample.teacher_labels != IGNORE_INDEX).nonzero(as_tuple=False).flatten()
+    )
     if not bool(supervised.numel()):
         return None
     supervision_start = int(supervised[0])
@@ -1080,9 +1430,7 @@ def generate_span(
         )
     else:
         cache_dtype = (
-            torch.bfloat16
-            if device.type == "cuda"
-            else next(raw.parameters()).dtype
+            torch.bfloat16 if device.type == "cuda" else next(raw.parameters()).dtype
         )
         raw.set_kv_cache(
             batch_size=1,
@@ -1110,18 +1458,14 @@ def generate_span(
             ):
                 logits = raw(
                     prompt,
-                    input_pos=torch.arange(
-                        prompt_len, device=device, dtype=torch.long
-                    ),
+                    input_pos=torch.arange(prompt_len, device=device, dtype=torch.long),
                     input_pos_maxp1=prompt_len,
                     region_ids=region_ids,
                     offset_ids=offset_ids,
                 )
         for generated_idx in range(max_new):
             next_logits = (
-                megabyte.next_logits()[0]
-                if megabyte is not None
-                else logits[0, -1]
+                megabyte.next_logits()[0] if megabyte is not None else logits[0, -1]
             )
             byte_logits = next_logits[:BYTE_VOCAB_SIZE].clone()
             if mask_illegal_bytes:
@@ -1308,7 +1652,9 @@ def _teacher_forced_span_mask(labels: Tensor, target_length: int) -> Tensor | No
 
 @torch.inference_mode()
 def teacher_forced_span_metrics(
-    model: nn.Module, sample: WindowFimSample, device: torch.device,
+    model: nn.Module,
+    sample: WindowFimSample,
+    device: torch.device,
 ) -> dict[str, Any] | None:
     """Score the FIM span without changing its training-time patch alignment."""
     raw = _unwrap_model(model)
@@ -1338,7 +1684,9 @@ def teacher_forced_span_metrics(
         offset_ids = sample.teacher_offset_ids.to(device).unsqueeze(0)
         model_kwargs = {}
     with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda",
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=device.type == "cuda",
     ):
         logits = raw(
             idx,
@@ -1515,15 +1863,9 @@ def save_fim_videos(
             "gt_full_ffmpeg_decode": item["gt_full_ffmpeg_decode"],
             "corrupted_strict_decode_status": item["corrupted_strict_status"],
             "corrupted_strict_ffmpeg_decode": item["corrupted_strict_decode"],
-            "corrupted_concealed_decode_status": item[
-                "corrupted_concealed_status"
-            ],
-            "corrupted_concealed_ffmpeg_decode": item[
-                "corrupted_concealed_decode"
-            ],
-            "repaired_full_strict_decode_status": item[
-                "repaired_full_strict_status"
-            ],
+            "corrupted_concealed_decode_status": item["corrupted_concealed_status"],
+            "corrupted_concealed_ffmpeg_decode": item["corrupted_concealed_decode"],
+            "repaired_full_strict_decode_status": item["repaired_full_strict_status"],
             "repaired_full_ffmpeg_decode": item["repaired_full_strict_decode"],
             "panel_frame_counts": {
                 "clean_gt_strict": len(item["gt_full_frames"]),
@@ -1547,9 +1889,7 @@ def save_fim_videos(
                 corrupted_stream=item["corrupted_full_stream"],
                 repaired_stream=item["repaired_full_stream"],
                 strict_corrupted_frame_count=len(item["corrupted_strict_frames"]),
-                concealed_corrupted_frame_count=len(
-                    item["corrupted_concealed_frames"]
-                ),
+                concealed_corrupted_frame_count=len(item["corrupted_concealed_frames"]),
                 repaired_frame_count=len(item["repaired_full_frames"]),
                 reference_frame_count=len(item["gt_full_frames"]),
                 frame_height=int(reference.shape[0]),
@@ -1613,8 +1953,7 @@ def summarize(
         r.get("strict_decode_status") or "not_run" for r in details
     )
     corrupted_concealed_statuses = Counter(
-        r.get("corrupted_concealed_decode_status") or "not_run"
-        for r in details
+        r.get("corrupted_concealed_decode_status") or "not_run" for r in details
     )
     mask_failure_reasons = Counter(
         r["mask_failure_reason"] for r in details if r.get("mask_failure_reason")
@@ -1632,7 +1971,8 @@ def summarize(
         AR._merge_counts(elem_correct, row.get("element_correct_counts", {}))
         AR._merge_counts(elem_legal, row.get("syntax_legal_counts", {}))
         AR._merge_counts(
-            elem_illegal_different, row.get("syntax_illegal_when_different_counts", {}),
+            elem_illegal_different,
+            row.get("syntax_illegal_when_different_counts", {}),
         )
 
     probability_count = sum(
@@ -1725,9 +2065,11 @@ def summarize(
     end_to_end_success_rate = (
         AR.mean(
             [
-                1.0
-                if termination_results[i] and details[i].get("strict_valid")
-                else 0.0
+                (
+                    1.0
+                    if termination_results[i] and details[i].get("strict_valid")
+                    else 0.0
+                )
                 for i in range(n)
             ]
         )
@@ -1797,9 +2139,7 @@ def summarize(
         "corrupted_concealed_target_frame_rate": (
             AR.mean(
                 [
-                    1.0
-                    if r.get("corrupted_concealed_target_frame_available")
-                    else 0.0
+                    1.0 if r.get("corrupted_concealed_target_frame_available") else 0.0
                     for r in details
                 ]
             )
@@ -1850,7 +2190,11 @@ def summarize(
             if t >= 16
         },
         "syntax_illegal_when_different_by_element": {
-            e: {"illegal_rate": h / t, "illegal_count": h, "different_count": t,}
+            e: {
+                "illegal_rate": h / t,
+                "illegal_count": h,
+                "different_count": t,
+            }
             for e, (h, t) in sorted(elem_illegal_different.items())
             if t > 0
         },
@@ -1901,11 +2245,13 @@ def summarize(
             "count": len(group),
             "termination_success_rate": AR.mean(
                 [
-                    1.0
-                    if _termination_succeeded(
-                        stop_mode, str(row.get("stop_reason") or "none")
+                    (
+                        1.0
+                        if _termination_succeeded(
+                            stop_mode, str(row.get("stop_reason") or "none")
+                        )
+                        else 0.0
                     )
-                    else 0.0
                     for row in group
                 ]
             ),
@@ -1942,8 +2288,18 @@ def summarize(
     return out
 
 
-def main() -> None:
-    args = parse_args()
+def announce_stage(number: int, title: str, detail: str | None = None) -> None:
+    """Print one stable, user-facing stage marker for long cluster evaluations."""
+
+    message = f"\n=== Step {number}: {title} ==="
+    if detail:
+        message += f"\n{detail}"
+    print(message, flush=True)
+
+
+def configure_evaluation(args: argparse.Namespace) -> tuple[torch.device, int | None]:
+    """Validate CLI configuration and resolve the runtime device/parser layout."""
+
     HM.configure_debug(args.mask_debug)
     slice_max_mbs = (
         HM.slice_max_mbs_for_layout(args.slice_layout)
@@ -1952,544 +2308,726 @@ def main() -> None:
     )
     if slice_max_mbs is not None and slice_max_mbs <= 0:
         raise SystemExit("--slice-max-mbs must be positive")
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     )
-    samples = build_eval_samples(args)
-    gt_reconnect_ok: list[bool | None]
-    if "parser_reconnect" in args.stop_modes:
-        gt_reconnect_ok = [
-            gt_parser_reconnects(sample, slice_max_mbs=slice_max_mbs)
-            for sample in samples
-        ]
-        gt_reconnect_count = sum(gt_reconnect_ok)
+    return device, slice_max_mbs
+
+
+def validate_parser_reconnection(
+    args: argparse.Namespace,
+    samples: list[WindowFimSample],
+    *,
+    slice_max_mbs: int | None,
+) -> list[bool | None]:
+    """Preflight GT syntax for every evaluation mode that uses the automaton.
+
+    Masked learned-EOS generation uses the same automaton as parser-reconnection:
+    it filters every generated byte and permits EOS only when the fixed suffix can
+    be appended legally.  Replay the untouched GT middle through that path before
+    evaluating the model so an unsupported valid stream cannot be misreported as
+    a model failure.
+    """
+
+    masked_evaluation = bool(getattr(args, "mask_illegal_bytes", False))
+    parser_reconnect_evaluation = "parser_reconnect" in args.stop_modes
+    if not (masked_evaluation or parser_reconnect_evaluation):
+        return [None] * len(samples)
+
+    reconnect_ok = [
+        gt_parser_reconnects(sample, slice_max_mbs=slice_max_mbs) for sample in samples
+    ]
+    reconnect_count = sum(reconnect_ok)
+    print(
+        f"GT automaton preflight: {reconnect_count}/{len(samples)}",
+        flush=True,
+    )
+    if masked_evaluation and reconnect_count != len(samples):
+        failed = [index for index, ok in enumerate(reconnect_ok) if not ok]
+        raise RuntimeError(
+            "Masked evaluation requires the H.264 automaton to accept every "
+            "untouched GT middle and suffix, but only "
+            f"{reconnect_count}/{len(samples)} samples passed. Failed sample "
+            f"indices: {failed}. Inspect unsupported syntax before evaluating "
+            "the model."
+        )
+    if reconnect_count == 0:
+        raise RuntimeError(
+            "The parser could not reconnect the GT middle for any sample; "
+            "parser_reconnect evaluation would be invalid."
+        )
+    if reconnect_count != len(samples):
         print(
-            f"GT parser-reconnection sanity: {gt_reconnect_count}/{len(samples)}",
+            "WARNING: parser reconnection cannot certify every GT sample; "
+            "those samples remain visible as failures.",
             flush=True,
         )
-        if gt_reconnect_count == 0:
-            raise RuntimeError(
-                "The parser could not reconnect the GT middle for any sample; "
-                "parser_reconnect evaluation would be invalid."
-            )
-        if gt_reconnect_count != len(samples):
-            print(
-                "WARNING: parser reconnection cannot certify every GT sample; "
-                "those samples remain visible as failures.",
-                flush=True,
-            )
-    else:
-        gt_reconnect_ok = [None] * len(samples)
-    (args.out_dir / "config.json").write_text(
-        json.dumps(jsonable(vars(args)), indent=2) + "\n", encoding="utf-8"
+    return reconnect_ok
+
+
+def sample_manifest_row(
+    args: argparse.Namespace,
+    policy: EvalSamplePolicy,
+    sample_id: int,
+    sample: WindowFimSample,
+    gt_parser_reconnect_ok: bool | None,
+) -> dict[str, Any]:
+    """Describe the exact clean window and corruption used for one sample."""
+
+    available_positions = (
+        sample.frame_hi - (sample.frame_lo + policy.frame_guard_bytes) - sample.gap
     )
-    sample_manifest = [
-        {
-            "sample_id": i,
-            "dataset_index": s.sample_index,
-            "h264_path": str(s.h264_path),
-            "start_nal": s.start_nal,
-            "end_nal": s.end_nal,
-            "frame_lo": s.frame_lo,
-            "frame_hi": s.frame_hi,
-            "split": s.split,
-            "gap": s.gap,
-            "hole_id": s.hole_id,
-            "target_length": s.target_length,
-            "hole_placement": args.hole_placement,
-            "corruption_frame_type": s.corruption_frame_type,
-            "requested_corr_pos": (
-                args.corr_pos
-                if args.hole_placement == "corrupt_gen_frame"
-                else None
-            ),
-            "actual_corr_pos": (
-                (
-                    (s.split - (s.frame_lo + args.effective_frame_guard_bytes))
-                    / (
-                        s.frame_hi
-                        - (s.frame_lo + args.effective_frame_guard_bytes)
-                        - s.gap
-                    )
-                )
-                if args.hole_placement == "corrupt_gen_frame"
-                and s.frame_hi
-                - (s.frame_lo + args.effective_frame_guard_bytes)
-                - s.gap
-                > 0
-                else None
-            ),
-            "gt_parser_reconnect_ok": gt_reconnect_ok[i],
-        }
-        for i, s in enumerate(samples)
+    actual_corr_pos = (
+        (sample.split - (sample.frame_lo + policy.frame_guard_bytes))
+        / available_positions
+        if policy.hole_placement == "corrupt_gen_frame" and available_positions > 0
+        else None
+    )
+    return {
+        "sample_id": sample_id,
+        "eval_split": args.eval_split,
+        "dataset_index": sample.sample_index,
+        "h264_path": str(sample.h264_path),
+        "start_nal": sample.start_nal,
+        "end_nal": sample.end_nal,
+        "frame_lo": sample.frame_lo,
+        "frame_hi": sample.frame_hi,
+        "split": sample.split,
+        "gap": sample.gap,
+        "hole_id": sample.hole_id,
+        "target_length": sample.target_length,
+        "hole_placement": policy.hole_placement,
+        "corruption_frame_type": sample.corruption_frame_type,
+        "requested_corr_pos": (
+            args.corr_pos if policy.hole_placement == "corrupt_gen_frame" else None
+        ),
+        "actual_corr_pos": actual_corr_pos,
+        "gt_parser_reconnect_ok": gt_parser_reconnect_ok,
+    }
+
+
+def write_evaluation_inputs(
+    args: argparse.Namespace,
+    selection: SampleSelection,
+    reconnect_ok: list[bool | None],
+) -> None:
+    """Persist resolved configuration and exact sample/corruption definitions."""
+
+    policy = selection.policy
+    resolved_config = {
+        **vars(args),
+        "fim_loss_scope": policy.fim_loss_scope,
+        "window_unit": policy.window_unit,
+        "hole_set": policy.hole_set,
+        "effective_fim_min_gap": policy.min_gap,
+        "effective_fim_max_gap": policy.max_gap,
+        "effective_frame_guard_bytes": policy.frame_guard_bytes,
+        "effective_corr_eligibility_bytes": (policy.corruption_eligibility_bytes),
+        "exact_training_holes_verified": (selection.exact_training_holes_verified),
+        "fixed_training_holes_available": (selection.fixed_training_holes_available),
+    }
+    (args.out_dir / "config.json").write_text(
+        json.dumps(jsonable(resolved_config), indent=2) + "\n", encoding="utf-8"
+    )
+    manifest = [
+        sample_manifest_row(
+            args,
+            policy,
+            sample_id,
+            sample,
+            reconnect_ok[sample_id],
+        )
+        for sample_id, sample in enumerate(selection.samples)
     ]
     (args.out_dir / "samples.json").write_text(
-        json.dumps(jsonable(sample_manifest), indent=2) + "\n", encoding="utf-8"
+        json.dumps(jsonable(manifest), indent=2) + "\n", encoding="utf-8"
     )
+
+
+def prepare_checkpoint_inputs(
+    args: argparse.Namespace,
+    model: nn.Module,
+    samples: list[WindowFimSample],
+    device: torch.device,
+) -> CheckpointInputs:
+    """Run teacher forcing and decode fixed references once per checkpoint."""
+
+    teacher_forced = [
+        teacher_forced_span_metrics(model, sample, device) for sample in samples
+    ]
+    ground_truth: list[DecodedStream] = []
+    corrupted_concealed: list[DecodedStream] = []
+    for sample in samples:
+        if not args.decode:
+            ground_truth.append(([], "not_run", {}))
+            corrupted_concealed.append(([], "not_run", {}))
+            continue
+        ground_truth.append(
+            AR.decode_h264(
+                sample.gt_truncated_stream,
+                args,
+                strict=True,
+                max_frames=None,
+            )
+        )
+        corrupted_concealed.append(
+            AR.decode_h264(
+                sample.corrupted_stream,
+                args,
+                strict=False,
+                max_frames=None,
+                keep_partial_on_error=True,
+            )
+        )
+    return CheckpointInputs(
+        teacher_forced=teacher_forced,
+        ground_truth=ground_truth,
+        corrupted_concealed=corrupted_concealed,
+        visualization={},
+    )
+
+
+def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
+    """Write the cross-checkpoint, cross-stopping-mode summary table."""
+
+    if not summaries:
+        return
+    fieldnames = sorted({key for row in summaries for key in row})
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in summaries:
+            writer.writerow(jsonable(row))
+
+
+def build_repair_result_row(
+    args: argparse.Namespace,
+    *,
+    checkpoint_name: str,
+    stop_mode: str,
+    sample_id: int,
+    sample: WindowFimSample,
+    result: GenerationResult,
+    teacher_forced_metrics: dict[str, Any] | None,
+    gt_parser_reconnect_ok: bool | None,
+    corrupted_concealed_status: str,
+    corrupted_concealed_decode: dict[str, Any],
+) -> tuple[dict[str, Any], bytes]:
+    """Insert generated bytes and record syntax/parser diagnostics."""
+
+    model_stream = sample.repaired_stream(result.data)
+    gt_stream = sample.gt_truncated_stream
+    gt_parse = repaired_stream_diagnostics(
+        gt_stream, sample.split, sample.target_length
+    )
+    model_parse = repaired_stream_diagnostics(
+        model_stream, sample.split, len(result.data)
+    )
+    row = {
+        "checkpoint": checkpoint_name,
+        "eval_split": args.eval_split,
+        "stop_mode": stop_mode,
+        "sample_id": sample_id,
+        "dataset_index": sample.sample_index,
+        "h264_path": str(sample.h264_path),
+        "start_nal": sample.start_nal,
+        "end_nal": sample.end_nal,
+        "frame_lo": sample.frame_lo,
+        "frame_hi": sample.frame_hi,
+        "split": sample.split,
+        "gap": sample.gap,
+        "target_length": sample.target_length,
+        "generated_length": len(result.data),
+        "target_bytes": sample.target_length,
+        "completed_bytes": model_parse["completed_bytes"],
+        "completed_frames": 0,
+        "target_frames": 1,
+        "eos_stopped": result.eos_stopped,
+        "stop_reason": result.stop_reason,
+        "termination_succeeded": _termination_succeeded(stop_mode, result.stop_reason),
+        "parser_reconnect_checks": result.parser_reconnect_checks,
+        "parser_reconnect_found": result.parser_reconnect_found,
+        "parser_failure_reason": result.parser_failure_reason,
+        "gt_parser_reconnect_ok": gt_parser_reconnect_ok,
+        "mask_enabled": args.mask_illegal_bytes,
+        "slice_layout": args.slice_layout,
+        "mask_calls": result.mask_calls,
+        "mask_strict_calls": result.mask_strict_calls,
+        "mask_permissive_calls": result.mask_permissive_calls,
+        "mask_argmax_rejected": result.mask_argmax_rejected,
+        "mask_eos_checks": result.mask_eos_checks,
+        "mask_eos_blocked": result.mask_eos_blocked,
+        "mask_failure_reason": result.mask_failure_reason,
+        "mask_probability_mass_sum": result.mask_probability_mass_sum,
+        "mask_probability_mass_count": result.mask_probability_mass_count,
+        "first_mask_intervention": result.first_mask_intervention,
+        "gt_parse_ok": gt_parse.get("parse_ok", False),
+        "model_parse_ok": model_parse.get("parse_ok", False),
+        "desync_region": model_parse["desync_region"],
+        "desync_category": model_parse["desync_category"],
+        "desync_reason": model_parse["desync_reason"],
+        "first_desync": model_parse["first_desync"],
+        "gt_parse": gt_parse,
+        "model_parse": model_parse,
+        "hole_placement": args.hole_placement,
+        "corruption_frame_type": sample.corruption_frame_type,
+        "requested_corr_pos": (
+            args.corr_pos if args.hole_placement == "corrupt_gen_frame" else None
+        ),
+        "corrupted_concealed_decode_status": corrupted_concealed_status,
+        "corrupted_concealed_ffmpeg_decode": corrupted_concealed_decode,
+    }
+    if teacher_forced_metrics is not None:
+        row.update(teacher_forced_metrics)
+    return row, model_stream
+
+
+def save_repair_streams(
+    stream_dir: Path,
+    *,
+    sample_id: int,
+    stop_mode: str,
+    sample: WindowFimSample,
+    result: GenerationResult,
+    model_stream: bytes,
+) -> dict[str, str]:
+    """Save clean, corrupted, repaired, target-span, and generated-span bytes."""
+
+    stem = f"sample_{sample_id:04d}_{stop_mode}"
+    paths = {
+        "gt_stream_path": stream_dir / f"{stem}_gt.h264",
+        "model_stream_path": stream_dir / f"{stem}_model.h264",
+        "corrupted_stream_path": stream_dir / f"{stem}_corrupted.h264",
+        "gt_missing_path": stream_dir / f"{stem}_missing_gt.bin",
+        "model_missing_path": stream_dir / f"{stem}_missing_model.bin",
+    }
+    paths["gt_stream_path"].write_bytes(sample.gt_truncated_stream)
+    paths["model_stream_path"].write_bytes(model_stream)
+    paths["corrupted_stream_path"].write_bytes(sample.corrupted_stream)
+    paths["gt_missing_path"].write_bytes(sample.target_bytes)
+    paths["model_missing_path"].write_bytes(result.data)
+    return {key: str(path) for key, path in paths.items()}
+
+
+def decode_and_score_repair(
+    args: argparse.Namespace,
+    *,
+    row: dict[str, Any],
+    model_stream: bytes,
+    gt_frames: list[Tensor],
+    corrupted_concealed_frames: list[Tensor],
+) -> tuple[int, bool]:
+    """Strictly decode the repair and compute frame-level quality metrics."""
+
+    if not args.decode:
+        row.update({"strict_valid": None, "strict_decode_status": "not_run"})
+        return 0, False
+
+    model_frames, model_status, model_decode = AR.decode_h264(
+        model_stream, args, strict=True, max_frames=None
+    )
+    prefix_frames = max(0, len(gt_frames) - 1)
+    produced = max(0, min(1, len(model_frames) - prefix_frames))
+    strict_valid = model_status == "decoded" and produced >= 1
+    row.update(
+        {
+            "prefix_frames": prefix_frames,
+            "completed_frames": produced,
+            "strict_valid": strict_valid,
+            "strict_decode_status": model_status,
+            "strict_decode_seconds": model_decode.get("elapsed_seconds"),
+            "timeout_complete_frames": model_decode.get(
+                "complete_frames_before_exit", 0
+            ),
+            "ffmpeg_decode": model_decode,
+        }
+    )
+
+    target_index = len(gt_frames) - 1
+    corrupted_target_available = (
+        target_index < len(corrupted_concealed_frames)
+        and corrupted_concealed_frames[target_index].shape
+        == gt_frames[target_index].shape
+    )
+    row["corrupted_concealed_target_frame_available"] = corrupted_target_available
+    if corrupted_target_available:
+        corrupted_psnr = AR.image_psnr(
+            gt_frames[target_index], corrupted_concealed_frames[target_index]
+        )
+        row["corrupted_concealed_psnr"] = (
+            AR.PSNR_PERFECT_CAP if corrupted_psnr == float("inf") else corrupted_psnr
+        )
+        row["corrupted_concealed_ssim"] = AR.image_ssim(
+            gt_frames[target_index], corrupted_concealed_frames[target_index]
+        )
+
+    row["real_appearance_features"] = AR.appearance_features(gt_frames[target_index])
+    if target_index > 0:
+        row["real_motion_features"] = AR.motion_features(
+            gt_frames[target_index], gt_frames[target_index - 1]
+        )
+    if (
+        target_index >= len(model_frames)
+        or model_frames[target_index].shape != gt_frames[target_index].shape
+    ):
+        return prefix_frames, strict_valid
+
+    repaired_psnr = AR.image_psnr(gt_frames[target_index], model_frames[target_index])
+    row["cont_psnr_mean"] = (
+        AR.PSNR_PERFECT_CAP if repaired_psnr == float("inf") else repaired_psnr
+    )
+    row["cont_ssim_mean"] = AR.image_ssim(
+        gt_frames[target_index], model_frames[target_index]
+    )
+    if row.get("corrupted_concealed_psnr") is not None:
+        row["repair_psnr_lift_db"] = (
+            row["cont_psnr_mean"] - row["corrupted_concealed_psnr"]
+        )
+    if row.get("corrupted_concealed_ssim") is not None:
+        row["repair_ssim_lift"] = (
+            row["cont_ssim_mean"] - row["corrupted_concealed_ssim"]
+        )
+    row["gen_appearance_features"] = AR.appearance_features(model_frames[target_index])
+    if target_index > 0:
+        row["gen_motion_features"] = AR.motion_features(
+            model_frames[target_index], model_frames[target_index - 1]
+        )
+    return prefix_frames, strict_valid
+
+
+def prepare_repair_visualization(
+    args: argparse.Namespace,
+    *,
+    checkpoint_name: str,
+    stop_mode: str,
+    sample_id: int,
+    sample: WindowFimSample,
+    result: GenerationResult,
+    row: dict[str, Any],
+    prefix_frames: int,
+    strict_valid: bool,
+    input_cache: dict[int, tuple[Any, ...]],
+) -> dict[str, Any]:
+    """Decode full-window panels and assemble one visualization record."""
+
+    if sample_id not in input_cache:
+        gt_full = AR.decode_h264(
+            sample.window_bytes, args, strict=True, max_frames=None
+        )
+        corrupted_strict = AR.decode_h264(
+            sample.corrupted_full_stream,
+            args,
+            strict=True,
+            max_frames=None,
+            keep_partial_on_error=True,
+        )
+        corrupted_concealed = AR.decode_h264(
+            sample.corrupted_full_stream,
+            args,
+            strict=False,
+            max_frames=None,
+            keep_partial_on_error=True,
+        )
+        input_cache[sample_id] = (*gt_full, *corrupted_strict, *corrupted_concealed)
+
+    (
+        gt_full_frames,
+        gt_full_status,
+        gt_full_decode,
+        corrupted_strict_frames,
+        corrupted_strict_status,
+        corrupted_strict_decode,
+        corrupted_concealed_frames,
+        corrupted_concealed_status,
+        corrupted_concealed_decode,
+    ) = input_cache[sample_id]
+    (
+        repaired_full_frames,
+        repaired_full_strict_status,
+        repaired_full_strict_decode,
+    ) = AR.decode_h264(
+        sample.repaired_full_stream(result.data),
+        args,
+        strict=True,
+        max_frames=None,
+        keep_partial_on_error=True,
+    )
+    comparison_path = (
+        args.out_dir
+        / "frames"
+        / checkpoint_name
+        / f"sample_{sample_id:04d}_{stop_mode}.mp4"
+    )
+    row["comparison_video_path"] = str(comparison_path)
+    return {
+        "gt_full_frames": [frame.cpu() for frame in gt_full_frames],
+        "corrupted_strict_frames": [frame.cpu() for frame in corrupted_strict_frames],
+        "corrupted_concealed_frames": [
+            frame.cpu() for frame in corrupted_concealed_frames
+        ],
+        "repaired_full_frames": [frame.cpu() for frame in repaired_full_frames],
+        "target_frame": prefix_frames,
+        "gt_full_strict_decode_status": gt_full_status,
+        "gt_full_ffmpeg_decode": gt_full_decode,
+        "corrupted_strict_status": corrupted_strict_status,
+        "corrupted_strict_decode": corrupted_strict_decode,
+        "corrupted_concealed_status": corrupted_concealed_status,
+        "corrupted_concealed_decode": corrupted_concealed_decode,
+        "repaired_full_strict_status": repaired_full_strict_status,
+        "repaired_full_strict_decode": repaired_full_strict_decode,
+        "panel_stream_bytes": {
+            "clean_gt": len(sample.window_bytes),
+            "corrupted": len(sample.corrupted_full_stream),
+            "repaired": len(sample.repaired_full_stream(result.data)),
+        },
+        "clean_full_stream": sample.window_bytes,
+        "corrupted_full_stream": sample.corrupted_full_stream,
+        "repaired_full_stream": sample.repaired_full_stream(result.data),
+        "corruption_frame_type": sample.corruption_frame_type,
+        "strict_valid": strict_valid,
+        "h264_path": str(sample.h264_path),
+        "corrupted_concealed_psnr": row.get("corrupted_concealed_psnr"),
+        "repaired_psnr": row.get("cont_psnr_mean"),
+        "repair_psnr_lift_db": row.get("repair_psnr_lift_db"),
+    }
+
+
+def evaluate_stop_mode(
+    args: argparse.Namespace,
+    *,
+    model: nn.Module,
+    device: torch.device,
+    checkpoint_dir: Path,
+    checkpoint_name: str,
+    stream_dir: Path,
+    selection: SampleSelection,
+    checkpoint_inputs: CheckpointInputs,
+    stop_mode: str,
+    slice_max_mbs: int | None,
+    gt_reconnect_ok: list[bool | None],
+    details_path: Path,
+    metrics_path: Path,
+) -> dict[str, Any]:
+    """Restore every corrupted span for one checkpoint/stopping-mode pair."""
+
+    samples = selection.samples
+    policy = selection.policy
+    rows: list[dict[str, Any]] = []
+    viz: dict[int, dict[str, Any]] = {}
+    skipped_prompt_or_budget = 0
+    skipped_gt_decode_short = 0
+    for sample_id, sample in enumerate(samples):
+        tf_metrics = checkpoint_inputs.teacher_forced[sample_id]
+        gt_frames, gt_status, gt_decode = checkpoint_inputs.ground_truth[sample_id]
+        (
+            corrupted_concealed_frames,
+            corrupted_concealed_status,
+            corrupted_concealed_decode,
+        ) = checkpoint_inputs.corrupted_concealed[sample_id]
+        if args.decode and (gt_status != "decoded" or not gt_frames):
+            skipped_gt_decode_short += 1
+            rows.append(
+                {
+                    "checkpoint": checkpoint_name,
+                    "stop_mode": stop_mode,
+                    "sample_id": sample_id,
+                    "dataset_index": sample.sample_index,
+                    "error": "gt_decode_short",
+                    "gt_strict_decode_status": gt_status,
+                    "gt_ffmpeg_decode": gt_decode,
+                }
+            )
+            continue
+        result = generate_span(
+            model,
+            sample,
+            device,
+            stop_mode=stop_mode,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            max_gen_bytes=args.max_gen_bytes,
+            mask_illegal_bytes=args.mask_illegal_bytes,
+            slice_max_mbs=slice_max_mbs,
+        )
+        if result is None:
+            skipped_prompt_or_budget += 1
+            row = {
+                "checkpoint": checkpoint_name,
+                "stop_mode": stop_mode,
+                "sample_id": sample_id,
+                "dataset_index": sample.sample_index,
+                "error": "prompt_or_budget_too_long",
+            }
+            rows.append(row)
+            continue
+
+        row, model_stream = build_repair_result_row(
+            args,
+            checkpoint_name=checkpoint_name,
+            stop_mode=stop_mode,
+            sample_id=sample_id,
+            sample=sample,
+            result=result,
+            teacher_forced_metrics=tf_metrics,
+            gt_parser_reconnect_ok=gt_reconnect_ok[sample_id],
+            corrupted_concealed_status=corrupted_concealed_status,
+            corrupted_concealed_decode=corrupted_concealed_decode,
+        )
+        if args.save_streams:
+            row.update(
+                save_repair_streams(
+                    stream_dir,
+                    sample_id=sample_id,
+                    stop_mode=stop_mode,
+                    sample=sample,
+                    result=result,
+                    model_stream=model_stream,
+                )
+            )
+
+        prefix_frames, strict_valid = decode_and_score_repair(
+            args,
+            row=row,
+            model_stream=model_stream,
+            gt_frames=gt_frames,
+            corrupted_concealed_frames=corrupted_concealed_frames,
+        )
+        if args.decode and sample_id < args.num_visualizations:
+            viz[sample_id] = prepare_repair_visualization(
+                args,
+                checkpoint_name=checkpoint_name,
+                stop_mode=stop_mode,
+                sample_id=sample_id,
+                sample=sample,
+                result=result,
+                row=row,
+                prefix_frames=prefix_frames,
+                strict_valid=strict_valid,
+                input_cache=checkpoint_inputs.visualization,
+            )
+        rows.append(row)
+    announce_stage(
+        7,
+        "Write visualizations and reports",
+        f"checkpoint={checkpoint_name} stop_mode={stop_mode}",
+    )
+    if args.decode:
+        save_fim_videos(
+            viz,
+            args.out_dir / "frames" / checkpoint_name,
+            checkpoint_name,
+            stop_mode,
+            args,
+        )
+    write_jsonl(details_path, rows)
+    valid_rows = [r for r in rows if "error" not in r]
+    summary = {
+        "checkpoint": checkpoint_name,
+        "checkpoint_dir": str(checkpoint_dir),
+        "mode": "fim_avclm",
+        "eval_split": args.eval_split,
+        "stop_mode": stop_mode,
+        "slice_layout": args.slice_layout,
+        "window_unit": policy.window_unit,
+        "hole_placement": policy.hole_placement,
+        "corr_frame_type": args.corr_frame_type,
+        "corr_len_bytes": args.corr_len_bytes,
+        "corr_pos": (
+            args.corr_pos if policy.hole_placement == "corrupt_gen_frame" else None
+        ),
+        "exact_training_holes_verified": (selection.exact_training_holes_verified),
+        "fixed_training_holes_available": (selection.fixed_training_holes_available),
+        **summarize(
+            valid_rows,
+            stop_mode=stop_mode,
+            skipped_prompt_or_budget=skipped_prompt_or_budget,
+            skipped_gt_decode_short=skipped_gt_decode_short,
+            mask_enabled=args.mask_illegal_bytes,
+            decode_enabled=args.decode,
+        ),
+    }
+    write_jsonl(metrics_path, [summary])
+    print(
+        f"[{checkpoint_name}/{stop_mode}] success={summary.get('success_rate')!s} "
+        f"termination={summary.get('termination_success_rate')!s} "
+        f"decode={summary.get('repair_decode_success_rate')!s} "
+        f"frames={summary.get('completed_frames_total', 0)}/"
+        f"{summary.get('target_frames_total', 0)} "
+        f"bytes={summary.get('completed_bytes_total', 0)}/"
+        f"{summary.get('target_bytes_total', 0)} "
+        f"desync_top={summary.get('desync_region_top')}",
+        flush=True,
+    )
+    return summary
+
+
+def main() -> None:
+    args = parse_args()
+
+    announce_stage(1, "Resolve configuration")
+    device, slice_max_mbs = configure_evaluation(args)
+
+    announce_stage(
+        2,
+        "Load data and construct corruptions",
+        f"hole_placement={args.hole_placement} num_samples={args.num_clips}",
+    )
+    selection = build_eval_sample_selection(args)
+    samples = selection.samples
+
+    announce_stage(3, "Validate corruption and stopping assumptions")
+    gt_reconnect_ok = validate_parser_reconnection(
+        args, samples, slice_max_mbs=slice_max_mbs
+    )
+    write_evaluation_inputs(args, selection, gt_reconnect_ok)
 
     metrics_path = args.out_dir / "metrics.jsonl"
     details_path = args.out_dir / "sample_details.jsonl"
     summaries: list[dict[str, Any]] = []
 
     for checkpoint_dir in args.checkpoint_dirs:
+        announce_stage(4, "Load checkpoint", str(checkpoint_dir))
         model = load_model(checkpoint_dir, device)
         ckpt_name = checkpoint_dir.name
         stream_dir = args.out_dir / "streams" / ckpt_name
         if args.save_streams:
             stream_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[{ckpt_name}] teacher-forced and GT decode setup", flush=True)
-        tf_cache = [
-            teacher_forced_span_metrics(model, sample, device) for sample in samples
-        ]
-        gt_cache: list[tuple[list[Tensor], str, dict[str, Any]]] = []
-        corrupted_concealed_cache: list[
-            tuple[list[Tensor], str, dict[str, Any]]
-        ] = []
-        for sample in samples:
-            if args.decode:
-                gt_cache.append(
-                    AR.decode_h264(
-                        sample.gt_truncated_stream, args, strict=True, max_frames=None,
-                    )
-                )
-                corrupted_concealed_cache.append(
-                    AR.decode_h264(
-                        sample.corrupted_stream,
-                        args,
-                        strict=False,
-                        max_frames=None,
-                        keep_partial_on_error=True,
-                    )
-                )
-            else:
-                gt_cache.append(([], "not_run", {}))
-                corrupted_concealed_cache.append(([], "not_run", {}))
-        # Full-window GT and deleted-span inputs are checkpoint- and stopping-mode-
-        # independent. Decode them lazily for visualization. The strict corrupted
-        # view preserves complete frames emitted before failure; the concealed view
-        # deliberately uses FFmpeg defaults to match BSCV's visible-corruption path.
-        fim_viz_input_cache: dict[
-            int,
-            tuple[
-                list[Tensor],
-                str,
-                dict[str, Any],
-                list[Tensor],
-                str,
-                dict[str, Any],
-                list[Tensor],
-                str,
-                dict[str, Any],
-            ],
-        ] = {}
+
+        announce_stage(
+            5,
+            "Measure teacher forcing and decode references",
+            f"checkpoint={ckpt_name}",
+        )
+        checkpoint_inputs = prepare_checkpoint_inputs(args, model, samples, device)
+
         for stop_mode in args.stop_modes:
-            print(f"[{ckpt_name}] FIM AVC-LM stop_mode={stop_mode}", flush=True)
-            rows: list[dict[str, Any]] = []
-            viz: dict[int, dict[str, Any]] = {}
-            skipped_prompt_or_budget = 0
-            skipped_gt_decode_short = 0
-            for sample_id, sample in enumerate(samples):
-                tf_metrics = tf_cache[sample_id]
-                gt_frames, gt_status, gt_decode = gt_cache[sample_id]
-                (
-                    corrupted_concealed_frames,
-                    corrupted_concealed_status,
-                    corrupted_concealed_decode,
-                ) = corrupted_concealed_cache[sample_id]
-                if args.decode and (gt_status != "decoded" or not gt_frames):
-                    skipped_gt_decode_short += 1
-                    rows.append(
-                        {
-                            "checkpoint": ckpt_name,
-                            "stop_mode": stop_mode,
-                            "sample_id": sample_id,
-                            "dataset_index": sample.sample_index,
-                            "error": "gt_decode_short",
-                            "gt_strict_decode_status": gt_status,
-                            "gt_ffmpeg_decode": gt_decode,
-                        }
-                    )
-                    continue
-                result = generate_span(
-                    model,
-                    sample,
-                    device,
-                    stop_mode=stop_mode,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    top_p=args.top_p,
-                    max_gen_bytes=args.max_gen_bytes,
-                    mask_illegal_bytes=args.mask_illegal_bytes,
-                    slice_max_mbs=slice_max_mbs,
-                )
-                if result is None:
-                    skipped_prompt_or_budget += 1
-                    row = {
-                        "checkpoint": ckpt_name,
-                        "stop_mode": stop_mode,
-                        "sample_id": sample_id,
-                        "dataset_index": sample.sample_index,
-                        "error": "prompt_or_budget_too_long",
-                    }
-                    rows.append(row)
-                    continue
-
-                model_stream = sample.repaired_stream(result.data)
-                gt_stream = sample.gt_truncated_stream
-                gt_parse = repaired_stream_diagnostics(
-                    gt_stream, sample.split, sample.target_length
-                )
-                model_parse = repaired_stream_diagnostics(
-                    model_stream, sample.split, len(result.data)
-                )
-                row = {
-                    "checkpoint": ckpt_name,
-                    "stop_mode": stop_mode,
-                    "sample_id": sample_id,
-                    "dataset_index": sample.sample_index,
-                    "h264_path": str(sample.h264_path),
-                    "start_nal": sample.start_nal,
-                    "end_nal": sample.end_nal,
-                    "frame_lo": sample.frame_lo,
-                    "frame_hi": sample.frame_hi,
-                    "split": sample.split,
-                    "gap": sample.gap,
-                    "target_length": sample.target_length,
-                    "generated_length": len(result.data),
-                    "target_bytes": sample.target_length,
-                    "completed_bytes": model_parse["completed_bytes"],
-                    "completed_frames": 0,
-                    "target_frames": 1,
-                    "eos_stopped": result.eos_stopped,
-                    "stop_reason": result.stop_reason,
-                    "termination_succeeded": _termination_succeeded(
-                        stop_mode, result.stop_reason
-                    ),
-                    "parser_reconnect_checks": result.parser_reconnect_checks,
-                    "parser_reconnect_found": result.parser_reconnect_found,
-                    "parser_failure_reason": result.parser_failure_reason,
-                    "gt_parser_reconnect_ok": gt_reconnect_ok[sample_id],
-                    "mask_enabled": args.mask_illegal_bytes,
-                    "slice_layout": args.slice_layout,
-                    "mask_calls": result.mask_calls,
-                    "mask_strict_calls": result.mask_strict_calls,
-                    "mask_permissive_calls": result.mask_permissive_calls,
-                    "mask_argmax_rejected": result.mask_argmax_rejected,
-                    "mask_eos_checks": result.mask_eos_checks,
-                    "mask_eos_blocked": result.mask_eos_blocked,
-                    "mask_failure_reason": result.mask_failure_reason,
-                    "mask_probability_mass_sum": result.mask_probability_mass_sum,
-                    "mask_probability_mass_count": result.mask_probability_mass_count,
-                    "first_mask_intervention": result.first_mask_intervention,
-                    "gt_parse_ok": gt_parse.get("parse_ok", False),
-                    "model_parse_ok": model_parse.get("parse_ok", False),
-                    "desync_region": model_parse["desync_region"],
-                    "desync_category": model_parse["desync_category"],
-                    "desync_reason": model_parse["desync_reason"],
-                    "first_desync": model_parse["first_desync"],
-                    "gt_parse": gt_parse,
-                    "model_parse": model_parse,
-                    "hole_placement": args.hole_placement,
-                    "corruption_frame_type": sample.corruption_frame_type,
-                    "requested_corr_pos": (
-                        args.corr_pos
-                        if args.hole_placement == "corrupt_gen_frame"
-                        else None
-                    ),
-                    "corrupted_concealed_decode_status": (
-                        corrupted_concealed_status
-                    ),
-                    "corrupted_concealed_ffmpeg_decode": (
-                        corrupted_concealed_decode
-                    ),
-                }
-                if tf_metrics is not None:
-                    row.update(tf_metrics)
-                if args.save_streams:
-                    stem = f"sample_{sample_id:04d}_{stop_mode}"
-                    gt_path = stream_dir / f"{stem}_gt.h264"
-                    model_path = stream_dir / f"{stem}_model.h264"
-                    corrupted_path = stream_dir / f"{stem}_corrupted.h264"
-                    missing_path = stream_dir / f"{stem}_missing_gt.bin"
-                    gen_path = stream_dir / f"{stem}_missing_model.bin"
-                    gt_path.write_bytes(gt_stream)
-                    model_path.write_bytes(model_stream)
-                    corrupted_path.write_bytes(sample.corrupted_stream)
-                    missing_path.write_bytes(sample.target_bytes)
-                    gen_path.write_bytes(result.data)
-                    row.update(
-                        {
-                            "gt_stream_path": str(gt_path),
-                            "model_stream_path": str(model_path),
-                            "corrupted_stream_path": str(corrupted_path),
-                            "gt_missing_path": str(missing_path),
-                            "model_missing_path": str(gen_path),
-                        }
-                    )
-                if args.decode:
-                    model_frames, model_status, model_decode = AR.decode_h264(
-                        model_stream, args, strict=True, max_frames=None
-                    )
-                    prefix_frames = max(0, len(gt_frames) - 1)
-                    produced = max(0, min(1, len(model_frames) - prefix_frames))
-                    strict_valid = model_status == "decoded" and produced >= 1
-                    row.update(
-                        {
-                            "prefix_frames": prefix_frames,
-                            "completed_frames": produced,
-                            "strict_valid": strict_valid,
-                            "strict_decode_status": model_status,
-                            "strict_decode_seconds": model_decode.get(
-                                "elapsed_seconds"
-                            ),
-                            "timeout_complete_frames": model_decode.get(
-                                "complete_frames_before_exit", 0
-                            ),
-                            "ffmpeg_decode": model_decode,
-                        }
-                    )
-                    target_index = len(gt_frames) - 1
-                    corrupted_target_available = (
-                        target_index < len(corrupted_concealed_frames)
-                        and corrupted_concealed_frames[target_index].shape
-                        == gt_frames[target_index].shape
-                    )
-                    row["corrupted_concealed_target_frame_available"] = (
-                        corrupted_target_available
-                    )
-                    if corrupted_target_available:
-                        corrupted_psnr = AR.image_psnr(
-                            gt_frames[target_index],
-                            corrupted_concealed_frames[target_index],
-                        )
-                        row["corrupted_concealed_psnr"] = (
-                            AR.PSNR_PERFECT_CAP
-                            if corrupted_psnr == float("inf")
-                            else corrupted_psnr
-                        )
-                        row["corrupted_concealed_ssim"] = AR.image_ssim(
-                            gt_frames[target_index],
-                            corrupted_concealed_frames[target_index],
-                        )
-                    row["real_appearance_features"] = AR.appearance_features(
-                        gt_frames[target_index]
-                    )
-                    if target_index > 0:
-                        row["real_motion_features"] = AR.motion_features(
-                            gt_frames[target_index], gt_frames[target_index - 1]
-                        )
-                    if (
-                        target_index < len(model_frames)
-                        and model_frames[target_index].shape
-                        == gt_frames[target_index].shape
-                    ):
-                        p = AR.image_psnr(
-                            gt_frames[target_index], model_frames[target_index]
-                        )
-                        row["cont_psnr_mean"] = (
-                            AR.PSNR_PERFECT_CAP if p == float("inf") else p
-                        )
-                        row["cont_ssim_mean"] = AR.image_ssim(
-                            gt_frames[target_index], model_frames[target_index]
-                        )
-                        if row.get("corrupted_concealed_psnr") is not None:
-                            row["repair_psnr_lift_db"] = (
-                                row["cont_psnr_mean"]
-                                - row["corrupted_concealed_psnr"]
-                            )
-                        if row.get("corrupted_concealed_ssim") is not None:
-                            row["repair_ssim_lift"] = (
-                                row["cont_ssim_mean"]
-                                - row["corrupted_concealed_ssim"]
-                            )
-                        row["gen_appearance_features"] = AR.appearance_features(
-                            model_frames[target_index]
-                        )
-                        if target_index > 0:
-                            row["gen_motion_features"] = AR.motion_features(
-                                model_frames[target_index],
-                                model_frames[target_index - 1],
-                            )
-                    if sample_id < args.num_visualizations:
-                        if sample_id not in fim_viz_input_cache:
-                            gt_full = AR.decode_h264(
-                                sample.window_bytes,
-                                args,
-                                strict=True,
-                                max_frames=None,
-                            )
-                            corrupted_strict = AR.decode_h264(
-                                sample.corrupted_full_stream,
-                                args,
-                                strict=True,
-                                max_frames=None,
-                                keep_partial_on_error=True,
-                            )
-                            corrupted_concealed = AR.decode_h264(
-                                sample.corrupted_full_stream,
-                                args,
-                                strict=False,
-                                max_frames=None,
-                                keep_partial_on_error=True,
-                            )
-                            fim_viz_input_cache[sample_id] = (
-                                *gt_full,
-                                *corrupted_strict,
-                                *corrupted_concealed,
-                            )
-                        (
-                            gt_full_frames,
-                            gt_full_status,
-                            gt_full_decode,
-                            corrupted_strict_frames,
-                            corrupted_strict_status,
-                            corrupted_strict_decode,
-                            corrupted_concealed_frames,
-                            corrupted_concealed_status,
-                            corrupted_concealed_decode,
-                        ) = fim_viz_input_cache[sample_id]
-                        (
-                            repaired_full_frames,
-                            repaired_full_strict_status,
-                            repaired_full_strict_decode,
-                        ) = AR.decode_h264(
-                            sample.repaired_full_stream(result.data),
-                            args,
-                            strict=True,
-                            max_frames=None,
-                            keep_partial_on_error=True,
-                        )
-                        comparison_path = (
-                            args.out_dir
-                            / "frames"
-                            / ckpt_name
-                            / f"sample_{sample_id:04d}_{stop_mode}.mp4"
-                        )
-                        viz[sample_id] = {
-                            "gt_full_frames": [
-                                frame.cpu() for frame in gt_full_frames
-                            ],
-                            "corrupted_strict_frames": [
-                                frame.cpu() for frame in corrupted_strict_frames
-                            ],
-                            "corrupted_concealed_frames": [
-                                frame.cpu() for frame in corrupted_concealed_frames
-                            ],
-                            "repaired_full_frames": [
-                                frame.cpu() for frame in repaired_full_frames
-                            ],
-                            "target_frame": prefix_frames,
-                            "gt_full_strict_decode_status": gt_full_status,
-                            "gt_full_ffmpeg_decode": gt_full_decode,
-                            "corrupted_strict_status": corrupted_strict_status,
-                            "corrupted_strict_decode": corrupted_strict_decode,
-                            "corrupted_concealed_status": (
-                                corrupted_concealed_status
-                            ),
-                            "corrupted_concealed_decode": (
-                                corrupted_concealed_decode
-                            ),
-                            "repaired_full_strict_status": (
-                                repaired_full_strict_status
-                            ),
-                            "repaired_full_strict_decode": (
-                                repaired_full_strict_decode
-                            ),
-                            "panel_stream_bytes": {
-                                "clean_gt": len(sample.window_bytes),
-                                "corrupted": len(sample.corrupted_full_stream),
-                                "repaired": len(
-                                    sample.repaired_full_stream(result.data)
-                                ),
-                            },
-                            "clean_full_stream": sample.window_bytes,
-                            "corrupted_full_stream": sample.corrupted_full_stream,
-                            "repaired_full_stream": sample.repaired_full_stream(
-                                result.data
-                            ),
-                            "corruption_frame_type": (
-                                sample.corruption_frame_type
-                            ),
-                            "strict_valid": strict_valid,
-                            "h264_path": str(sample.h264_path),
-                            "corrupted_concealed_psnr": row.get(
-                                "corrupted_concealed_psnr"
-                            ),
-                            "repaired_psnr": row.get("cont_psnr_mean"),
-                            "repair_psnr_lift_db": row.get(
-                                "repair_psnr_lift_db"
-                            ),
-                        }
-                        row["comparison_video_path"] = str(comparison_path)
-                else:
-                    row.update(
-                        {"strict_valid": None, "strict_decode_status": "not_run",}
-                    )
-                rows.append(row)
-            if args.decode:
-                save_fim_videos(
-                    viz,
-                    args.out_dir / "frames" / ckpt_name,
-                    ckpt_name,
-                    stop_mode,
-                    args,
-                )
-            write_jsonl(details_path, rows)
-            valid_rows = [r for r in rows if "error" not in r]
-            summary = {
-                "checkpoint": ckpt_name,
-                "checkpoint_dir": str(checkpoint_dir),
-                "mode": "fim_avclm",
-                "stop_mode": stop_mode,
-                "slice_layout": args.slice_layout,
-                "window_unit": args.window_unit,
-                "hole_placement": args.hole_placement,
-                "corr_frame_type": args.corr_frame_type,
-                "corr_len_bytes": args.corr_len_bytes,
-                "corr_pos": (
-                    args.corr_pos
-                    if args.hole_placement == "corrupt_gen_frame"
-                    else None
-                ),
-                "exact_training_holes_verified": int(
-                    getattr(args, "exact_training_holes_verified", 0)
-                ),
-                "fixed_training_holes_available": int(
-                    getattr(args, "fixed_training_holes_available", 0)
-                ),
-                **summarize(
-                    valid_rows,
-                    stop_mode=stop_mode,
-                    skipped_prompt_or_budget=skipped_prompt_or_budget,
-                    skipped_gt_decode_short=skipped_gt_decode_short,
-                    mask_enabled=args.mask_illegal_bytes,
-                    decode_enabled=args.decode,
-                ),
-            }
-            write_jsonl(metrics_path, [summary])
-            summaries.append(summary)
-            print(
-                f"[{ckpt_name}/{stop_mode}] success={summary.get('success_rate')!s} "
-                f"termination={summary.get('termination_success_rate')!s} "
-                f"decode={summary.get('repair_decode_success_rate')!s} "
-                f"frames={summary.get('completed_frames_total', 0)}/"
-                f"{summary.get('target_frames_total', 0)} "
-                f"bytes={summary.get('completed_bytes_total', 0)}/"
-                f"{summary.get('target_bytes_total', 0)} "
-                f"desync_top={summary.get('desync_region_top')}",
-                flush=True,
+            announce_stage(
+                6,
+                "Restore spans, parse, and strictly decode",
+                f"checkpoint={ckpt_name} stop_mode={stop_mode}",
             )
+            summary = evaluate_stop_mode(
+                args,
+                model=model,
+                device=device,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_name=ckpt_name,
+                stream_dir=stream_dir,
+                selection=selection,
+                checkpoint_inputs=checkpoint_inputs,
+                stop_mode=stop_mode,
+                slice_max_mbs=slice_max_mbs,
+                gt_reconnect_ok=gt_reconnect_ok,
+                details_path=details_path,
+                metrics_path=metrics_path,
+            )
+            summaries.append(summary)
 
-    if summaries:
-        fieldnames = sorted({k for row in summaries for k in row.keys()})
-        with (args.out_dir / "summary.csv").open(
-            "w", newline="", encoding="utf-8"
-        ) as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in summaries:
-                writer.writerow(jsonable(row))
+    announce_stage(8, "Finalize cross-checkpoint summary")
+    write_summary_csv(args.out_dir / "summary.csv", summaries)
 
 
 if __name__ == "__main__":
