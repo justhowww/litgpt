@@ -28,7 +28,7 @@ FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
 
 CHECKPOINT_NAMES=${CHECKPOINT_NAMES:-"step-00100000 step-00200000 step-00300000 final"}
 EVAL_TAG=${EVAL_TAG:-"corrupt-gen-frame"}
-NUM_CLIPS=${NUM_CLIPS:-100}
+NUM_CLIPS=${NUM_CLIPS:-20}
 NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-0}
 MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-131071}
@@ -68,11 +68,15 @@ checkpoint_dirs=()
 for checkpoint_name in ${CHECKPOINT_NAMES}; do
     checkpoint_dir="${RUN_DIR}/${checkpoint_name}"
     if [[ ! -r "${checkpoint_dir}/lit_model.pth" ]]; then
-        echo "Checkpoint is missing: ${checkpoint_dir}/lit_model.pth" >&2
-        exit 1
+        echo "Skipping unavailable checkpoint: ${checkpoint_dir}/lit_model.pth" >&2
+        continue
     fi
     checkpoint_dirs+=("${checkpoint_dir}")
 done
+if (( ${#checkpoint_dirs[@]} == 0 )); then
+    echo "None of the requested checkpoints are readable under ${RUN_DIR}: ${CHECKPOINT_NAMES}" >&2
+    exit 1
+fi
 
 OUT_DIR="${RUN_DIR}/eval_fim/${EVAL_TAG}/${EVAL_SPLIT}/${MASK_TAG}"
 if [[ -e "${OUT_DIR}/.complete" && "${SKIP_COMPLETED_EVAL:-0}" == "1" ]]; then

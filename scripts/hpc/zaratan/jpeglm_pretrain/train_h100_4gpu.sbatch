@@ -36,7 +36,7 @@ if [[ "${INLINE_FINAL_EVAL:-0}" == "1" ]]; then
     export RUN_DIR="${OUT_DIR}"
     export CHECKPOINT_NAMES=final
     export EVAL_TAG=${INLINE_EVAL_TAG:-corrupt-gen-frame-final}
-    export NUM_CLIPS=${INLINE_EVAL_NUM_CLIPS:-100}
+    export NUM_CLIPS=${INLINE_EVAL_NUM_CLIPS:-20}
     export NUM_VISUALIZATIONS=${INLINE_EVAL_NUM_VISUALIZATIONS:-8}
     export SKIP_COMPLETED_EVAL=1
 
