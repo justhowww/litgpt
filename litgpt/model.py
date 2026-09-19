@@ -54,8 +54,12 @@ class GPT(nn.Module):
                 n_embd=config.megabyte_local_n_embd,
                 n_head=config.megabyte_local_n_head,
                 head_size=None,
-                n_query_groups=None,
-                intermediate_size=4 * config.megabyte_local_n_embd,
+                n_query_groups=config.megabyte_local_n_query_groups,
+                intermediate_size=(
+                    config.megabyte_local_intermediate_size
+                    if config.megabyte_local_intermediate_size is not None
+                    else 4 * config.megabyte_local_n_embd
+                ),
                 byte_patch_size=1,
                 use_region_id=False,
                 use_offset_id=False,

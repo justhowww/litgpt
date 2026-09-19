@@ -14,7 +14,6 @@ import torch
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.byte.grpo import GRPOConfig
 from litgpt.byte.mrt import MRTConfig, MRT_RISK_MODES
-from litgpt.config import Config
 from litgpt.byte.data import (
     DATASET_MODES,
     FIM_FORMATS,
@@ -28,6 +27,10 @@ from litgpt.byte.data import (
 from litgpt.byte.reconstruction import ReconstructionEvalConfig
 from litgpt.byte.free_run_eval import FreeRunEvalConfig
 from litgpt.byte.h264_mask import SLICE_LAYOUT_MACROBLOCK, SLICE_LAYOUTS
+from litgpt.byte.model_config import (
+    BYTE_MODEL_ARCHITECTURES,
+    build_byte_model_config,
+)
 from litgpt.pretrain import setup
 
 
@@ -35,6 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--model-name", default="byte-stage1")
+    parser.add_argument(
+        "--model-architecture",
+        choices=BYTE_MODEL_ARCHITECTURES,
+        default="pythia",
+        help=(
+            "Transformer block family for both the global model and the "
+            "MEGABYTE local model. 'pythia' preserves the existing GPT-NeoX "
+            "defaults; 'qwen3' uses RMSNorm, SwiGLU, full RoPE, QK-Norm, "
+            "bias-free projections, and 4:1 grouped-query attention."
+        ),
+    )
     parser.add_argument(
         "--nal-index-path",
         type=Path,
@@ -634,7 +648,8 @@ def main() -> None:
     use_offset_id = not args.no_offset_id
     max_tokens = args.steps * args.global_batch_size * args.block_size
 
-    model_config = Config(
+    model_config = build_byte_model_config(
+        architecture=args.model_architecture,
         name=args.model_name,
         block_size=args.block_size,
         n_layer=args.n_layer,

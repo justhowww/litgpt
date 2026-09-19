@@ -15,6 +15,7 @@ N_LAYER=${N_LAYER:-32}
 N_EMBD=${N_EMBD:-4096}
 N_HEAD=${N_HEAD:-64}
 MODEL_TAG=${MODEL_TAG:-byte-jpeglm-7b-megabyte-patch8-fim-p050-fullseq-eos-1m}
+MODEL_ARCHITECTURE=${MODEL_ARCHITECTURE:-pythia}
 BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE:-8}
 if (( BYTE_PATCH_SIZE < 1 )); then
     echo "BYTE_PATCH_SIZE=${BYTE_PATCH_SIZE} must be positive" >&2
@@ -123,6 +124,20 @@ if (( MEGABYTE_LOCAL_EMBD % MEGABYTE_LOCAL_HEADS != 0 )); then
     echo "MEGABYTE_LOCAL_EMBD=${MEGABYTE_LOCAL_EMBD} must be divisible by MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS}" >&2
     exit 1
 fi
+if [[ "${MODEL_ARCHITECTURE}" != "pythia" && "${MODEL_ARCHITECTURE}" != "qwen3" ]]; then
+    echo "MODEL_ARCHITECTURE must be pythia or qwen3" >&2
+    exit 1
+fi
+if [[ "${MODEL_ARCHITECTURE}" == "qwen3" ]]; then
+    if (( N_HEAD % 4 != 0 )); then
+        echo "Qwen3 N_HEAD=${N_HEAD} must be divisible by 4 for grouped-query attention" >&2
+        exit 1
+    fi
+    if (( MEGABYTE_LOCAL_HEADS % 4 != 0 )); then
+        echo "Qwen3 MEGABYTE_LOCAL_HEADS=${MEGABYTE_LOCAL_HEADS} must be divisible by 4 for grouped-query attention" >&2
+        exit 1
+    fi
+fi
 if [[ "${SAVE_FINAL}" != "0" && "${SAVE_FINAL}" != "1" ]]; then
     echo "SAVE_FINAL must be 0 or 1" >&2
     exit 1
@@ -149,6 +164,7 @@ cmd=(
     --nal-index-path "${NAL_INDEX}"
     --out-dir "${OUT_DIR}"
     --model-name "${MODEL_TAG}"
+    --model-architecture "${MODEL_ARCHITECTURE}"
     --n-layer "${N_LAYER}"
     --n-embd "${N_EMBD}"
     --n-head "${N_HEAD}"
@@ -212,7 +228,7 @@ if [[ "${COMPILE}" == "1" ]]; then
     cmd+=(--compile)
 fi
 
-echo "[jpeglm] model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} global_positions=${BLOCK_SIZE} raw_capacity=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
+echo "[jpeglm] architecture=${MODEL_ARCHITECTURE} model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} global_positions=${BLOCK_SIZE} raw_capacity=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
 echo "[jpeglm] rows=${MAX_ROWS} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} micro=${MICRO_BATCH_SIZE} devices=${DEVICES} activation_checkpointing=${ACTIVATION_CHECKPOINTING} compile=${COMPILE}"
 echo "[jpeglm] length_bucketing=${ENABLE_LENGTH_BUCKETING} pool_size=${LENGTH_BUCKET_POOL_SIZE} (training only)"
 echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} EOS=on split=held-out-video"

@@ -13,6 +13,7 @@ MODEL_TAG=${MODEL_TAG:-byte-jpeglm-7b-megabyte-patch8-fim-p050-fullseq-eos-1m}
 OUT_DIR=${OUT_DIR:-"${STAGED_CORPUS}/runs/${MODEL_TAG}"}
 SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-metzler-prj-cmsc}
 SBATCH_MEM=${SBATCH_MEM:-320G}
+TRAIN_CPUS_PER_TASK=${TRAIN_CPUS_PER_TASK:-}
 JOB_SCRIPT=${JOB_SCRIPT:-"${SCRIPT_DIR}/train_h100_4gpu.sbatch"}
 
 FIM_MIN_GAP=${FIM_MIN_GAP:-64}
@@ -55,6 +56,13 @@ sbatch_args=(
     --output="${OUT_DIR}/logs/%x-%j.out"
     --error="${OUT_DIR}/logs/%x-%j.err"
 )
+if [[ -n "${TRAIN_CPUS_PER_TASK}" ]]; then
+    if [[ ! "${TRAIN_CPUS_PER_TASK}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "TRAIN_CPUS_PER_TASK must be a positive integer; got ${TRAIN_CPUS_PER_TASK}" >&2
+        exit 2
+    fi
+    sbatch_args+=(--cpus-per-task="${TRAIN_CPUS_PER_TASK}")
+fi
 if [[ -n "${EXCLUDE_NODES:-}" ]]; then
     sbatch_args+=(--exclude="${EXCLUDE_NODES}")
 fi
@@ -70,4 +78,5 @@ job_id=$(sbatch "${sbatch_args[@]}" "${JOB_SCRIPT}")
 echo "Submitted JPEG-LM pretraining job ${job_id}"
 echo "Output directory: ${OUT_DIR}"
 echo "Requested memory: ${SBATCH_MEM}"
+[[ -n "${TRAIN_CPUS_PER_TASK}" ]] && echo "CPUs per training rank: ${TRAIN_CPUS_PER_TASK}"
 [[ -n "${AFTER_JOBID:-}" ]] && echo "Dependency: ${DEPENDENCY_TYPE}:${AFTER_JOBID}"

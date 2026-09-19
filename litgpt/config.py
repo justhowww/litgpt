@@ -39,6 +39,9 @@ class Config:
     region_vocab_size: int = 7
     use_offset_id: bool = False
     offset_vocab_size: int | None = None
+    # Architecture family used by the byte-domain training launcher. This is
+    # saved in model_config.yaml so byte checkpoints remain self-describing.
+    byte_model_architecture: Literal["pythia", "qwen3"] = "pythia"
     # MEGABYTE-style byte patching. A value greater than one means each global
     # Transformer position represents this many consecutive byte/control ids.
     # A smaller local Transformer predicts the bytes causally inside each patch.
@@ -46,6 +49,8 @@ class Config:
     megabyte_local_n_layer: int = 4
     megabyte_local_n_embd: int = 512
     megabyte_local_n_head: int = 8
+    megabyte_local_n_query_groups: int | None = None
+    megabyte_local_intermediate_size: int | None = None
     # Transformer block (structure, normalizations)
     norm_class_name: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
     norm_eps: float = 1e-5
@@ -146,6 +151,26 @@ class Config:
                 raise ValueError(
                     "megabyte_local_n_embd must be divisible by "
                     "megabyte_local_n_head"
+                )
+            if self.megabyte_local_n_query_groups is not None:
+                if self.megabyte_local_n_query_groups < 1:
+                    raise ValueError(
+                        "megabyte_local_n_query_groups must be positive"
+                    )
+                if (
+                    self.megabyte_local_n_head
+                    % self.megabyte_local_n_query_groups
+                ):
+                    raise ValueError(
+                        "megabyte_local_n_head must be divisible by "
+                        "megabyte_local_n_query_groups"
+                    )
+            if (
+                self.megabyte_local_intermediate_size is not None
+                and self.megabyte_local_intermediate_size < 1
+            ):
+                raise ValueError(
+                    "megabyte_local_intermediate_size must be positive"
                 )
         if not self.name:
             self.name = self.hf_config.get("name", self.name)
