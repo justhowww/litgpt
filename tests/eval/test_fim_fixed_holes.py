@@ -12,6 +12,7 @@ from scripts.byte.eval.eval_fim_avclm import (
     _corrupt_gen_frame_hole_spec,
     _corrupt_gen_frame_hole_spec_with_reason,
     _load_train_split,
+    _requested_corruption_lengths,
     _verify_fixed_hole_replay,
     summarize,
 )
@@ -150,6 +151,41 @@ def test_corrupt_gen_frame_hole_explains_undersized_frame(tmp_path):
     )
 
 
+def test_corrupt_gen_frame_accepts_an_explicit_length_schedule(tmp_path):
+    stream = tmp_path / "clip.h264"
+    stream.write_bytes(b"x" * 4096)
+
+    class FakeDataset:
+        fim_min_gap = 64
+        fim_max_gap = 600
+        frame_guard_bytes = 0
+        samples = [SimpleNamespace(h264_path=Path(stream))]
+
+        @staticmethod
+        def _fim_candidates(sample, data):
+            return [(0, 1300)]
+
+    hole, reason = _corrupt_gen_frame_hole_spec_with_reason(
+        FakeDataset(),
+        0,
+        corr_pos=0.4,
+        eligibility_bytes=256,
+        seed=42,
+        gap_bytes=256,
+    )
+
+    assert reason is None
+    assert hole == (0, 1300, 417, 256)
+
+
+def test_requested_corruption_lengths_preserves_schedule_order():
+    args = SimpleNamespace(
+        corr_len_bytes=None,
+        corr_len_bytes_list=[64, 128, 600],
+    )
+    assert _requested_corruption_lengths(args) == [64, 128, 600]
+
+
 def test_corruption_frame_type_reads_idr_and_p_slice_type(tmp_path):
     path = tmp_path / "clip.h264"
     # first_mb_in_slice=0 and slice_type=P(0) are each encoded as ue(v) bit 1.
@@ -206,3 +242,12 @@ def test_summary_reports_corruption_baseline_and_repair_lift():
         == 20.0
     )
     assert summary["repair_quality_paired_count"] == 1
+    assert summary["corruption_by_length_bytes"]["100"] == {
+        "count": 1,
+        "frame_type_hist": {"p": 1},
+        "termination_success_rate": 1.0,
+        "repair_decode_success_rate": 1.0,
+        "corrupted_concealed_psnr_mean": 20.0,
+        "repaired_psnr_mean": 30.0,
+        "repair_psnr_lift_db_mean": 10.0,
+    }

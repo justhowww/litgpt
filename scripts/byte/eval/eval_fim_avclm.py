@@ -337,6 +337,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--corr-len-bytes-list",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Deterministic corruption-severity schedule for corrupt_gen_frame. "
+            "Select exactly one distinct clip for each listed byte length. This "
+            "is mutually exclusive with --corr-len-bytes."
+        ),
+    )
+    parser.add_argument(
+        "--corr-samples-per-length",
+        type=int,
+        default=1,
+        help=(
+            "Number of distinct clips selected for every entry in "
+            "--corr-len-bytes-list. Ignored by single-length evaluation."
+        ),
+    )
+    parser.add_argument(
         "--corr-header-guard-bytes",
         type=int,
         default=4,
@@ -443,17 +463,31 @@ def parse_args() -> argparse.Namespace:
         parser.error("--corr-pos must be in [0, 1]")
     if args.corr_header_guard_bytes < 0:
         parser.error("--corr-header-guard-bytes must be non-negative")
+    if args.corr_samples_per_length <= 0:
+        parser.error("--corr-samples-per-length must be positive")
     if args.hole_placement == "corrupt_gen_frame":
-        if args.corr_len_bytes is None or args.corr_len_bytes <= 0:
+        if args.corr_len_bytes is not None and args.corr_len_bytes_list is not None:
             parser.error(
-                "--hole-placement corrupt_gen_frame requires positive "
-                "--corr-len-bytes"
+                "--corr-len-bytes and --corr-len-bytes-list are mutually exclusive"
             )
+        corruption_lengths = _requested_corruption_lengths(args)
+        if not corruption_lengths:
+            parser.error(
+                "--hole-placement corrupt_gen_frame requires --corr-len-bytes "
+                "or --corr-len-bytes-list"
+            )
+        if any(length <= 0 for length in corruption_lengths):
+            parser.error("all corruption lengths must be positive")
+        if len(set(corruption_lengths)) != len(corruption_lengths):
+            parser.error("--corr-len-bytes-list must not contain duplicates")
         if (
             args.corr_eligibility_bytes is not None
-            and args.corr_eligibility_bytes < args.corr_len_bytes
+            and args.corr_eligibility_bytes < max(corruption_lengths)
         ):
-            parser.error("--corr-eligibility-bytes must be at least --corr-len-bytes")
+            parser.error(
+                "--corr-eligibility-bytes must be at least the largest requested "
+                "corruption length"
+            )
         if args.hole_set not in ("auto", "sampled"):
             parser.error(
                 "--hole-placement corrupt_gen_frame is incompatible with "
@@ -462,6 +496,16 @@ def parse_args() -> argparse.Namespace:
     elif args.corr_frame_type != "any":
         parser.error("--corr-frame-type requires --hole-placement corrupt_gen_frame")
     return args
+
+
+def _requested_corruption_lengths(args: argparse.Namespace) -> list[int]:
+    """Return the ordered corrupt_gen_frame deletion schedule."""
+
+    scheduled = getattr(args, "corr_len_bytes_list", None)
+    if scheduled is not None:
+        return [int(length) for length in scheduled]
+    scalar = getattr(args, "corr_len_bytes", None)
+    return [int(scalar)] if scalar is not None else []
 
 
 def _load_train_split(
@@ -599,6 +643,7 @@ def _corrupt_gen_frame_hole_spec(
     eligibility_bytes: int,
     seed: int,
     frame_type: str = "any",
+    gap_bytes: int | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Compatibility wrapper returning only the selected corruption span."""
 
@@ -609,6 +654,7 @@ def _corrupt_gen_frame_hole_spec(
         eligibility_bytes=eligibility_bytes,
         seed=seed,
         frame_type=frame_type,
+        gap_bytes=gap_bytes,
     )
     return hole
 
@@ -621,6 +667,7 @@ def _corrupt_gen_frame_hole_spec_with_reason(
     eligibility_bytes: int,
     seed: int,
     frame_type: str = "any",
+    gap_bytes: int | None = None,
 ) -> tuple[tuple[int, int, int, int] | None, str | None]:
     """Select one exact, byte-aligned corrupt_Gen-style frame deletion.
 
@@ -629,8 +676,16 @@ def _corrupt_gen_frame_hole_spec_with_reason(
     span always has the full requested length; otherwise the reason explains why
     this window is ineligible instead of silently shortening the deletion.
     """
-    if dataset.fim_min_gap != dataset.fim_max_gap:
+    if gap_bytes is None and dataset.fim_min_gap != dataset.fim_max_gap:
         raise ValueError("corrupt_gen_frame requires one fixed deletion length")
+    gap = int(dataset.fim_min_gap if gap_bytes is None else gap_bytes)
+    if not dataset.fim_min_gap <= gap <= dataset.fim_max_gap:
+        raise ValueError(
+            f"requested corruption length {gap} is outside the dataset range "
+            f"[{dataset.fim_min_gap}, {dataset.fim_max_gap}]"
+        )
+    if eligibility_bytes < gap:
+        raise ValueError("eligibility_bytes must be at least the corruption length")
     sample = dataset.samples[idx]
     data = sample.h264_path.read_bytes()
     candidates = dataset._fim_candidates(sample, data)
@@ -677,7 +732,6 @@ def _corrupt_gen_frame_hole_spec_with_reason(
     # severity runs are reproducible without depending on DataLoader RNG state.
     rng = random.Random((int(seed) << 32) ^ int(idx))
     frame_lo, frame_hi = rng.choice(candidates)
-    gap = dataset.fim_min_gap
     first_start = frame_lo + dataset.frame_guard_bytes
     available = frame_hi - first_start - gap
     if available < 0:
@@ -754,14 +808,15 @@ def _resolve_sample_policy(args: argparse.Namespace) -> EvalSamplePolicy:
     hole_placement = str(
         getattr(args, "hole_placement", "training_random")
     )  # "corrupt_gen_frame" for fixed corruption control / "training_random" for random corruption control
-    corr_len_bytes = getattr(args, "corr_len_bytes", None)
+    corruption_lengths = _requested_corruption_lengths(args)
     if hole_placement == "corrupt_gen_frame":
-        if corr_len_bytes is None or int(corr_len_bytes) <= 0:
-            raise ValueError("corrupt_gen_frame requires a positive --corr-len-bytes")
-        min_gap = max_gap = int(corr_len_bytes)
+        if not corruption_lengths or any(length <= 0 for length in corruption_lengths):
+            raise ValueError("corrupt_gen_frame requires positive corruption lengths")
+        min_gap = min(corruption_lengths)
+        max_gap = max(corruption_lengths)
         frame_guard_bytes = int(getattr(args, "corr_header_guard_bytes", 4))
         eligibility_bytes = int(
-            getattr(args, "corr_eligibility_bytes", None) or corr_len_bytes
+            getattr(args, "corr_eligibility_bytes", None) or max_gap
         )
         if eligibility_bytes < max_gap:
             raise ValueError(
@@ -992,6 +1047,62 @@ def _build_hole_requests(
     requests: list[HoleRequest] = []
     if policy.hole_placement == "corrupt_gen_frame":
         skip_reasons: Counter[str] = Counter()
+        corruption_lengths = _requested_corruption_lengths(args)
+        if getattr(args, "corr_len_bytes_list", None) is not None:
+            # A severity schedule uses one distinct source window per length. Scan
+            # the already shuffled split in order, carrying the cursor forward so
+            # no clip is reused and each requested length appears exactly once.
+            index_cursor = iter(indices)
+            samples_per_length = int(args.corr_samples_per_length)
+            for corruption_length in corruption_lengths:
+                for replicate in range(samples_per_length):
+                    selected = False
+                    for index in index_cursor:
+                        eligibility_bytes = int(
+                            getattr(args, "corr_eligibility_bytes", None)
+                            or corruption_length
+                        )
+                        hole, skip_reason = _corrupt_gen_frame_hole_spec_with_reason(
+                            dataset,
+                            index,
+                            corr_pos=float(getattr(args, "corr_pos", 0.4)),
+                            eligibility_bytes=eligibility_bytes,
+                            seed=int(args.seed),
+                            frame_type=str(getattr(args, "corr_frame_type", "any")),
+                            gap_bytes=corruption_length,
+                        )
+                        if hole is None:
+                            reason = skip_reason or "unknown_hole_selection_failure"
+                            skip_reasons[reason] += 1
+                            _log_sample_skip(dataset, index, reason)
+                            continue
+                        requests.append(HoleRequest(index, hole, None))
+                        selected = True
+                        break
+                    if not selected:
+                        raise RuntimeError(
+                            "Could not select distinct eligible clip "
+                            f"{replicate + 1}/{samples_per_length} for corruption "
+                            f"length {corruption_length} bytes"
+                        )
+            print(
+                "corrupt_gen_frame severity schedule: "
+                + ", ".join(f"{length}B" for length in corruption_lengths)
+                + f"; samples_per_length={samples_per_length}",
+                flush=True,
+            )
+            if skip_reasons:
+                print(
+                    "Hole-selection skip summary: "
+                    + ", ".join(
+                        f"{reason}={count}"
+                        for reason, count in sorted(skip_reasons.items())
+                    ),
+                    flush=True,
+                )
+            return requests
+
+        corruption_length = corruption_lengths[0]
         for index in indices:
             hole, skip_reason = _corrupt_gen_frame_hole_spec_with_reason(
                 dataset,
@@ -1000,6 +1111,7 @@ def _build_hole_requests(
                 eligibility_bytes=policy.corruption_eligibility_bytes,
                 seed=int(args.seed),
                 frame_type=str(getattr(args, "corr_frame_type", "any")),
+                gap_bytes=corruption_length,
             )
             if hole is None:
                 reason = skip_reason or "unknown_hole_selection_failure"
@@ -1180,6 +1292,11 @@ def _materialize_fim_samples(
 ) -> tuple[list[WindowFimSample], int]:
     """Materialize validated samples in request order up to --num-clips."""
 
+    requested_count = (
+        len(_requested_corruption_lengths(args)) * int(args.corr_samples_per_length)
+        if getattr(args, "corr_len_bytes_list", None) is not None
+        else args.num_clips
+    )
     selected: list[WindowFimSample] = []
     verified_fixed_holes = 0
     skip_reasons: Counter[str] = Counter()
@@ -1194,7 +1311,7 @@ def _materialize_fim_samples(
             continue
         selected.append(sample)
         verified_fixed_holes += int(replay_verified)
-        if len(selected) >= args.num_clips:
+        if len(selected) >= requested_count:
             break
     if skip_reasons:
         print(
@@ -1204,10 +1321,10 @@ def _materialize_fim_samples(
             ),
             flush=True,
         )
-    if len(selected) < args.num_clips:
+    if len(selected) < requested_count:
         print(
             "WARNING: requested "
-            f"{args.num_clips} samples but selected {len(selected)}; "
+            f"{requested_count} samples but selected {len(selected)}; "
             f"eligible_requests={len(requests)}",
             flush=True,
         )
@@ -2284,6 +2401,60 @@ def summarize(
         }
         for frame_type, group in sorted(frame_type_groups.items())
     }
+    length_groups: dict[int, list[dict[str, Any]]] = {}
+    for row in details:
+        if row.get("target_bytes") is not None:
+            length_groups.setdefault(int(row["target_bytes"]), []).append(row)
+    out["corruption_by_length_bytes"] = {
+        str(length): {
+            "count": len(group),
+            "frame_type_hist": dict(
+                Counter(
+                    str(row.get("corruption_frame_type") or "unknown")
+                    for row in group
+                )
+            ),
+            "termination_success_rate": AR.mean(
+                [
+                    (
+                        1.0
+                        if _termination_succeeded(
+                            stop_mode, str(row.get("stop_reason") or "none")
+                        )
+                        else 0.0
+                    )
+                    for row in group
+                ]
+            ),
+            "repair_decode_success_rate": (
+                AR.mean([1.0 if row.get("strict_valid") else 0.0 for row in group])
+                if decode_enabled
+                else None
+            ),
+            "corrupted_concealed_psnr_mean": AR.mean(
+                [
+                    float(row["corrupted_concealed_psnr"])
+                    for row in group
+                    if row.get("corrupted_concealed_psnr") is not None
+                ]
+            ),
+            "repaired_psnr_mean": AR.mean(
+                [
+                    float(row["cont_psnr_mean"])
+                    for row in group
+                    if row.get("cont_psnr_mean") is not None
+                ]
+            ),
+            "repair_psnr_lift_db_mean": AR.mean(
+                [
+                    float(row["repair_psnr_lift_db"])
+                    for row in group
+                    if row.get("repair_psnr_lift_db") is not None
+                ]
+            ),
+        }
+        for length, group in sorted(length_groups.items())
+    }
     out.update(AR.distribution_metrics(real_app, gen_app, real_mot, gen_mot))
     return out
 
@@ -2935,6 +3106,7 @@ def evaluate_stop_mode(
         "hole_placement": policy.hole_placement,
         "corr_frame_type": args.corr_frame_type,
         "corr_len_bytes": args.corr_len_bytes,
+        "corr_len_bytes_list": args.corr_len_bytes_list,
         "corr_pos": (
             args.corr_pos if policy.hole_placement == "corrupt_gen_frame" else None
         ),

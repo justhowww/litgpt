@@ -26,7 +26,7 @@ NAL_INDEX=${NAL_INDEX:-"${STAGED_CORPUS}/nal_index.sqlite"}
 TRAIN_SPLIT_FILE=${TRAIN_SPLIT_FILE:-"${RUN_DIR}/train_split.json"}
 FFMPEG_BINARY=${FFMPEG_BINARY:-"${CONDA_ROOT}/bin/ffmpeg"}
 
-CHECKPOINT_NAMES=${CHECKPOINT_NAMES:-"step-00100000 step-00200000 step-00300000 final"}
+CHECKPOINT_NAMES=${CHECKPOINT_NAMES:-"step-00100000 step-00200000 step-00300000 final latest"}
 EVAL_TAG=${EVAL_TAG:-"corrupt-gen-frame"}
 NUM_CLIPS=${NUM_CLIPS:-20}
 NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
@@ -34,6 +34,10 @@ MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-0}
 MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-131071}
 MAX_GEN_BYTES=${MAX_GEN_BYTES:-4096}
 CORR_LEN_BYTES=${CORR_LEN_BYTES:-600}
+# Optional whitespace-separated severity schedule. When set, the evaluator uses
+# one distinct clip per length and ignores the scalar CORR_LEN_BYTES value.
+CORR_LEN_BYTES_LIST=${CORR_LEN_BYTES_LIST:-}
+CORR_SAMPLES_PER_LENGTH=${CORR_SAMPLES_PER_LENGTH:-1}
 CORR_POS=${CORR_POS:-0.4}
 CORR_FRAME_TYPE=${CORR_FRAME_TYPE:-any}
 CORR_HEADER_GUARD_BYTES=${CORR_HEADER_GUARD_BYTES:-0}
@@ -65,17 +69,48 @@ if [[ ! -x "${FFMPEG_BINARY}" ]]; then
 fi
 
 checkpoint_dirs=()
+checkpoint_targets=()
 for checkpoint_name in ${CHECKPOINT_NAMES}; do
     checkpoint_dir="${RUN_DIR}/${checkpoint_name}"
     if [[ ! -r "${checkpoint_dir}/lit_model.pth" ]]; then
         echo "Skipping unavailable checkpoint: ${checkpoint_dir}/lit_model.pth" >&2
         continue
     fi
+    canonical_checkpoint_dir=$(cd -P -- "${checkpoint_dir}" && pwd)
+    duplicate=0
+    for existing_checkpoint_target in "${checkpoint_targets[@]}"; do
+        if [[ "${existing_checkpoint_target}" == "${canonical_checkpoint_dir}" ]]; then
+            duplicate=1
+            break
+        fi
+    done
+    if (( duplicate )); then
+        echo "Skipping duplicate checkpoint target: ${checkpoint_dir} -> ${canonical_checkpoint_dir}" >&2
+        continue
+    fi
     checkpoint_dirs+=("${checkpoint_dir}")
+    checkpoint_targets+=("${canonical_checkpoint_dir}")
 done
 if (( ${#checkpoint_dirs[@]} == 0 )); then
     echo "None of the requested checkpoints are readable under ${RUN_DIR}: ${CHECKPOINT_NAMES}" >&2
     exit 1
+fi
+
+corr_length_args=()
+if [[ -n "${CORR_LEN_BYTES_LIST}" ]]; then
+    read -r -a corr_length_values <<< "${CORR_LEN_BYTES_LIST}"
+    if (( ${#corr_length_values[@]} == 0 )); then
+        echo "CORR_LEN_BYTES_LIST did not contain any lengths" >&2
+        exit 2
+    fi
+    if [[ ! "${CORR_SAMPLES_PER_LENGTH}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "CORR_SAMPLES_PER_LENGTH must be a positive integer" >&2
+        exit 2
+    fi
+    NUM_CLIPS=$(( ${#corr_length_values[@]} * CORR_SAMPLES_PER_LENGTH ))
+    corr_length_args=(--corr-len-bytes-list "${corr_length_values[@]}")
+else
+    corr_length_args=(--corr-len-bytes "${CORR_LEN_BYTES}")
 fi
 
 OUT_DIR="${RUN_DIR}/eval_fim/${EVAL_TAG}/${EVAL_SPLIT}/${MASK_TAG}"
@@ -91,7 +126,7 @@ mkdir -p "${OUT_DIR}"
 
 echo "JPEG-LM FIM evaluation"
 echo "  task=${EVAL_TASK_ID} split=${EVAL_SPLIT} mask=${MASK_TAG} clips=${NUM_CLIPS}"
-echo "  corruption=${CORR_LEN_BYTES}B position=${CORR_POS} frame_type=${CORR_FRAME_TYPE}"
+echo "  corruption=${CORR_LEN_BYTES_LIST:-${CORR_LEN_BYTES}}B position=${CORR_POS} frame_type=${CORR_FRAME_TYPE}"
 echo "  checkpoints=${checkpoint_dirs[*]}"
 echo "  output=${OUT_DIR}"
 
@@ -118,7 +153,8 @@ python -u scripts/byte/eval/eval_fim_avclm.py \
     --fim-max-gap 1400 \
     --slice-header-guard-bytes 0 \
     --hole-placement corrupt_gen_frame \
-    --corr-len-bytes "${CORR_LEN_BYTES}" \
+    "${corr_length_args[@]}" \
+    --corr-samples-per-length "${CORR_SAMPLES_PER_LENGTH}" \
     --corr-pos "${CORR_POS}" \
     --corr-frame-type "${CORR_FRAME_TYPE}" \
     --corr-header-guard-bytes "${CORR_HEADER_GUARD_BYTES}" \
