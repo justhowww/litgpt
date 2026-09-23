@@ -33,6 +33,7 @@ NUM_VISUALIZATIONS=${NUM_VISUALIZATIONS:-8}
 MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-0}
 MAX_WINDOW_BYTES=${MAX_WINDOW_BYTES:-131071}
 MAX_GEN_BYTES=${MAX_GEN_BYTES:-4096}
+MODEL_DTYPE=${MODEL_DTYPE:-fp32}
 CORR_LEN_BYTES=${CORR_LEN_BYTES:-600}
 # Optional whitespace-separated severity schedule. When set, the evaluator uses
 # one distinct clip per length and ignores the scalar CORR_LEN_BYTES value.
@@ -128,6 +129,7 @@ echo "JPEG-LM FIM evaluation"
 echo "  task=${EVAL_TASK_ID} split=${EVAL_SPLIT} mask=${MASK_TAG} clips=${NUM_CLIPS}"
 echo "  corruption=${CORR_LEN_BYTES_LIST:-${CORR_LEN_BYTES}}B position=${CORR_POS} frame_type=${CORR_FRAME_TYPE}"
 echo "  checkpoints=${checkpoint_dirs[*]}"
+echo "  model_dtype=${MODEL_DTYPE}"
 echo "  output=${OUT_DIR}"
 
 cd "${REPO_ROOT}"
@@ -138,6 +140,7 @@ python -u scripts/byte/eval/eval_fim_avclm.py \
     --train-split-file "${TRAIN_SPLIT_FILE}" \
     --out-dir "${OUT_DIR}" \
     --device cuda \
+    --model-dtype "${MODEL_DTYPE}" \
     --eval-split "${EVAL_SPLIT}" \
     --hole-set sampled \
     --num-clips "${NUM_CLIPS}" \

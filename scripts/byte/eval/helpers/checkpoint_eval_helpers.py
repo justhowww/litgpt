@@ -107,7 +107,12 @@ def require_png_writer() -> None:
         )
 
 
-def load_model(checkpoint_dir: Path, device: torch.device) -> GPT:
+def load_model(
+    checkpoint_dir: Path,
+    device: torch.device,
+    *,
+    dtype: torch.dtype | None = None,
+) -> GPT:
     print(f"Loading checkpoint: {checkpoint_dir}", flush=True)
     config = Config.from_file(checkpoint_dir / "model_config.yaml")
     model = GPT(config)
@@ -120,7 +125,10 @@ def load_model(checkpoint_dir: Path, device: torch.device) -> GPT:
     state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
     state_dict = {_strip_compile_prefix(key): value for key, value in state_dict.items()}
     model.load_state_dict(state_dict)
-    model = model.to(device).eval()
+    if dtype is None:
+        model = model.to(device).eval()
+    else:
+        model = model.to(device=device, dtype=dtype).eval()
     print(f"Loaded checkpoint: {checkpoint_dir.name}", flush=True)
     return model
 

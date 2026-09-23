@@ -235,6 +235,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dirs", type=Path, nargs="+", required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--model-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help=(
+            "Weight dtype during inference. bf16 reduces GPU weight memory for "
+            "large checkpoints (for example on an A100); fp32 preserves the "
+            "existing evaluation behavior."
+        ),
+    )
     parser.add_argument("--max-manifest-rows", type=int, default=0)
     parser.add_argument("--train-split-file", type=Path, default=None)
     parser.add_argument(
@@ -2771,12 +2781,20 @@ def save_repair_streams(
         "gt_stream_path": stream_dir / f"{stem}_gt.h264",
         "model_stream_path": stream_dir / f"{stem}_model.h264",
         "corrupted_stream_path": stream_dir / f"{stem}_corrupted.h264",
+        "gt_full_stream_path": stream_dir / f"{stem}_gt_full.h264",
+        "model_full_stream_path": stream_dir / f"{stem}_model_full.h264",
+        "corrupted_full_stream_path": stream_dir / f"{stem}_corrupted_full.h264",
         "gt_missing_path": stream_dir / f"{stem}_missing_gt.bin",
         "model_missing_path": stream_dir / f"{stem}_missing_model.bin",
     }
     paths["gt_stream_path"].write_bytes(sample.gt_truncated_stream)
     paths["model_stream_path"].write_bytes(model_stream)
     paths["corrupted_stream_path"].write_bytes(sample.corrupted_stream)
+    paths["gt_full_stream_path"].write_bytes(sample.window_bytes)
+    paths["model_full_stream_path"].write_bytes(
+        sample.repaired_full_stream(result.data)
+    )
+    paths["corrupted_full_stream_path"].write_bytes(sample.corrupted_full_stream)
     paths["gt_missing_path"].write_bytes(sample.target_bytes)
     paths["model_missing_path"].write_bytes(result.data)
     return {key: str(path) for key, path in paths.items()}
@@ -3141,6 +3159,8 @@ def main() -> None:
 
     announce_stage(1, "Resolve configuration")
     device, slice_max_mbs = configure_evaluation(args)
+    if args.model_dtype == "bf16" and device.type != "cuda":
+        raise ValueError("--model-dtype bf16 requires a CUDA device")
 
     announce_stage(
         2,
@@ -3162,7 +3182,13 @@ def main() -> None:
 
     for checkpoint_dir in args.checkpoint_dirs:
         announce_stage(4, "Load checkpoint", str(checkpoint_dir))
-        model = load_model(checkpoint_dir, device)
+        model = load_model(
+            checkpoint_dir,
+            device,
+            dtype=torch.bfloat16 if args.model_dtype == "bf16" else None,
+        )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         ckpt_name = checkpoint_dir.name
         stream_dir = args.out_dir / "streams" / ckpt_name
         if args.save_streams:
@@ -3197,6 +3223,14 @@ def main() -> None:
                 metrics_path=metrics_path,
             )
             summaries.append(summary)
+
+        if device.type == "cuda":
+            print(
+                f"[{ckpt_name}] peak GPU memory: "
+                f"allocated={torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB, "
+                f"reserved={torch.cuda.max_memory_reserved(device) / 1e9:.2f} GB",
+                flush=True,
+            )
 
     announce_stage(8, "Finalize cross-checkpoint summary")
     write_summary_csv(args.out_dir / "summary.csv", summaries)
