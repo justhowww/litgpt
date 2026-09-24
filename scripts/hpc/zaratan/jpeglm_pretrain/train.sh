@@ -235,7 +235,9 @@ echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[$
 echo "[jpeglm] checkpoints: rolling latest every ${LATEST_SAVE_INTERVAL} steps; permanent milestone every ${SAVE_INTERVAL} steps; final=${SAVE_FINAL}"
 
 exec {training_lock_fd}>"${OUT_DIR}/.training.lock"
-if ! flock -n "${training_lock_fd}"; then
+# Wait briefly rather than fail: a bridging job (e.g. train_a100_2node.sbatch)
+# cancels itself once this job starts and needs a moment to release the lock.
+if ! flock -w "${TRAINING_LOCK_WAIT_SEC:-900}" "${training_lock_fd}"; then
     echo "Another training job is already using OUT_DIR=${OUT_DIR}" >&2
     exit 1
 fi
