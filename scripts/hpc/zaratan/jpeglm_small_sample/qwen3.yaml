@@ -1,0 +1,73 @@
+schema_version: 1
+
+# Matched to pythia.yaml except for architecture and run identity.
+run:
+  staged_corpus: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm
+  model_tag: byte-jpeglm-small-27x1024-qwen3-patch256
+  out_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-small-27x1024-qwen3-patch256
+
+model:
+  architecture: qwen3
+  n_layer: 27
+  n_embd: 1024
+  n_head: 16
+  byte_patch_size: 256
+  raw_context_bytes: 131072
+  megabyte_local_layers: 4
+  megabyte_local_embd: 512
+  megabyte_local_heads: 8
+
+data:
+  max_rows: 256
+  val_fraction: 0.05
+  num_workers: 12
+  window_min_frames: 2
+  window_unit: gop
+  enable_length_bucketing: true
+  length_bucket_pool_size: 8192
+
+fim:
+  p_fim: 1.0
+  format: psm
+  loss_scope: full
+  span_loss_weight: 1.0
+  eos_aux_loss_weight: 1.0
+  min_gap: 64
+  max_gap: 1400
+  slice_header_guard_bytes: 0
+
+training:
+  steps: 5000
+  warmup_steps: 100
+  global_batch_size: 64
+  micro_batch_size: 4
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 1000
+  eval_iters: 20
+  save_interval: 1000000
+  latest_save_interval: 1000000
+  save_final: true
+  activation_checkpointing: true
+  compile: true
+  memory_profile_step: 100
+
+preflight:
+  min_manifest_rows: 1
+  min_p_fim_eligibility: 0.5
+  allow_low_fim_eligibility: false
+
+slurm:
+  account: metzler-prj-cmsc
+  mem: 160G
+  cpus_per_task: 16
+
+evaluation:
+  seed: 42
+  corruption_lengths: [64, 128, 256, 400, 600]
+  samples_per_length: 2
+  corruption_position: 0.4
+  corruption_header_guard_bytes: 0
+  frame_types: [idr, p]
+  sample_set_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/eval_sets/small-27x1024-patch256-v1
+  num_heatmaps: 20

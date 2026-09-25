@@ -631,6 +631,17 @@ def fit(
 
     last_reconstruction_step = -1
 
+    # Only isolated small-sample jobs set this environment variable. Normal
+    # pretraining runs do not import the profiler or record allocation history.
+    memory_profile_step = int(os.environ.get("SMALL_SAMPLE_MEMORY_PROFILE_STEP", "0"))
+    memory_profiler = None
+    if memory_profile_step:
+        from litgpt.byte.small_sample_memory_profile import SmallSampleMemoryProfiler
+
+        memory_profiler = SmallSampleMemoryProfiler(
+            step=memory_profile_step, out_dir=out_dir, rank=fabric.global_rank
+        )
+
     for train_data in train_iterator:
         if state["step_count"] >= max_steps:
             break
@@ -653,6 +664,8 @@ def fit(
         # Byte-domain extension: dict batches already contain aligned labels and
         # auxiliary ids, while original text batches retain LitGPT's shift path.
         model_inputs, targets = get_model_inputs_and_targets(train_data, model.max_seq_length)
+        if memory_profiler is not None:
+            memory_profiler.start_if_due(state["step_count"] + 1)
 
         is_accumulating = state["iter_num"] % gradient_accumulation_iters != 0
         run_mrt = byte_runtime.should_run_mrt(
@@ -673,6 +686,8 @@ def fit(
                 logits, targets, target_region_ids
             )
             loss = loss_terms["objective"]
+            if memory_profiler is not None:
+                memory_profiler.sample("after_forward_and_loss")
             # Byte-domain experiments may make decoder risk the primary
             # objective while retaining a small CE syntax regularizer.
             fabric.backward(
@@ -680,6 +695,8 @@ def fit(
                 * loss
                 / gradient_accumulation_iters
             )
+            if memory_profiler is not None:
+                memory_profiler.sample("after_backward")
         step_ce_sum += loss.detach()
         step_ce_count += 1
 
@@ -720,8 +737,12 @@ def fit(
         if not is_accumulating:
             fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
             optimizer.step()
+            if memory_profiler is not None:
+                memory_profiler.sample("after_optimizer_step")
             optimizer.zero_grad()
             state["step_count"] += 1
+            if memory_profiler is not None:
+                memory_profiler.finish(model, optimizer)
             if mrt_metrics is not None:
                 byte_runtime.log_mrt(fabric, mrt_metrics, state["step_count"])
             step_ce_sum.zero_()

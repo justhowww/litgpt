@@ -553,29 +553,52 @@ def decode_stream(
 ) -> DecodeResult:
     frame_dir = temp_dir / key
     frame_dir.mkdir(parents=True, exist_ok=True)
-    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning"]
+    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     if strict:
         command.extend(STRICT_FLAGS)
     command.extend(
         [
             "-fflags", "+genpts", "-f", "h264", "-i", str(path),
-            "-vsync", "0", "-frames:v", str(max_frames),
+            "-fps_mode", "passthrough", "-frames:v", str(max_frames),
             str(frame_dir / "frame_%04d.png"),
         ]
     )
+    log_path = frame_dir / "ffmpeg.stderr.log"
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        with log_path.open("w") as stderr_file:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                text=True,
+                timeout=timeout,
+            )
         status = "decoded" if result.returncode == 0 else "decoder_error"
-        stderr = result.stderr
         returncode = result.returncode
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         status = "timeout"
         returncode = None
-        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
     except FileNotFoundError as exc:
         status = "ffmpeg_not_found"
         returncode = None
-        stderr = str(exc)
+        log_path.write_text(str(exc))
+    max_log_bytes = 64 * 1024
+    log_size = log_path.stat().st_size if log_path.is_file() else 0
+    if log_size <= max_log_bytes:
+        stderr = log_path.read_text(errors="replace") if log_path.is_file() else ""
+    else:
+        half = max_log_bytes // 2
+        with log_path.open("rb") as source:
+            beginning = source.read(half)
+            source.seek(-half, 2)
+            ending = source.read(half)
+        omitted = log_size - max_log_bytes
+        stderr = (
+            beginning.decode(errors="replace")
+            + f"\n[diagnostic truncated {omitted:,} stderr bytes]\n"
+            + ending.decode(errors="replace")
+        )
+    log_path.unlink(missing_ok=True)
     frames = sorted(frame_dir.glob("frame_*.png"))
     if frames and status == "decoder_error":
         status = "partial after decoder error"
