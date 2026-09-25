@@ -82,6 +82,10 @@ FIELDS = {
     },
 }
 
+# Keep the required keys of previously frozen YAMLs unchanged. Only the new
+# IDR-balanced run opts into this additional training setting.
+OPTIONAL_FIELDS = {"fim": {"idr_sampling_probability": "FIM_IDR_SAMPLING_PROBABILITY"}}
+
 BOOLEAN_KEYS = {
     "ENABLE_LENGTH_BUCKETING",
     "SAVE_FINAL",
@@ -115,12 +119,17 @@ def load_config(path: Path) -> dict:
         section = config.get(group)
         if not isinstance(section, dict):
             raise ValueError(f"Missing or invalid section: {group}")
-        if set(section) != set(names):
+        allowed = set(names) | set(OPTIONAL_FIELDS.get(group, {}))
+        if set(names) - set(section) or set(section) - allowed:
             raise ValueError(
                 f"{group}: missing {sorted(set(names) - set(section))}; "
-                f"unknown {sorted(set(section) - set(names))}"
+                f"unknown {sorted(set(section) - allowed)}"
             )
-        for key, env_name in names.items():
+        present_optional = {
+            key: env_name for key, env_name in OPTIONAL_FIELDS.get(group, {}).items()
+            if key in section
+        }
+        for key, env_name in {**names, **present_optional}.items():
             value = section[key]
             if env_name in BOOLEAN_KEYS:
                 if not isinstance(value, bool):
@@ -149,6 +158,12 @@ def load_config(path: Path) -> dict:
             raise ValueError(f"{key} must be at most 1")
         if key in {"LEARNING_RATE", "MIN_LEARNING_RATE"} and value == 0:
             raise ValueError(f"{key} must be positive")
+    if "FIM_IDR_SAMPLING_PROBABILITY" in values:
+        probability = float(values["FIM_IDR_SAMPLING_PROBABILITY"])
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError("fim.idr_sampling_probability must be in [0, 1]")
+        if float(values["P_FIM"]) <= 0:
+            raise ValueError("IDR-balanced sampling requires fim.p_fim > 0")
     if values["MODEL_ARCHITECTURE"] not in {"pythia", "qwen3"}:
         raise ValueError("model.architecture must be pythia or qwen3")
     if values["WINDOW_UNIT"] != "gop":
@@ -269,7 +284,10 @@ def main() -> None:
         return
     reserve_run_dir(Path(values["OUT_DIR"]), values, evaluation, source_yaml)
     environment = os.environ.copy()
-    for key in ("AFTER_JOBID", "EXCLUDE_NODES", "DEPENDENCY_TYPE", "TRAINING_LOCK_WAIT_SEC"):
+    for key in (
+        "AFTER_JOBID", "EXCLUDE_NODES", "DEPENDENCY_TYPE", "TRAINING_LOCK_WAIT_SEC",
+        "FIM_IDR_SAMPLING_PROBABILITY",
+    ):
         environment.pop(key, None)
     environment.update(values)
     subprocess.run(["bash", str(submit)], env=environment, check=True)

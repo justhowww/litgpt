@@ -100,6 +100,10 @@ class ByteDataConfig:
     # positive K caches K distinct holes per training window. The Boolean above
     # remains a backward-compatible alias for K=1.
     fixed_fim_holes_per_window: int = 0
+    # Optional training-only mixture over eligible window-FIM frame classes.
+    # None preserves uniform sampling over frames; on B-free JPEG-LM data,
+    # non-IDR VCL frames are P frames.
+    fim_idr_sampling_probability: float | None = None
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -1113,6 +1117,7 @@ class ByteStreamWindowDataset(Dataset):
         window_unit: WindowUnit = "byte_budget",
         resample_fim: bool = False,
         fixed_fim_holes_per_window: int = 0,
+        fim_idr_sampling_probability: float | None = None,
         nal_index: dict[str, list[NALUnit]] | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
@@ -1135,6 +1140,11 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError(f"window_unit must be one of {WINDOW_UNITS}")
         if fixed_fim_holes_per_window < 0:
             raise ValueError("fixed_fim_holes_per_window must be non-negative")
+        if fim_idr_sampling_probability is not None:
+            if not 0.0 <= fim_idr_sampling_probability <= 1.0:
+                raise ValueError("fim_idr_sampling_probability must be in [0, 1]")
+            if fixed_fim_holes_per_window:
+                raise ValueError("IDR-balanced sampling requires changing FIM holes")
         self.rows = rows
         self.max_seq_length = max_seq_length
         self.min_frames = min_frames
@@ -1148,6 +1158,7 @@ class ByteStreamWindowDataset(Dataset):
         self.window_unit = window_unit
         self.resample_fim = resample_fim
         self.fixed_fim_holes_per_window = fixed_fim_holes_per_window
+        self.fim_idr_sampling_probability = fim_idr_sampling_probability
         self._fixed_hole_cache: dict[
             int, tuple[tuple[int, int, int, int], ...]
         ] = {}
@@ -1337,6 +1348,23 @@ class ByteStreamWindowDataset(Dataset):
                 candidates.append((lo, hi))
         return candidates
 
+    def _candidate_nal_types(
+        self, sample: WindowSample, candidates: list[tuple[int, int]]
+    ) -> dict[int, int]:
+        """Map each eligible frame's local start to its first VCL NAL type."""
+        starts = {lo for lo, _ in candidates}
+        types: dict[int, int] = {}
+        cursor = 0
+        for nal in self.nal_index[str(sample.h264_path)][sample.start_nal : sample.end_nal]:
+            if cursor in starts:
+                if nal.nal_type not in VCL_NAL_TYPES:
+                    raise RuntimeError("FIM frame boundary does not start at a VCL NAL")
+                types[cursor] = nal.nal_type
+            cursor += nal.end - nal.start
+        if set(types) != starts:
+            raise RuntimeError("Could not identify every eligible FIM frame's NAL type")
+        return types
+
     def _fim_overhead(self) -> int:
         """Net length added by the FIM reordering, over a window cut at frame_hi.
 
@@ -1464,8 +1492,22 @@ class ByteStreamWindowDataset(Dataset):
         self,
         candidates: list[tuple[int, int]],
         rng: random.Random,
+        *,
+        nal_types_by_start: dict[int, int] | None = None,
     ) -> tuple[int, int, int, int]:
-        frame_lo, frame_hi = rng.choice(candidates)
+        frame_pool = candidates
+        if self.fim_idr_sampling_probability is not None:
+            if nal_types_by_start is None:
+                raise ValueError("IDR-balanced sampling requires candidate NAL types")
+            idr = [frame for frame in candidates if nal_types_by_start[frame[0]] == 5]
+            non_idr = [frame for frame in candidates if nal_types_by_start[frame[0]] != 5]
+            if idr and non_idr:
+                frame_pool = (
+                    idr if rng.random() < self.fim_idr_sampling_probability else non_idr
+                )
+            else:
+                frame_pool = idr or non_idr
+        frame_lo, frame_hi = rng.choice(frame_pool)
         lo = frame_lo + self.frame_guard_bytes
         gap = rng.randint(
             self.fim_min_gap,
@@ -1481,6 +1523,7 @@ class ByteStreamWindowDataset(Dataset):
         rng: random.Random,
         *,
         exclude: Iterable[tuple[int, int, int, int]] = (),
+        nal_types_by_start: dict[int, int] | None = None,
     ) -> tuple[tuple[int, int, int, int], ...]:
         """Deterministically sample distinct legal holes without replacement."""
         if count < 0:
@@ -1492,7 +1535,9 @@ class ByteStreamWindowDataset(Dataset):
         for _ in range(max_attempts):
             if len(selected) >= count:
                 break
-            spec = self._draw_hole_spec(candidates, rng)
+            spec = self._draw_hole_spec(
+                candidates, rng, nal_types_by_start=nal_types_by_start
+            )
             if spec in seen:
                 continue
             seen.add(spec)
@@ -1545,6 +1590,10 @@ class ByteStreamWindowDataset(Dataset):
             candidates,
             count,
             rng,
+            nal_types_by_start=(
+                self._candidate_nal_types(sample, candidates)
+                if self.fim_idr_sampling_probability is not None else None
+            ),
             exclude=(
                 self.fixed_fim_hole_specs(idx)
                 if exclude is None
@@ -1568,7 +1617,12 @@ class ByteStreamWindowDataset(Dataset):
         candidates = self._fim_candidates(sample, data)
         if not candidates:
             return None
-        return self._draw_hole_spec(candidates, rng)
+        nal_types = (
+            self._candidate_nal_types(sample, candidates)
+            if self.fim_idr_sampling_probability is not None
+            else None
+        )
+        return self._draw_hole_spec(candidates, rng, nal_types_by_start=nal_types)
 
     def fim_item_for_hole(
         self,
@@ -1691,8 +1745,11 @@ class ByteStreamWindowDataset(Dataset):
         hole: tuple[int, int, int, int] | None = None,
         hole_id: int | None = None,
     ) -> dict[str, Any]:
+        nal_types = self._candidate_nal_types(sample, candidates)
         if hole is None:
-            frame_lo, frame_hi, split, gap = self._draw_hole_spec(candidates, rng)
+            frame_lo, frame_hi, split, gap = self._draw_hole_spec(
+                candidates, rng, nal_types_by_start=nal_types
+            )
         else:
             frame_lo, frame_hi, split, gap = hole
 
@@ -1767,6 +1824,7 @@ class ByteStreamWindowDataset(Dataset):
             fim_split=split,
             frame_lo=frame_lo,
             frame_hi=frame_hi,
+            fim_frame_nal_type=nal_types[frame_lo],
             fim_hole_id=hole_id if hole_id is not None else -1,
         )
 
@@ -1830,6 +1888,10 @@ def collate_byte_samples(
         ),
         "offset_ids": pad_and_truncate(
             [sample["offset_ids"] for sample in samples], max_seq_length, 0
+        ),
+        "fim_frame_nal_type": torch.tensor(
+            [sample["sample_meta"].get("fim_frame_nal_type", -1) for sample in samples],
+            dtype=torch.int64,
         ),
         **(
             {
@@ -2011,6 +2073,13 @@ class ByteDataModule(DataModule):
             raise ValueError("length_bucket_pool_size must be positive")
         if self.config.length_bucketing and self.config.dataset_mode != "window":
             raise ValueError("length bucketing requires dataset_mode='window'")
+        if self.config.fim_idr_sampling_probability is not None:
+            if not 0.0 <= self.config.fim_idr_sampling_probability <= 1.0:
+                raise ValueError("fim_idr_sampling_probability must be in [0, 1]")
+            if self.config.dataset_mode != "window" or not self.config.split_by_video:
+                raise ValueError("IDR-balanced FIM requires window mode and a video-level split")
+            if self.config.p_fim <= 0 or self.config.fixed_fim_holes_per_window:
+                raise ValueError("IDR-balanced FIM requires changing holes and p_fim > 0")
         if (
             self.config.fixed_fim_holes
             and self.config.fixed_fim_holes_per_window == 0
@@ -2069,7 +2138,7 @@ class ByteDataModule(DataModule):
             else self.max_seq_length * self.config.byte_patch_size - 1
         )
 
-        def _build_dataset(rows_subset: list[dict[str, Any]]) -> Dataset:
+        def _build_dataset(rows_subset: list[dict[str, Any]], *, training: bool = False) -> Dataset:
             if self.config.dataset_mode == "window":
                 return ByteStreamWindowDataset(
                     rows_subset,
@@ -2085,6 +2154,9 @@ class ByteDataModule(DataModule):
                     window_unit=self.config.window_unit,
                     fixed_fim_holes_per_window=(
                         self.config.fixed_fim_holes_per_window
+                    ),
+                    fim_idr_sampling_probability=(
+                        self.config.fim_idr_sampling_probability if training else None
                     ),
                     nal_index=nal_index,
                     seed=self.config.seed,
@@ -2126,7 +2198,7 @@ class ByteDataModule(DataModule):
             val_video_ids = {video_ids[i] for i in perm[:n_val]}
             train_rows = [r for r in rows if r["h264_path"] not in val_video_ids]
             val_rows = [r for r in rows if r["h264_path"] in val_video_ids]
-            self.train_dataset = _build_dataset(train_rows)
+            self.train_dataset = _build_dataset(train_rows, training=True)
             self.val_dataset = _build_dataset(val_rows)
             # Separate instances here, so train resamples and val simply does not.
             if isinstance(self.train_dataset, ByteStreamWindowDataset):

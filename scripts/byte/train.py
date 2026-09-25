@@ -250,6 +250,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--p-fim", type=float, default=0.0)
     parser.add_argument(
+        "--fim-idr-sampling-probability",
+        type=float,
+        default=None,
+        help=(
+            "Training-only probability of choosing an eligible IDR frame for "
+            "each changing-hole window-FIM draw. The other class is non-IDR "
+            "(P on B-free JPEG-LM). Omit to preserve uniform frame sampling."
+        ),
+    )
+    parser.add_argument(
         "--fixed-fim-holes",
         action="store_true",
         help=(
@@ -545,6 +555,15 @@ def main() -> None:
     args = parse_args()
     if args.fixed_fim_holes_per_window < 0:
         raise ValueError("--fixed-fim-holes-per-window must be non-negative")
+    if args.fim_idr_sampling_probability is not None:
+        if not 0.0 <= args.fim_idr_sampling_probability <= 1.0:
+            raise ValueError("--fim-idr-sampling-probability must be in [0, 1]")
+        if args.dataset_mode != "window" or not args.split_by_video or args.p_fim <= 0:
+            raise ValueError(
+                "--fim-idr-sampling-probability requires window FIM and --split-by-video"
+            )
+        if args.fixed_fim_holes or args.fixed_fim_holes_per_window:
+            raise ValueError("IDR-balanced sampling requires changing FIM holes")
     if args.fixed_fim_holes:
         if args.fixed_fim_holes_per_window not in (0, 1):
             raise ValueError(
@@ -674,6 +693,7 @@ def main() -> None:
         p_fim=args.p_fim,
         fixed_fim_holes=args.fixed_fim_holes,
         fixed_fim_holes_per_window=args.fixed_fim_holes_per_window,
+        fim_idr_sampling_probability=args.fim_idr_sampling_probability,
         fim_format=args.fim_format,
         fim_loss_scope=args.fim_loss_scope,
         use_eos=args.use_eos,

@@ -190,6 +190,34 @@ def test_shared_loss_computation_keeps_confident_wrong_eos_finite():
     assert torch.isfinite(logits.grad).all()
 
 
+def test_frame_type_span_diagnostics_reuse_training_ce_without_changing_objective():
+    torch.manual_seed(5)
+    logits = torch.randn(2, 4, SEQ_EOS_ID + 1)
+    targets = torch.tensor([[1, 2, SEQ_EOS_ID, IGNORE_INDEX], [3, 4, 5, SEQ_EOS_ID]])
+    regions = torch.tensor(
+        [[REGION_BRIDGE] * 4, [REGION_BRIDGE] * 4]
+    )
+    baseline = byte_training_loss_terms(
+        logits, targets, target_region_ids=regions, fim_span_loss_weight=1.0
+    )
+    typed = byte_training_loss_terms(
+        logits,
+        targets,
+        target_region_ids=regions,
+        fim_span_loss_weight=1.0,
+        fim_frame_nal_type=torch.tensor([5, 1]),
+    )
+
+    assert torch.equal(typed["objective"], baseline["objective"])
+    assert typed["fim_sample_count_idr"] == typed["fim_sample_count_p"] == 1
+    assert typed["fim_span_target_count_idr"] == 2
+    assert typed["fim_span_target_count_p"] == 3
+    per_byte = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+                               ignore_index=IGNORE_INDEX, reduction="none").reshape(2, 4)
+    assert torch.allclose(typed["fim_span_nll_sum_idr"], per_byte[0, :2].sum())
+    assert torch.allclose(typed["fim_span_nll_sum_p"], per_byte[1, :3].sum())
+
+
 def test_byte_only_ce_excludes_eos_and_control_logits():
     logits = torch.zeros(1, 1, SEQ_EOS_ID + 1, requires_grad=True)
     targets = torch.tensor([[7]])

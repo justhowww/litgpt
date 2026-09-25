@@ -23,13 +23,19 @@ srun --ntasks=2 --ntasks-per-node=2 bash -c \
     'echo "[gpu-check] rank=${SLURM_PROCID} local_rank=${SLURM_LOCALID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"'
 
 if [[ "${SMALL_SAMPLE_EVAL_ONLY:-0}" == "1" ]]; then
-    echo "[small-sample] evaluation only; reusing ${OUT_DIR}/final"
+    echo "[small-sample] evaluation only; reusing ${OUT_DIR}/${SMALL_SAMPLE_EVAL_CHECKPOINT:-final}"
 else
     source "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_pretrain/train.sh"
 fi
 
-if [[ ! -r "${OUT_DIR}/final/lit_model.pth" ]]; then
-    echo "Training finished without a readable final checkpoint: ${OUT_DIR}/final/lit_model.pth" >&2
+EVAL_CHECKPOINT=${SMALL_SAMPLE_EVAL_CHECKPOINT:-final}
+if [[ ! "${EVAL_CHECKPOINT}" =~ ^(final|step-[0-9]{8})$ ]]; then
+    echo "SMALL_SAMPLE_EVAL_CHECKPOINT must be final or step-XXXXXXXX" >&2
+    exit 1
+fi
+export EVAL_CHECKPOINT
+if [[ ! -r "${OUT_DIR}/${EVAL_CHECKPOINT}/lit_model.pth" ]]; then
+    echo "Checkpoint is not readable: ${OUT_DIR}/${EVAL_CHECKPOINT}/lit_model.pth" >&2
     exit 1
 fi
 if [[ ! -r "${OUT_DIR}/train_split.json" ]]; then
@@ -55,7 +61,7 @@ srun \
         split=train
         if [[ "${SLURM_PROCID}" == "1" ]]; then split=val; fi
         exec python -u "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_small_sample/eval_tf.py" \
-            "${SMALL_SAMPLE_CONFIG}" --split "${split}"
+            "${SMALL_SAMPLE_CONFIG}" --split "${split}" --checkpoint "${EVAL_CHECKPOINT}"
     '
 
 echo "[small-sample] evaluation complete"

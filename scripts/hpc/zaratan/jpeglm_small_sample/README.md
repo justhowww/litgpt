@@ -81,6 +81,36 @@ type/corruption length.
 The launcher delegates to the existing `jpeglm_pretrain/submit.sh` and
 `train.sh`; it does not replace their behavior for any previous run.
 
+`qwen3_idr50_20k.yaml` is a separate follow-up run. Its training loader first
+chooses an eligible IDR or non-IDR frame with equal probability, then chooses
+uniformly within that class and draws the gap/position as before. JPEG-LM has
+no B-frames, so its non-IDR class is P. If a GOP has only one eligible class,
+the loader uses that class and the logged realized fraction exposes the change.
+The held-out in-loop validation loader keeps its original uniform frame choice;
+the fixed-hole evaluator still uses the same shared 35-hole set. Training logs
+the local-rank realized IDR draw fraction and separate IDR/P missing-byte CE
+over each 100-step block, without recomputing vocabulary CE. The 20k-step run
+saves permanent checkpoints at 5k, 10k, 15k, and 20k; a rolling `latest`
+points at each milestone. The first 5k steps have a **different cosine LR**
+than the original 5k-step run, so their comparison is not a pure sampling-only
+ablation; a matched-schedule control would be needed to attribute all changes.
+
+Submit the new training run from the repository root on Zaratan:
+
+```bash
+python scripts/hpc/zaratan/jpeglm_small_sample/submit.py \
+  scripts/hpc/zaratan/jpeglm_small_sample/qwen3_idr50_20k.yaml
+```
+
+After step 5,000 has been saved, evaluate that milestone on both splits
+without restarting training:
+
+```bash
+SMALL_SAMPLE_EVAL_ONLY=1 SMALL_SAMPLE_EVAL_CHECKPOINT=step-00005000 \
+python scripts/hpc/zaratan/jpeglm_small_sample/submit.py \
+  scripts/hpc/zaratan/jpeglm_small_sample/qwen3_idr50_20k.yaml
+```
+
 To rerun only the teacher-forced evaluation after a successful training job,
 inside a one-GPU allocation with the project environment active:
 

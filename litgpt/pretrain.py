@@ -628,6 +628,17 @@ def fit(
     running_eos_aux = RunningMean(
         window=gradient_accumulation_iters, sync_on_compute=False
     ).to(fabric.device)
+    # Per-rank, 100-step diagnostics for optional frame-balanced window FIM.
+    # Reuse the NLL already computed by the objective; do not run another CE.
+    fim_type_window = {
+        f"{name}_{field}": torch.zeros((), device=fabric.device, dtype=torch.float64)
+        for name in ("idr", "p")
+        for field in ("nll", "bytes", "samples")
+    }
+    fim_type_total_samples = {
+        name: torch.zeros((), device=fabric.device, dtype=torch.float64)
+        for name in ("idr", "p")
+    }
     # Track the CE represented by one optimizer step. MRT is applied only at
     # the accumulation boundary, so a single final microbatch is not a fair
     # scalar comparison with its decoder-risk update.
@@ -689,8 +700,12 @@ def fit(
                     target_region_ids = target_region_ids[
                         :, : model.max_seq_length
                     ].contiguous().long()
+            fim_frame_nal_type = (
+                train_data.get("fim_frame_nal_type")
+                if isinstance(train_data, dict) else None
+            )
             loss_terms = byte_runtime.loss_terms(
-                logits, targets, target_region_ids
+                logits, targets, target_region_ids, fim_frame_nal_type
             )
             loss = loss_terms["objective"]
             if memory_profiler is not None:
@@ -740,6 +755,17 @@ def fit(
         running_full_ce.update(loss_terms["full_ce"].detach())
         running_fim_span_ce.update(loss_terms["fim_span_ce"].detach())
         running_eos_aux.update(loss_terms["eos_aux"].detach())
+        if "fim_sample_count_idr" in loss_terms:
+            for name in ("idr", "p"):
+                fim_type_window[f"{name}_nll"].add_(
+                    loss_terms[f"fim_span_nll_sum_{name}"]
+                )
+                fim_type_window[f"{name}_bytes"].add_(
+                    loss_terms[f"fim_span_target_count_{name}"]
+                )
+                samples = loss_terms[f"fim_sample_count_{name}"]
+                fim_type_window[f"{name}_samples"].add_(samples)
+                fim_type_total_samples[name].add_(samples)
 
         if not is_accumulating:
             fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
@@ -803,6 +829,29 @@ def fit(
                 "total_tokens": completed_tokens,
                 "learning_rate": lr,
             }
+            if (
+                not is_accumulating
+                and completed_steps > 0
+                and completed_steps % 100 == 0
+                and "fim_sample_count_idr" in loss_terms
+            ):
+                sample_count = sum(
+                    fim_type_window[f"{name}_samples"] for name in ("idr", "p")
+                )
+                metrics["training/fim_idr_draw_fraction_local_100steps"] = (
+                    fim_type_window["idr_samples"] / sample_count.clamp_min(1)
+                ).item()
+                for name in ("idr", "p"):
+                    count = fim_type_window[f"{name}_bytes"]
+                    metrics[f"training/fim_{name}_span_ce_local_100steps"] = (
+                        fim_type_window[f"{name}_nll"] / count.clamp_min(1)
+                    ).item()
+                    metrics[f"training/fim_{name}_target_bytes_local_100steps"] = count.item()
+                    metrics[f"training/fim_{name}_draws_since_launch_local"] = (
+                        fim_type_total_samples[name].item()
+                    )
+                    for field in ("nll", "bytes", "samples"):
+                        fim_type_window[f"{name}_{field}"].zero_()
             # Byte-domain extension: context and padding are masked, so record
             # how many tokens actually contribute to cross-entropy.
             if isinstance(train_data, dict):

@@ -302,6 +302,7 @@ class ByteTrainingRuntime:
         logits: torch.Tensor,
         targets: torch.Tensor,
         target_region_ids: torch.Tensor | None = None,
+        fim_frame_nal_type: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return byte_training_loss_terms(
             logits,
@@ -311,6 +312,7 @@ class ByteTrainingRuntime:
             eos_aux_loss_weight=self.eos_aux_loss_weight,
             target_region_ids=target_region_ids,
             fim_span_loss_weight=self.fim_span_loss_weight,
+            fim_frame_nal_type=fim_frame_nal_type,
         )
 
     def should_run_mrt(self, next_step: int, is_accumulating: bool) -> bool:
@@ -1443,6 +1445,7 @@ def byte_training_loss_terms(
     eos_aux_loss_weight: float = 0.0,
     target_region_ids: torch.Tensor | None = None,
     fim_span_loss_weight: float = 0.0,
+    fim_frame_nal_type: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return raw loss terms and their weighted training objective.
 
@@ -1519,6 +1522,7 @@ def byte_training_loss_terms(
     # placeholders instead of scanning the full logits tensor again.
     zero = log_normalizer.sum() * 0.0
     fim_span_ce = zero
+    frame_stats: dict[str, torch.Tensor] = {}
     if fim_span_loss_weight > 0:
         if target_region_ids is None:
             raise ValueError(
@@ -1534,6 +1538,21 @@ def byte_training_loss_terms(
         )
         selected_float = selected.to(token_nll.dtype)
         fim_span_ce = (token_nll * selected_float).sum() / selected_float.sum().clamp_min(1)
+        if fim_frame_nal_type is not None:
+            if fim_frame_nal_type.shape != (targets.shape[0],):
+                raise ValueError("fim_frame_nal_type must contain one NAL type per sample")
+            frame_types = fim_frame_nal_type.to(targets.device)
+            selected_by_sample = selected.reshape(targets.shape[0], -1)
+            nll_by_sample = token_nll.detach().reshape(targets.shape[0], -1)
+            for name, nal_type in (("idr", 5), ("p", 1)):
+                frame_mask = selected_by_sample & (frame_types == nal_type).unsqueeze(1)
+                frame_stats[f"fim_span_nll_sum_{name}"] = (
+                    nll_by_sample * frame_mask
+                ).sum().detach()
+                frame_stats[f"fim_span_target_count_{name}"] = frame_mask.sum().detach()
+                frame_stats[f"fim_sample_count_{name}"] = (
+                    frame_types == nal_type
+                ).sum().detach()
 
     eos_aux = zero
     if eos_aux_loss_weight > 0:
@@ -1565,6 +1584,7 @@ def byte_training_loss_terms(
         "fim_span_ce": fim_span_ce,
         "eos_aux": eos_aux,
         "objective": objective,
+        **frame_stats,
     }
 
 

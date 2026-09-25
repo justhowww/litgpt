@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 
 import pytest
 import torch
@@ -31,6 +32,7 @@ from litgpt.byte.data import (
     ByteDataConfig,
     ByteDataModule,
     ByteStreamWindowDataset,
+    collate_byte_samples,
     parse_annexb_nals,
 )
 
@@ -92,6 +94,28 @@ def test_frame_bounds_track_first_mb_not_nal_boundaries(tmp_path):
     assert bounds == [
         (head + i * FRAME_BYTES, head + (i + 1) * FRAME_BYTES) for i in range(4)
     ]
+
+
+def test_idr_balanced_draws_and_frame_metadata(tmp_path):
+    ds, data = _dataset(tmp_path, fim_idr_sampling_probability=0.5)
+    sample = ds.samples[0]
+    candidates = ds._fim_candidates(sample, data)
+    nal_types = ds._candidate_nal_types(sample, candidates)
+    assert sorted(nal_types.values()) == [1, 1, 1, 5]
+
+    rng = random.Random(1234)
+    draws = [
+        ds._draw_hole_spec(candidates, rng, nal_types_by_start=nal_types)
+        for _ in range(1000)
+    ]
+    idr_fraction = sum(nal_types[hole[0]] == 5 for hole in draws) / len(draws)
+    assert 0.45 < idr_fraction < 0.55
+
+    item = ds[0]
+    chosen_type = nal_types[item["sample_meta"]["frame_lo"]]
+    assert item["sample_meta"]["fim_frame_nal_type"] == chosen_type
+    batch = collate_byte_samples([item], max_seq_length=4096)
+    assert batch["fim_frame_nal_type"].tolist() == [chosen_type]
 
 
 def test_psm_layout_and_labels_only_on_missing_span(tmp_path):

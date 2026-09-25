@@ -354,6 +354,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--split", choices=("train", "val"), required=True)
+    parser.add_argument(
+        "--checkpoint", default="final",
+        help="Checkpoint directory under the run (final or step-XXXXXXXX)",
+    )
     args = parser.parse_args()
     values = load_config(args.config)
     evaluation = load_evaluation_config(args.config)
@@ -366,16 +370,22 @@ def main() -> None:
             f"Evaluation config differs from the frozen training config: {record_path}"
         )
     split = args.split
+    if args.checkpoint != "final" and not (
+        args.checkpoint.startswith("step-")
+        and len(args.checkpoint) == 13
+        and args.checkpoint[5:].isdigit()
+    ):
+        raise ValueError("--checkpoint must be final or step-XXXXXXXX")
     strata, omitted_strata = evaluation_strata(evaluation)
     print(
         f"Evaluation protocol {EVAL_PROTOCOL_ID}: {len(strata) * evaluation['samples_per_length']} "
         f"holes per split; {len(omitted_strata)} requested strata not evaluated",
         flush=True,
     )
-    checkpoint = run_dir / "final"
+    checkpoint = run_dir / args.checkpoint
     if not (checkpoint / "lit_model.pth").is_file():
         raise FileNotFoundError(f"Final checkpoint missing: {checkpoint / 'lit_model.pth'}")
-    out = run_dir / "eval_small_sample" / "final" / EVAL_PROTOCOL_ID / split
+    out = run_dir / "eval_small_sample" / args.checkpoint / EVAL_PROTOCOL_ID / split
     if out.exists() and any(out.iterdir()):
         raise RuntimeError(f"Evaluation output already exists; refusing overwrite: {out}")
     samples = build_samples(values, evaluation, split)
