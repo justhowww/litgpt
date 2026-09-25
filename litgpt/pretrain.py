@@ -1,5 +1,6 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+import gc
 import math
 import os
 import pprint
@@ -371,7 +372,10 @@ def main(
     state = {
         "model": model,
         "optimizer": optimizer,
-        "train_dataloader": train_dataloader,
+        # The DataLoader is deliberately not checkpointed: nothing restores from
+        # it, and pickling it embeds the full dataset (millions of Python
+        # objects) in every checkpoint and in every resumed rank's memory, where
+        # forked workers slowly copy it until the node is OOM-killed.
         "iter_num": 0,
         "step_count": 0,
     }
@@ -412,7 +416,10 @@ def main(
         fabric.print(f"Resuming training from {resume}")
         # Stage-1 checkpoints are trusted local artifacts and contain optimizer
         # and DataLoader state, which PyTorch 2.6's weights-only loader rejects.
+        # Older checkpoints still carry a pickled DataLoader; it comes back in the
+        # returned remainder and is dropped here instead of replacing ours.
         fabric.load(resume, state, weights_only=False)
+        gc.collect()
 
     train_time = time.perf_counter()
     initial_step_count = state["step_count"]

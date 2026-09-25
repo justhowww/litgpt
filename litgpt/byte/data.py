@@ -11,6 +11,7 @@ unit used by the byte model.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -20,9 +21,10 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any, Literal
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -988,6 +990,52 @@ class WindowSample:
     byte_length: int = 0
 
 
+class WindowSampleTable(Sequence):
+    """Read-only ``Sequence[WindowSample]`` backed by flat numpy columns.
+
+    A full corpus has ~13M windows. As a list of dataclass instances that is
+    several GB of GC-tracked objects per rank, and every forked DataLoader
+    worker gradually copies those pages (refcount and GC header writes defeat
+    copy-on-write) until the node is OOM-killed. Numpy columns are never
+    written after construction, so workers keep sharing them. Items are
+    materialized on access and compare equal to the original ``WindowSample``.
+    """
+
+    def __init__(self, samples: Iterable[WindowSample]) -> None:
+        path_ids: dict[str, int] = {}
+        columns: list[tuple[int, int, int, int, int]] = []
+        for s in samples:
+            key = str(s.h264_path)
+            path_id = path_ids.setdefault(key, len(path_ids))
+            columns.append((path_id, s.start_nal, s.end_nal, s.num_frames, s.byte_length))
+        # Plain strings are not GC-tracked; Path objects are rebuilt per access.
+        self._paths = list(path_ids)
+        table = np.array(columns, dtype=np.int64).reshape(-1, 5)
+        self._path_id = table[:, 0].astype(np.int32)
+        self._start_nal = table[:, 1].copy()
+        self._end_nal = table[:, 2].copy()
+        self._num_frames = table[:, 3].astype(np.int32)
+        self._byte_length = table[:, 4].copy()
+
+    def __len__(self) -> int:
+        return len(self._path_id)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        index = range(len(self))[index]  # normalizes negatives, raises IndexError
+        return WindowSample(
+            Path(self._paths[self._path_id[index]]),
+            int(self._start_nal[index]),
+            int(self._end_nal[index]),
+            int(self._num_frames[index]),
+            int(self._byte_length[index]),
+        )
+
+    def byte_length(self, index: int) -> int:
+        return int(self._byte_length[index])
+
+
 class ByteStreamWindowDataset(Dataset):
     """Contiguous multi-frame stream-window dataset for AR pretraining (H0).
 
@@ -1113,7 +1161,12 @@ class ByteStreamWindowDataset(Dataset):
         self.gops_seen = 0
         self.gops_oversized = 0
         self.gops_too_short = 0
-        self.samples, self.nal_index = self._build_index(nal_index)
+        samples, self.nal_index = self._build_index(nal_index)
+        self.samples = WindowSampleTable(samples)
+        del samples
+        # Rows are only needed to build the index; drop the GC-tracked dicts so
+        # forked DataLoader workers do not gradually copy them.
+        self.rows = []
         if not self.samples:
             raise ValueError(
                 "No usable stream windows found. Check max_seq_length, min_frames, "
@@ -1135,10 +1188,10 @@ class ByteStreamWindowDataset(Dataset):
 
     def sample_length(self, index: int) -> int:
         """Return a window's byte length without reading its H.264 file."""
-        sample = self.samples[index]
-        byte_length = int(getattr(sample, "byte_length", 0))
+        byte_length = self.samples.byte_length(index)
         if byte_length > 0:
             return byte_length
+        sample = self.samples[index]
         # Backward compatibility for WindowSample objects restored from an old
         # checkpoint that predates the cached byte_length field.
         nals = self.nal_index[str(sample.h264_path)]
@@ -2202,6 +2255,12 @@ class ByteDataModule(DataModule):
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             self.setup()
+        if self.config.num_workers > 0:
+            # Move everything built so far (dataset index, NAL file map, ...) out
+            # of the collector's reach. Forked workers otherwise copy these pages
+            # as soon as a full collection touches their GC headers.
+            gc.collect()
+            gc.freeze()
         if self.config.length_bucketing:
             batch_sampler = DistributedLengthBucketBatchSampler(
                 self.train_dataset,
