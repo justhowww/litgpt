@@ -78,5 +78,9 @@ job_id=$(sbatch "${sbatch_args[@]}" "${JOB_SCRIPT}")
 echo "Submitted JPEG-LM pretraining job ${job_id}"
 echo "Output directory: ${OUT_DIR}"
 echo "Requested memory: ${SBATCH_MEM}"
-[[ -n "${TRAIN_CPUS_PER_TASK}" ]] && echo "CPUs per training rank: ${TRAIN_CPUS_PER_TASK}"
-[[ -n "${AFTER_JOBID:-}" ]] && echo "Dependency: ${DEPENDENCY_TYPE}:${AFTER_JOBID}"
+if [[ -n "${TRAIN_CPUS_PER_TASK}" ]]; then
+    echo "CPUs per training rank: ${TRAIN_CPUS_PER_TASK}"
+fi
+if [[ -n "${AFTER_JOBID:-}" ]]; then
+    echo "Dependency: ${DEPENDENCY_TYPE}:${AFTER_JOBID}"
+fi

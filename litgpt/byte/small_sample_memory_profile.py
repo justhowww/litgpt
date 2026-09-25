@@ -100,7 +100,9 @@ class SmallSampleMemoryProfiler:
                 reading["total_device_used_gb"] = (
                     device_used(torch.cuda.current_device()) / 1e9
                 )
-            except (RuntimeError, TypeError):
+            except (ImportError, RuntimeError, TypeError, OSError):
+                # PyTorch's device_memory_used() requires optional pynvml.
+                # Keep allocator readings when it is unavailable.
                 pass
         self.phases.append(reading)
 
