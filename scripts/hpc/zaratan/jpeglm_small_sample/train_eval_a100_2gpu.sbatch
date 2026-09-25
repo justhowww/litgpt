@@ -55,8 +55,8 @@ srun \
     --ntasks-per-node=2 \
     --gpus-per-task=a100:1 \
     --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
-    --output="${OUT_DIR}/logs/small-sample-eval-%t.out" \
-    --error="${OUT_DIR}/logs/small-sample-eval-%t.err" \
+    --output="${OUT_DIR}/logs/small-sample-eval-${EVAL_CHECKPOINT}-%t.out" \
+    --error="${OUT_DIR}/logs/small-sample-eval-${EVAL_CHECKPOINT}-%t.err" \
     bash -c '
         split=train
         if [[ "${SLURM_PROCID}" == "1" ]]; then split=val; fi

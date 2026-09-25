@@ -1745,7 +1745,11 @@ class ByteStreamWindowDataset(Dataset):
         hole: tuple[int, int, int, int] | None = None,
         hole_id: int | None = None,
     ) -> dict[str, Any]:
-        nal_types = self._candidate_nal_types(sample, candidates)
+        nal_types = (
+            self._candidate_nal_types(sample, candidates)
+            if self.fim_idr_sampling_probability is not None
+            else None
+        )
         if hole is None:
             frame_lo, frame_hi, split, gap = self._draw_hole_spec(
                 candidates, rng, nal_types_by_start=nal_types
@@ -1824,7 +1828,10 @@ class ByteStreamWindowDataset(Dataset):
             fim_split=split,
             frame_lo=frame_lo,
             frame_hi=frame_hi,
-            fim_frame_nal_type=nal_types[frame_lo],
+            **(
+                {"fim_frame_nal_type": nal_types[frame_lo]}
+                if nal_types is not None else {}
+            ),
             fim_hole_id=hole_id if hole_id is not None else -1,
         )
 
@@ -1889,9 +1896,15 @@ def collate_byte_samples(
         "offset_ids": pad_and_truncate(
             [sample["offset_ids"] for sample in samples], max_seq_length, 0
         ),
-        "fim_frame_nal_type": torch.tensor(
-            [sample["sample_meta"].get("fim_frame_nal_type", -1) for sample in samples],
-            dtype=torch.int64,
+        **(
+            {
+                "fim_frame_nal_type": torch.tensor(
+                    [sample["sample_meta"].get("fim_frame_nal_type", -1) for sample in samples],
+                    dtype=torch.int64,
+                )
+            }
+            if any("fim_frame_nal_type" in sample["sample_meta"] for sample in samples)
+            else {}
         ),
         **(
             {

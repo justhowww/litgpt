@@ -384,7 +384,7 @@ def main() -> None:
     )
     checkpoint = run_dir / args.checkpoint
     if not (checkpoint / "lit_model.pth").is_file():
-        raise FileNotFoundError(f"Final checkpoint missing: {checkpoint / 'lit_model.pth'}")
+        raise FileNotFoundError(f"Checkpoint missing: {checkpoint / 'lit_model.pth'}")
     out = run_dir / "eval_small_sample" / args.checkpoint / EVAL_PROTOCOL_ID / split
     if out.exists() and any(out.iterdir()):
         raise RuntimeError(f"Evaluation output already exists; refusing overwrite: {out}")
