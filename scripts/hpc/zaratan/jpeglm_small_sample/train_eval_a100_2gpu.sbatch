@@ -18,7 +18,7 @@ REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 export REPO_ROOT
 export DEVICES=2 NUM_NODES=1
 
-echo "[small-sample] train on two A100 GPUs; config=${SMALL_SAMPLE_CONFIG}"
+echo "[small-sample] two-A100 job; config=${SMALL_SAMPLE_CONFIG} eval_only=${SMALL_SAMPLE_EVAL_ONLY:-0}"
 srun --ntasks=2 --ntasks-per-node=2 bash -c \
     'echo "[gpu-check] rank=${SLURM_PROCID} local_rank=${SLURM_LOCALID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"'
 
@@ -37,7 +37,9 @@ if [[ ! -r "${OUT_DIR}/train_split.json" ]]; then
     exit 1
 fi
 
-python "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_small_sample/write_learning_curve_aliases.py" "${OUT_DIR}"
+if [[ "${SMALL_SAMPLE_EVAL_ONLY:-0}" != "1" ]]; then
+    python "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_small_sample/write_learning_curve_aliases.py" "${OUT_DIR}"
+fi
 
 echo "[small-sample] teacher-forced evaluation: rank 0=train, rank 1=val"
 srun \
@@ -56,4 +58,4 @@ srun \
             "${SMALL_SAMPLE_CONFIG}" --split "${split}"
     '
 
-echo "[small-sample] train and evaluation complete"
+echo "[small-sample] evaluation complete"
