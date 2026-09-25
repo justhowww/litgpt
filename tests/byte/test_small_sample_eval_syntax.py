@@ -96,8 +96,8 @@ def test_small_eval_selects_each_severity_with_its_own_size_limit(monkeypatch):
         "SLICE_HEADER_GUARD_BYTES": "0",
     }
     evaluation = {
-        "corruption_lengths": [64, 600],
-        "samples_per_length": 2,
+        "corruption_lengths": [64, 128, 256, 400, 600],
+        "samples_per_length": 5,
         "frame_types": ["idr", "p"],
         "seed": 42,
         "corruption_position": 0.4,
@@ -106,10 +106,17 @@ def test_small_eval_selects_each_severity_with_its_own_size_limit(monkeypatch):
 
     samples = eval_tf.build_samples(values, evaluation, "val")
 
-    assert len(samples) == 8
+    assert len(samples) == 35
     assert seen == [
         ("idr", [64], 64),
+        ("idr", [128], 128),
+        ("idr", [256], 256),
+        ("idr", [400], 400),
         ("idr", [600], 600),
         ("p", [64], 64),
-        ("p", [600], 600),
+        ("p", [128], 128),
+    ]
+    _, omitted = eval_tf.evaluation_strata(evaluation)
+    assert [(item["frame_type"], item["corruption_length_bytes"]) for item in omitted] == [
+        ("p", 256), ("p", 400), ("p", 600),
     ]

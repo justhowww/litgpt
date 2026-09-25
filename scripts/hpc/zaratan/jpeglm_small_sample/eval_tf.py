@@ -61,7 +61,40 @@ SYNTAX_BUCKETS = (
     "mixed",
     "unclassified",
 )
-EVAL_PROTOCOL_ID = "per_length_eligibility_v1"
+EVAL_PROTOCOL_ID = "feasible_35_holes_v1"
+# The frozen run configs request 50 holes. On this 256-video subset, none of
+# the 60 held-out GOP windows has a P-frame eligible for a 256-byte cut (and
+# therefore not for 400/600 bytes). Keep the feasible train/val comparison
+# identical without changing either run's frozen training configuration.
+EVAL_STRATA = (
+    ("idr", 64), ("idr", 128), ("idr", 256), ("idr", 400), ("idr", 600),
+    ("p", 64), ("p", 128),
+)
+
+
+def evaluation_strata(evaluation: dict) -> tuple[list[tuple[str, int]], list[dict[str, Any]]]:
+    requested = [
+        (frame_type, length)
+        for frame_type in evaluation["frame_types"]
+        for length in evaluation["corruption_lengths"]
+    ]
+    if requested != [
+        (frame_type, length)
+        for frame_type in ("idr", "p")
+        for length in (64, 128, 256, 400, 600)
+    ]:
+        raise ValueError(
+            f"{EVAL_PROTOCOL_ID} requires the frozen IDR/P, 64/128/256/400/600B "
+            "evaluation config; use a different protocol for other settings"
+        )
+    if evaluation["samples_per_length"] != 5:
+        raise ValueError(f"{EVAL_PROTOCOL_ID} requires five holes per stratum")
+    omitted = [
+        {"frame_type": frame_type, "corruption_length_bytes": length,
+         "reason": "no eligible held-out P-frame window in the fixed 256-video subset"}
+        for frame_type, length in requested if (frame_type, length) not in EVAL_STRATA
+    ]
+    return list(EVAL_STRATA), omitted
 
 
 def syntax_bucket(categories: set[HS.Category]) -> str:
@@ -92,62 +125,63 @@ def sample_identity(sample: FIM.WindowFimSample, split: str) -> dict[str, Any]:
 
 def build_samples(values: dict[str, str], evaluation: dict, split: str) -> list[FIM.WindowFimSample]:
     samples = []
-    lengths = evaluation["corruption_lengths"]
     per_length = evaluation["samples_per_length"]
-    for frame_type in evaluation["frame_types"]:
-        for length in lengths:
-            # Require only the requested cut to fit. Reusing a source window
-            # across severities is intentional: each severity remains five
-            # distinct windows, while cross-severity comparisons are paired.
-            args = argparse.Namespace(
-                manifest=Path(values["MANIFEST"]),
-                nal_index_path=Path(values["NAL_INDEX"]),
-                train_split_file=Path(values["OUT_DIR"]) / "train_split.json",
-                eval_split=split,
-                max_manifest_rows=int(values["MAX_ROWS"]),
-                max_window_bytes=int(values["RAW_CONTEXT_BYTES"]) - 1,
-                window_min_frames=int(values["WINDOW_MIN_FRAMES"]),
-                window_unit=values["WINDOW_UNIT"],
-                val_fraction=float(values["VAL_FRACTION"]),
-                split_by_video=True,
-                seed=evaluation["seed"],
-                fim_format=values["FIM_FORMAT"],
-                fim_loss_scope=values["FIM_LOSS_SCOPE"],
-                use_eos=True,
-                fim_min_gap=int(values["FIM_MIN_GAP"]),
-                fim_max_gap=int(values["FIM_MAX_GAP"]),
-                slice_header_guard_bytes=int(values["SLICE_HEADER_GUARD_BYTES"]),
-                hole_placement="corrupt_gen_frame",
-                hole_set="sampled",
-                corr_pos=evaluation["corruption_position"],
-                corr_len_bytes=None,
-                corr_len_bytes_list=[length],
-                corr_samples_per_length=per_length,
-                corr_eligibility_bytes=length,
-                corr_header_guard_bytes=evaluation["corruption_header_guard_bytes"],
-                corr_frame_type=frame_type,
-                num_clips=per_length,
+    strata, _ = evaluation_strata(evaluation)
+    for frame_type, length in strata:
+        # Require only the requested cut to fit. Reusing a source window
+        # across severities is intentional: each severity remains five
+        # distinct windows, while cross-severity comparisons are paired.
+        args = argparse.Namespace(
+            manifest=Path(values["MANIFEST"]),
+            nal_index_path=Path(values["NAL_INDEX"]),
+            train_split_file=Path(values["OUT_DIR"]) / "train_split.json",
+            eval_split=split,
+            max_manifest_rows=int(values["MAX_ROWS"]),
+            max_window_bytes=int(values["RAW_CONTEXT_BYTES"]) - 1,
+            window_min_frames=int(values["WINDOW_MIN_FRAMES"]),
+            window_unit=values["WINDOW_UNIT"],
+            val_fraction=float(values["VAL_FRACTION"]),
+            split_by_video=True,
+            seed=evaluation["seed"],
+            fim_format=values["FIM_FORMAT"],
+            fim_loss_scope=values["FIM_LOSS_SCOPE"],
+            use_eos=True,
+            fim_min_gap=int(values["FIM_MIN_GAP"]),
+            fim_max_gap=int(values["FIM_MAX_GAP"]),
+            slice_header_guard_bytes=int(values["SLICE_HEADER_GUARD_BYTES"]),
+            hole_placement="corrupt_gen_frame",
+            hole_set="sampled",
+            corr_pos=evaluation["corruption_position"],
+            corr_len_bytes=None,
+            corr_len_bytes_list=[length],
+            corr_samples_per_length=per_length,
+            corr_eligibility_bytes=length,
+            corr_header_guard_bytes=evaluation["corruption_header_guard_bytes"],
+            corr_frame_type=frame_type,
+            num_clips=per_length,
+        )
+        try:
+            selection = FIM.build_eval_sample_selection(args)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"Cannot select {per_length} distinct {split}/{frame_type}/"
+                f"{length}B evaluation windows: {error}"
+            ) from error
+        if len(selection.samples) != per_length:
+            raise RuntimeError(
+                f"{split}/{frame_type}/{length}B: expected {per_length} "
+                f"samples, got {len(selection.samples)}; no silent dropping is allowed"
             )
-            try:
-                selection = FIM.build_eval_sample_selection(args)
-            except RuntimeError as error:
-                raise RuntimeError(
-                    f"Cannot select {per_length} distinct {split}/{frame_type}/"
-                    f"{length}B evaluation windows: {error}"
-                ) from error
-            if len(selection.samples) != per_length:
-                raise RuntimeError(
-                    f"{split}/{frame_type}/{length}B: expected {per_length} "
-                    f"samples, got {len(selection.samples)}; no silent dropping is allowed"
-                )
-            if any(
-                s.corruption_frame_type != frame_type or s.gap != length
-                for s in selection.samples
-            ):
-                raise AssertionError(
-                    f"{split}/{frame_type}/{length}B: wrong corruption class selected"
-                )
-            samples.extend(selection.samples)
+        if any(
+            s.corruption_frame_type != frame_type or s.gap != length
+            for s in selection.samples
+        ):
+            raise AssertionError(
+                f"{split}/{frame_type}/{length}B: wrong corruption class selected"
+            )
+        samples.extend(selection.samples)
+    if len(samples) != 35:
+        raise AssertionError(f"{EVAL_PROTOCOL_ID} selected {len(samples)} holes, expected 35")
     return samples
 
 
@@ -332,6 +366,12 @@ def main() -> None:
             f"Evaluation config differs from the frozen training config: {record_path}"
         )
     split = args.split
+    strata, omitted_strata = evaluation_strata(evaluation)
+    print(
+        f"Evaluation protocol {EVAL_PROTOCOL_ID}: {len(strata) * evaluation['samples_per_length']} "
+        f"holes per split; {len(omitted_strata)} requested strata not evaluated",
+        flush=True,
+    )
     checkpoint = run_dir / "final"
     if not (checkpoint / "lit_model.pth").is_file():
         raise FileNotFoundError(f"Final checkpoint missing: {checkpoint / 'lit_model.pth'}")
@@ -402,6 +442,17 @@ def main() -> None:
         "checkpoint": str(checkpoint),
         "eval_split": split,
         "eval_protocol": EVAL_PROTOCOL_ID,
+        "requested_strata": [
+            {"frame_type": frame_type, "corruption_length_bytes": length}
+            for frame_type in evaluation["frame_types"]
+            for length in evaluation["corruption_lengths"]
+        ],
+        "evaluated_strata": [
+            {"frame_type": frame_type, "corruption_length_bytes": length,
+             "samples": evaluation["samples_per_length"]}
+            for frame_type, length in strata
+        ],
+        "not_evaluated_strata": omitted_strata,
         "syntax_bucket_definition": {
             "structural_syntax": sorted(category.value for category in STRUCTURAL_SYNTAX_CATEGORIES),
             "content_dependent": sorted(category.value for category in CONTENT_DEPENDENT_CATEGORIES),

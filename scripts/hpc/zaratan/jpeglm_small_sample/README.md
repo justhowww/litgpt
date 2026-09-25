@@ -50,9 +50,14 @@ non-PyTorch allocations such as NCCL are not captured by PyTorch's allocator.
 Only the configured small-sample step enables recording, and larger runs keep
 their existing behavior.
 
-The evaluation fixes the corruption length to 64, 128, 256, 400, or 600 bytes,
-with five IDR and five P-frame examples per length in each split (50 holes per
-split). It records the exact selected holes in a shared manifest and refuses to
+The frozen YAML requests corruption lengths of 64, 128, 256, 400, and 600 bytes
+for both frame types. The `feasible_35_holes_v1` evaluation protocol scores five
+IDR examples at each length and five P-frame examples at 64 and 128 bytes (35
+holes per split). The 256-video subset has no eligible held-out P-frame window
+for a 256-byte cut, so P/256B, P/400B, and P/600B are explicitly marked as
+not evaluated in `summary.json`; they are never silently counted as failures.
+The protocol applies identically to train and validation, and to Qwen3 and
+Pythia. It records the exact selected holes in a shared manifest and refuses to
 compare runs whose
 sample definitions differ. It reports missing-byte CE in bits/byte (EOS
 excluded), byte perplexity/accuracy, EOS probability/rank, I/P and length
@@ -62,7 +67,7 @@ continue to change and are not exact replay pairs.
 Each severity requires five distinct eligible windows, but a window may recur
 at a different severity. Eligibility is checked against that severity's actual
 cut length, not the largest length in the schedule.
-This corrected selection is versioned as `per_length_eligibility_v1` under both
+This feasible selection is versioned as `feasible_35_holes_v1` under both
 the shared sample-set directory and `eval_small_sample/final/`, so earlier
 partial evaluation files are preserved and never mistaken for this protocol.
 
@@ -86,7 +91,7 @@ python scripts/hpc/zaratan/jpeglm_small_sample/eval_tf.py \
 ```
 
 The evaluator protects existing output; move aside an incomplete
-`eval_small_sample/final/per_length_eligibility_v1/<split>` directory before
+`eval_small_sample/final/feasible_35_holes_v1/<split>` directory before
 retrying the same protocol. It does not delete or overwrite anything
 automatically.
 
