@@ -51,8 +51,9 @@ Only the configured small-sample step enables recording, and larger runs keep
 their existing behavior.
 
 The evaluation fixes the corruption length to 64, 128, 256, 400, or 600 bytes,
-with two IDR and two P-frame examples per length in each split. It records the
-exact selected holes in a shared manifest and refuses to compare runs whose
+with five IDR and five P-frame examples per length in each split (50 holes per
+split). It records the exact selected holes in a shared manifest and refuses to
+compare runs whose
 sample definitions differ. It reports missing-byte CE in bits/byte (EOS
 excluded), byte perplexity/accuracy, EOS probability/rank, I/P and length
 breakdowns, per-byte NLL JSONL, and HTML syntax-annotated loss heatmaps. It is

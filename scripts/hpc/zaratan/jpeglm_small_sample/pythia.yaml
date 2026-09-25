@@ -66,9 +66,9 @@ slurm:
 evaluation:
   seed: 42
   corruption_lengths: [64, 128, 256, 400, 600]
-  samples_per_length: 2
+  samples_per_length: 5
   corruption_position: 0.4
   corruption_header_guard_bytes: 0
   frame_types: [idr, p]
-  sample_set_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/eval_sets/small-27x1024-patch256-v1
-  num_heatmaps: 20
+  sample_set_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/eval_sets/small-27x1024-patch256-v2-50holes
+  num_heatmaps: 50
