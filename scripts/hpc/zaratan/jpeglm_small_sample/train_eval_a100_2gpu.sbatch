@@ -22,7 +22,11 @@ echo "[small-sample] train on two A100 GPUs; config=${SMALL_SAMPLE_CONFIG}"
 srun --ntasks=2 --ntasks-per-node=2 bash -c \
     'echo "[gpu-check] rank=${SLURM_PROCID} local_rank=${SLURM_LOCALID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"'
 
-source "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_pretrain/train.sh"
+if [[ "${SMALL_SAMPLE_EVAL_ONLY:-0}" == "1" ]]; then
+    echo "[small-sample] evaluation only; reusing ${OUT_DIR}/final"
+else
+    source "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_pretrain/train.sh"
+fi
 
 if [[ ! -r "${OUT_DIR}/final/lit_model.pth" ]]; then
     echo "Training finished without a readable final checkpoint: ${OUT_DIR}/final/lit_model.pth" >&2
@@ -41,7 +45,7 @@ srun \
     --kill-on-bad-exit=1 \
     --ntasks=2 \
     --ntasks-per-node=2 \
-    --gpus-per-task=1 \
+    --gpus-per-task=a100:1 \
     --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
     --output="${OUT_DIR}/logs/small-sample-eval-%t.out" \
     --error="${OUT_DIR}/logs/small-sample-eval-%t.err" \

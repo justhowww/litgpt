@@ -60,6 +60,13 @@ breakdowns, per-byte NLL JSONL, and HTML syntax-annotated loss heatmaps. It is
 teacher-forced only; it does not claim free-run repair success. Training holes
 continue to change and are not exact replay pairs.
 
+The summary also pools byte-weighted CE by parser ownership: stream/header
+structure, content-dependent macroblock/prediction/residual coding, bytes
+straddling both, and unclassified bytes. Each bucket reports its byte fraction
+and contribution to overall missing-byte CE; unknown parser coverage is never
+silently counted as syntax. The same breakdown appears overall and by frame
+type/corruption length.
+
 The launcher delegates to the existing `jpeglm_pretrain/submit.sh` and
 `train.sh`; it does not replace their behavior for any previous run.
 
@@ -75,3 +82,13 @@ python scripts/hpc/zaratan/jpeglm_small_sample/eval_tf.py \
 The evaluator protects existing output; move aside an incomplete
 `eval_small_sample/final/<split>` directory before retrying. It does not delete
 or overwrite anything automatically.
+
+To rerun both evaluation splits in the two-A100 Slurm job without retraining,
+set `SMALL_SAMPLE_EVAL_ONLY=1` when invoking `submit.py` with the unchanged
+YAML. This requires an existing final checkpoint and training split, and the
+evaluator still refuses to overwrite any existing split output.
+
+```bash
+SMALL_SAMPLE_EVAL_ONLY=1 python scripts/hpc/zaratan/jpeglm_small_sample/submit.py \
+  scripts/hpc/zaratan/jpeglm_small_sample/qwen3.yaml
+```

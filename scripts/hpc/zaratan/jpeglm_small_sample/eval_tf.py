@@ -34,7 +34,44 @@ from litgpt.byte.megabyte_inference import megabyte_teacher_forced_sample  # noq
 from litgpt.byte.reconstruction import _unwrap_model  # noqa: E402
 from scripts.byte.eval import eval_fim_avclm as FIM  # noqa: E402
 from scripts.byte.eval.helpers.checkpoint_eval_helpers import load_model  # noqa: E402
-from submit import load_config, load_evaluation_config  # noqa: E402
+from scripts.hpc.zaratan.jpeglm_small_sample.submit import load_config, load_evaluation_config  # noqa: E402
+
+
+STRUCTURAL_SYNTAX_CATEGORIES = frozenset({
+    HS.Category.START_CODE,
+    HS.Category.NAL_HEADER,
+    HS.Category.EMULATION_PREVENTION,
+    HS.Category.SPS,
+    HS.Category.PPS,
+    HS.Category.SEI,
+    HS.Category.SLICE_HEADER,
+    HS.Category.RBSP_TRAILING,
+})
+CONTENT_DEPENDENT_CATEGORIES = frozenset({
+    HS.Category.MB_HEADER,
+    HS.Category.MB_PRED,
+    HS.Category.CBP,
+    HS.Category.MB_QP_DELTA,
+    HS.Category.RESIDUAL_LUMA,
+    HS.Category.RESIDUAL_CHROMA,
+})
+SYNTAX_BUCKETS = (
+    "structural_syntax",
+    "content_dependent",
+    "mixed",
+    "unclassified",
+)
+
+
+def syntax_bucket(categories: set[HS.Category]) -> str:
+    """Assign a whole byte only when all overlapping bit fields agree."""
+    if not categories or categories - STRUCTURAL_SYNTAX_CATEGORIES - CONTENT_DEPENDENT_CATEGORIES:
+        return "unclassified"
+    structural = bool(categories & STRUCTURAL_SYNTAX_CATEGORIES)
+    content = bool(categories & CONTENT_DEPENDENT_CATEGORIES)
+    if structural and content:
+        return "mixed"
+    return "structural_syntax" if structural else "content_dependent"
 
 
 def sample_identity(sample: FIM.WindowFimSample, split: str) -> dict[str, Any]:
@@ -175,33 +212,44 @@ def score_sample(model: torch.nn.Module, sample: FIM.WindowFimSample, device: to
     }
 
 
-def syntax_owners(sample: FIM.WindowFimSample) -> list[str]:
+def syntax_annotations(sample: FIM.WindowFimSample) -> list[dict[str, str]]:
+    """Record all parser spans touching each deleted Annex-B byte."""
     try:
         spans = HS.parse_stream(sample.gt_truncated_stream, parse_slice_data=True).all_spans()
     except Exception:
-        return ["parser unavailable"] * sample.target_length
-    owners = []
-    for offset in range(sample.split, sample.split + sample.target_length):
-        overlapping = [
-            span for span in spans if span.byte_start <= offset < span.byte_end
+        return [
+            {"owners": "parser unavailable", "bucket": "unclassified"}
+            for _ in range(sample.target_length)
         ]
-        # A byte may straddle several bit fields. Show every owner, not just the
-        # first syntax element in that byte.
-        names = list(dict.fromkeys(span.name for span in overlapping))
-        owners.append(", ".join(names) if names else "unattributed")
-    return owners
+    names: list[list[str]] = [[] for _ in range(sample.target_length)]
+    categories: list[set[HS.Category]] = [set() for _ in range(sample.target_length)]
+    for span in spans:
+        lo = max(0, span.byte_start - sample.split)
+        hi = min(sample.target_length, span.byte_end - sample.split)
+        for index in range(lo, hi):
+            if span.name not in names[index]:
+                names[index].append(span.name)
+            categories[index].add(span.category)
+    return [
+        {
+            "owners": ", ".join(names[index]) if names[index] else "unattributed",
+            "bucket": syntax_bucket(categories[index]),
+        }
+        for index in range(sample.target_length)
+    ]
 
 
-def write_heatmap(path: Path, sample: FIM.WindowFimSample, scores: dict, owners: list[str]) -> None:
+def write_heatmap(path: Path, sample: FIM.WindowFimSample, scores: dict, annotations: list[dict[str, str]]) -> None:
     cells = []
-    for index, (bit_loss, owner) in enumerate(zip(scores["byte_nll_bits"], owners)):
+    for index, (bit_loss, annotation) in enumerate(zip(scores["byte_nll_bits"], annotations)):
         clipped = min(max(float(bit_loss), 0.0), 8.0) / 8.0
         red = int(245 - 55 * clipped)
         green = int(245 - 190 * clipped)
         blue = int(245 - 190 * clipped)
         label = (
             f"byte {index} | stream offset {sample.split + index} | "
-            f"GT {sample.target_bytes[index]:02x} | {bit_loss:.3f} bits | {owner}"
+            f"GT {sample.target_bytes[index]:02x} | {bit_loss:.3f} bits | "
+            f"{annotation['bucket']} | {annotation['owners']}"
         )
         cells.append(
             f'<span class="byte" style="background:rgb({red},{green},{blue})" '
@@ -225,6 +273,13 @@ def aggregate(rows: list[dict]) -> dict:
     total_bytes = sum(row["target_bytes"] for row in rows)
     total_bits = sum(row["byte_loss_bits_sum"] for row in rows)
     bits_per_byte = total_bits / total_bytes if total_bytes else None
+    bucket_totals = {bucket: {"bytes": 0, "loss_bits_sum": 0.0} for bucket in SYNTAX_BUCKETS}
+    for row in rows:
+        for bucket, values in row["syntax_buckets"].items():
+            bucket_totals[bucket]["bytes"] += values["bytes"]
+            bucket_totals[bucket]["loss_bits_sum"] += values["loss_bits_sum"]
+    if sum(values["bytes"] for values in bucket_totals.values()) != total_bytes:
+        raise AssertionError("Syntax buckets do not cover every scored byte")
     return {
         "samples": len(rows),
         "target_bytes": total_bytes,
@@ -234,6 +289,15 @@ def aggregate(rows: list[dict]) -> dict:
         "eos_probability_mean": statistics.mean(row["eos_probability"] for row in rows) if rows else None,
         "eos_rank_median": statistics.median(row["eos_rank"] for row in rows) if rows else None,
         "eos_top1_rate": sum(row["eos_rank"] == 1 for row in rows) / len(rows) if rows else None,
+        "by_syntax_bucket": {
+            bucket: {
+                "bytes": values["bytes"],
+                "byte_fraction": values["bytes"] / total_bytes if total_bytes else None,
+                "ce_bits_per_byte": values["loss_bits_sum"] / values["bytes"] if values["bytes"] else None,
+                "contribution_bits_per_target_byte": values["loss_bits_sum"] / total_bytes if total_bytes else None,
+            }
+            for bucket, values in bucket_totals.items()
+        },
     }
 
 
@@ -274,8 +338,15 @@ def main() -> None:
         heatmaps.mkdir()
         for sample_id, sample in enumerate(samples):
             scores = score_sample(model, sample, device)
-            owners = syntax_owners(sample)
+            annotations = syntax_annotations(sample)
             bits = scores["byte_nll_bits"]
+            if len(annotations) != len(bits):
+                raise AssertionError("Syntax annotations do not match scored bytes")
+            syntax_buckets = {bucket: {"bytes": 0, "loss_bits_sum": 0.0} for bucket in SYNTAX_BUCKETS}
+            for bit_loss, annotation in zip(bits, annotations):
+                bucket = syntax_buckets[annotation["bucket"]]
+                bucket["bytes"] += 1
+                bucket["loss_bits_sum"] += bit_loss
             identity = sample_identity(sample, split)
             row = {
                 "sample_id": sample_id,
@@ -286,20 +357,22 @@ def main() -> None:
                 "byte_correct": scores["byte_correct"],
                 "eos_probability": scores["eos_probability"],
                 "eos_rank": scores["eos_rank"],
+                "syntax_buckets": syntax_buckets,
             }
             rows.append(row)
             sample_file.write(json.dumps(row, sort_keys=True) + "\n")
-            for index, (bit_loss, owner) in enumerate(zip(bits, owners)):
+            for index, (bit_loss, annotation) in enumerate(zip(bits, annotations)):
                 byte_file.write(json.dumps({
                     "sample_id": sample_id,
                     "byte_index": index,
                     "stream_offset": sample.split + index,
                     "gt_byte": sample.target_bytes[index],
                     "nll_bits": bit_loss,
-                    "syntax_owners": owner,
+                    "syntax_owners": annotation["owners"],
+                    "syntax_bucket": annotation["bucket"],
                 }, sort_keys=True) + "\n")
             if sample_id < evaluation["num_heatmaps"]:
-                write_heatmap(heatmaps / f"sample-{sample_id:03d}.html", sample, scores, owners)
+                write_heatmap(heatmaps / f"sample-{sample_id:03d}.html", sample, scores, annotations)
             print(
                 f"[{split}] {sample_id + 1}/{len(samples)} "
                 f"{sample.corruption_frame_type} {sample.gap}B "
@@ -313,6 +386,12 @@ def main() -> None:
     summary = {
         "checkpoint": str(checkpoint),
         "eval_split": split,
+        "syntax_bucket_definition": {
+            "structural_syntax": sorted(category.value for category in STRUCTURAL_SYNTAX_CATEGORIES),
+            "content_dependent": sorted(category.value for category in CONTENT_DEPENDENT_CATEGORIES),
+            "mixed": "byte overlaps both structural and content-dependent fields",
+            "unclassified": "no parsed span, opaque slice data, unknown category, or parser failure",
+        },
         "overall": aggregate(rows),
         "by_frame_type_and_length": {key: aggregate(group) for key, group in sorted(grouped.items())},
     }
