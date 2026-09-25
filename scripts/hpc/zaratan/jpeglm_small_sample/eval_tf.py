@@ -61,6 +61,7 @@ SYNTAX_BUCKETS = (
     "mixed",
     "unclassified",
 )
+EVAL_PROTOCOL_ID = "per_length_eligibility_v1"
 
 
 def syntax_bucket(categories: set[HS.Category]) -> str:
@@ -94,50 +95,64 @@ def build_samples(values: dict[str, str], evaluation: dict, split: str) -> list[
     lengths = evaluation["corruption_lengths"]
     per_length = evaluation["samples_per_length"]
     for frame_type in evaluation["frame_types"]:
-        args = argparse.Namespace(
-            manifest=Path(values["MANIFEST"]),
-            nal_index_path=Path(values["NAL_INDEX"]),
-            train_split_file=Path(values["OUT_DIR"]) / "train_split.json",
-            eval_split=split,
-            max_manifest_rows=int(values["MAX_ROWS"]),
-            max_window_bytes=int(values["RAW_CONTEXT_BYTES"]) - 1,
-            window_min_frames=int(values["WINDOW_MIN_FRAMES"]),
-            window_unit=values["WINDOW_UNIT"],
-            val_fraction=float(values["VAL_FRACTION"]),
-            split_by_video=True,
-            seed=evaluation["seed"],
-            fim_format=values["FIM_FORMAT"],
-            fim_loss_scope=values["FIM_LOSS_SCOPE"],
-            use_eos=True,
-            fim_min_gap=int(values["FIM_MIN_GAP"]),
-            fim_max_gap=int(values["FIM_MAX_GAP"]),
-            slice_header_guard_bytes=int(values["SLICE_HEADER_GUARD_BYTES"]),
-            hole_placement="corrupt_gen_frame",
-            hole_set="sampled",
-            corr_pos=evaluation["corruption_position"],
-            corr_len_bytes=None,
-            corr_len_bytes_list=lengths,
-            corr_samples_per_length=per_length,
-            corr_eligibility_bytes=max(lengths),
-            corr_header_guard_bytes=evaluation["corruption_header_guard_bytes"],
-            corr_frame_type=frame_type,
-            num_clips=len(lengths) * per_length,
-        )
-        selection = FIM.build_eval_sample_selection(args)
-        expected = len(lengths) * per_length
-        if len(selection.samples) != expected:
-            raise RuntimeError(
-                f"{split}/{frame_type}: expected {expected} samples, got "
-                f"{len(selection.samples)}; no silent dropping is allowed"
+        for length in lengths:
+            # Require only the requested cut to fit. Reusing a source window
+            # across severities is intentional: each severity remains five
+            # distinct windows, while cross-severity comparisons are paired.
+            args = argparse.Namespace(
+                manifest=Path(values["MANIFEST"]),
+                nal_index_path=Path(values["NAL_INDEX"]),
+                train_split_file=Path(values["OUT_DIR"]) / "train_split.json",
+                eval_split=split,
+                max_manifest_rows=int(values["MAX_ROWS"]),
+                max_window_bytes=int(values["RAW_CONTEXT_BYTES"]) - 1,
+                window_min_frames=int(values["WINDOW_MIN_FRAMES"]),
+                window_unit=values["WINDOW_UNIT"],
+                val_fraction=float(values["VAL_FRACTION"]),
+                split_by_video=True,
+                seed=evaluation["seed"],
+                fim_format=values["FIM_FORMAT"],
+                fim_loss_scope=values["FIM_LOSS_SCOPE"],
+                use_eos=True,
+                fim_min_gap=int(values["FIM_MIN_GAP"]),
+                fim_max_gap=int(values["FIM_MAX_GAP"]),
+                slice_header_guard_bytes=int(values["SLICE_HEADER_GUARD_BYTES"]),
+                hole_placement="corrupt_gen_frame",
+                hole_set="sampled",
+                corr_pos=evaluation["corruption_position"],
+                corr_len_bytes=None,
+                corr_len_bytes_list=[length],
+                corr_samples_per_length=per_length,
+                corr_eligibility_bytes=length,
+                corr_header_guard_bytes=evaluation["corruption_header_guard_bytes"],
+                corr_frame_type=frame_type,
+                num_clips=per_length,
             )
-        if any(s.corruption_frame_type != frame_type for s in selection.samples):
-            raise AssertionError(f"{split}/{frame_type}: wrong frame class selected")
-        samples.extend(selection.samples)
+            try:
+                selection = FIM.build_eval_sample_selection(args)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Cannot select {per_length} distinct {split}/{frame_type}/"
+                    f"{length}B evaluation windows: {error}"
+                ) from error
+            if len(selection.samples) != per_length:
+                raise RuntimeError(
+                    f"{split}/{frame_type}/{length}B: expected {per_length} "
+                    f"samples, got {len(selection.samples)}; no silent dropping is allowed"
+                )
+            if any(
+                s.corruption_frame_type != frame_type or s.gap != length
+                for s in selection.samples
+            ):
+                raise AssertionError(
+                    f"{split}/{frame_type}/{length}B: wrong corruption class selected"
+                )
+            samples.extend(selection.samples)
     return samples
 
 
 def verify_shared_sample_set(samples: list[FIM.WindowFimSample], evaluation: dict, split: str) -> None:
-    path = Path(evaluation["sample_set_dir"]) / f"{split}.json"
+    path = Path(evaluation["sample_set_dir"]) / EVAL_PROTOCOL_ID / f"{split}.json"
     identities = [sample_identity(sample, split) for sample in samples]
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(identities, indent=2, sort_keys=True) + "\n"
@@ -320,7 +335,7 @@ def main() -> None:
     checkpoint = run_dir / "final"
     if not (checkpoint / "lit_model.pth").is_file():
         raise FileNotFoundError(f"Final checkpoint missing: {checkpoint / 'lit_model.pth'}")
-    out = run_dir / "eval_small_sample" / "final" / split
+    out = run_dir / "eval_small_sample" / "final" / EVAL_PROTOCOL_ID / split
     if out.exists() and any(out.iterdir()):
         raise RuntimeError(f"Evaluation output already exists; refusing overwrite: {out}")
     samples = build_samples(values, evaluation, split)
@@ -386,6 +401,7 @@ def main() -> None:
     summary = {
         "checkpoint": str(checkpoint),
         "eval_split": split,
+        "eval_protocol": EVAL_PROTOCOL_ID,
         "syntax_bucket_definition": {
             "structural_syntax": sorted(category.value for category in STRUCTURAL_SYNTAX_CATEGORIES),
             "content_dependent": sorted(category.value for category in CONTENT_DEPENDENT_CATEGORIES),

@@ -1093,7 +1093,9 @@ def _build_hole_requests(
                         raise RuntimeError(
                             "Could not select distinct eligible clip "
                             f"{replicate + 1}/{samples_per_length} for corruption "
-                            f"length {corruption_length} bytes"
+                            f"length {corruption_length} bytes "
+                            f"(frame_type={getattr(args, 'corr_frame_type', 'any')}; "
+                            f"skips={dict(skip_reasons)})"
                         )
             print(
                 "corrupt_gen_frame severity schedule: "

@@ -59,6 +59,12 @@ excluded), byte perplexity/accuracy, EOS probability/rank, I/P and length
 breakdowns, per-byte NLL JSONL, and HTML syntax-annotated loss heatmaps. It is
 teacher-forced only; it does not claim free-run repair success. Training holes
 continue to change and are not exact replay pairs.
+Each severity requires five distinct eligible windows, but a window may recur
+at a different severity. Eligibility is checked against that severity's actual
+cut length, not the largest length in the schedule.
+This corrected selection is versioned as `per_length_eligibility_v1` under both
+the shared sample-set directory and `eval_small_sample/final/`, so earlier
+partial evaluation files are preserved and never mistaken for this protocol.
 
 The summary also pools byte-weighted CE by parser ownership: stream/header
 structure, content-dependent macroblock/prediction/residual coding, bytes
@@ -80,8 +86,9 @@ python scripts/hpc/zaratan/jpeglm_small_sample/eval_tf.py \
 ```
 
 The evaluator protects existing output; move aside an incomplete
-`eval_small_sample/final/<split>` directory before retrying. It does not delete
-or overwrite anything automatically.
+`eval_small_sample/final/per_length_eligibility_v1/<split>` directory before
+retrying the same protocol. It does not delete or overwrite anything
+automatically.
 
 To rerun both evaluation splits in the two-A100 Slurm job without retraining,
 set `SMALL_SAMPLE_EVAL_ONLY=1` when invoking `submit.py` with the unchanged

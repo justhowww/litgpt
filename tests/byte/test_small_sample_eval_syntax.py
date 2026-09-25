@@ -62,3 +62,54 @@ def test_syntax_bucket_ce_is_byte_weighted():
         "contribution_bits_per_target_byte": 4 / 3,
     }
     assert summary["by_syntax_bucket"]["content_dependent"]["ce_bits_per_byte"] == 5.0
+
+
+def test_small_eval_selects_each_severity_with_its_own_size_limit(monkeypatch):
+    seen = []
+
+    def select(args):
+        seen.append((args.corr_frame_type, args.corr_len_bytes_list, args.corr_eligibility_bytes))
+        return SimpleNamespace(
+            samples=[
+                SimpleNamespace(
+                    corruption_frame_type=args.corr_frame_type,
+                    gap=args.corr_len_bytes_list[0],
+                )
+                for _ in range(args.corr_samples_per_length)
+            ]
+        )
+
+    monkeypatch.setattr(eval_tf.FIM, "build_eval_sample_selection", select)
+    values = {
+        "MANIFEST": "/data/manifest.jsonl",
+        "NAL_INDEX": "/data/nal_index.sqlite",
+        "OUT_DIR": "/data/run",
+        "MAX_ROWS": "256",
+        "RAW_CONTEXT_BYTES": "131072",
+        "WINDOW_MIN_FRAMES": "2",
+        "WINDOW_UNIT": "gop",
+        "VAL_FRACTION": "0.05",
+        "FIM_FORMAT": "psm",
+        "FIM_LOSS_SCOPE": "full",
+        "FIM_MIN_GAP": "64",
+        "FIM_MAX_GAP": "1400",
+        "SLICE_HEADER_GUARD_BYTES": "0",
+    }
+    evaluation = {
+        "corruption_lengths": [64, 600],
+        "samples_per_length": 2,
+        "frame_types": ["idr", "p"],
+        "seed": 42,
+        "corruption_position": 0.4,
+        "corruption_header_guard_bytes": 0,
+    }
+
+    samples = eval_tf.build_samples(values, evaluation, "val")
+
+    assert len(samples) == 8
+    assert seen == [
+        ("idr", [64], 64),
+        ("idr", [600], 600),
+        ("p", [64], 64),
+        ("p", [600], 600),
+    ]
