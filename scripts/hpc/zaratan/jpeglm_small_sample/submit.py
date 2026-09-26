@@ -272,7 +272,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, help="Small-sample YAML configuration")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print settings without writing or submitting")
+    parser.add_argument(
+        "--after-jobid",
+        type=int,
+        help="Submit with an afterok dependency on this Slurm job ID",
+    )
     args = parser.parse_args()
+    if args.after_jobid is not None and args.after_jobid <= 0:
+        parser.error("--after-jobid must be a positive Slurm job ID")
     source_yaml = args.config.resolve()
     values = load_config(source_yaml)
     evaluation = load_evaluation_config(source_yaml)
@@ -290,6 +297,9 @@ def main() -> None:
     ):
         environment.pop(key, None)
     environment.update(values)
+    if args.after_jobid is not None:
+        environment["AFTER_JOBID"] = str(args.after_jobid)
+        environment["DEPENDENCY_TYPE"] = "afterok"
     subprocess.run(["bash", str(submit)], env=environment, check=True)
 
 

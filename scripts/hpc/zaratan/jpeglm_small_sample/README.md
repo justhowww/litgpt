@@ -111,6 +111,28 @@ python scripts/hpc/zaratan/jpeglm_small_sample/submit.py \
   scripts/hpc/zaratan/jpeglm_small_sample/qwen3_idr50_20k.yaml
 ```
 
+The architecture-matched Pythia follow-up uses
+`pythia_idr50_20k.yaml`. To queue it only after an existing Qwen job
+finishes successfully, pass its Slurm ID with `--after-jobid`. This is a
+submission dependency, not a saved training hyperparameter. Each small-sample
+job performs its own train- and validation-split teacher-forced evaluations
+after its training and final checkpoint finish.
+
+```bash
+python scripts/hpc/zaratan/jpeglm_small_sample/submit.py \
+  scripts/hpc/zaratan/jpeglm_small_sample/pythia_idr50_20k.yaml \
+  --after-jobid 22584445
+```
+
+To keep Pythia training and the Qwen/Pythia evaluations as three separate
+dependent jobs, set `SMALL_SAMPLE_SKIP_EVAL=1` on the Pythia training
+submission. Then submit the Qwen evaluation with
+`SMALL_SAMPLE_EVAL_ONLY=1 SMALL_SAMPLE_EVAL_CHECKPOINT=step-00020000`
+dependent on Pythia; finally submit the Pythia `final` evaluation dependent on
+that Qwen evaluation. The Qwen step-20k checkpoint has the same terminal
+training step as `final`, but uses a separate evaluation output directory;
+the original Qwen job already evaluates `final` inline before it finishes.
+
 To rerun only the teacher-forced evaluation after a successful training job,
 inside a one-GPU allocation with the project environment active:
 

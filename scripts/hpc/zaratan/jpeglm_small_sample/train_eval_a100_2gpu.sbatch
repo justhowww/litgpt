@@ -19,6 +19,10 @@ export REPO_ROOT
 export DEVICES=2 NUM_NODES=1
 
 echo "[small-sample] two-A100 job; config=${SMALL_SAMPLE_CONFIG} eval_only=${SMALL_SAMPLE_EVAL_ONLY:-0}"
+if [[ "${SMALL_SAMPLE_EVAL_ONLY:-0}" == "1" && "${SMALL_SAMPLE_SKIP_EVAL:-0}" == "1" ]]; then
+    echo "SMALL_SAMPLE_EVAL_ONLY and SMALL_SAMPLE_SKIP_EVAL cannot both be 1" >&2
+    exit 1
+fi
 srun --ntasks=2 --ntasks-per-node=2 bash -c \
     'echo "[gpu-check] rank=${SLURM_PROCID} local_rank=${SLURM_LOCALID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"'
 
@@ -45,6 +49,11 @@ fi
 
 if [[ "${SMALL_SAMPLE_EVAL_ONLY:-0}" != "1" ]]; then
     python "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_small_sample/write_learning_curve_aliases.py" "${OUT_DIR}"
+fi
+
+if [[ "${SMALL_SAMPLE_SKIP_EVAL:-0}" == "1" ]]; then
+    echo "[small-sample] training and final checkpoint complete; evaluation deferred"
+    exit 0
 fi
 
 echo "[small-sample] teacher-forced evaluation: rank 0=train, rank 1=val"
