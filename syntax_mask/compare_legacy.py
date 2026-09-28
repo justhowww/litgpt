@@ -52,6 +52,8 @@ def compare(data: bytes, layout: str, legacy) -> dict:
         nal_header_policy=legacy.NAL_HEADER_POLICY_SYNTAX_ONLY,
     )
     stricter, looser, positions = Counter(), Counter(), Counter()
+    identical = 0
+    removed = 0  # legal bytes legacy allows that the new mask removes
     looser_examples = []
     t_new = t_old = 0.0
     for i, byte in enumerate(data):
@@ -64,6 +66,8 @@ def compare(data: bytes, layout: str, legacy) -> dict:
         t_old += time.perf_counter() - t
         o = sum(1 << b for b in range(256) if old[b])
         positions[where] += 1
+        identical += m == o
+        removed += bin(o & ~m).count("1")
         if o & ~m:
             stricter[where] += 1
         if m & ~o:
@@ -77,6 +81,8 @@ def compare(data: bytes, layout: str, legacy) -> dict:
         "new_us_per_byte": t_new / len(data) * 1e6,
         "legacy_us_per_byte": t_old / len(data) * 1e6,
         "positions": positions,
+        "identical": identical,
+        "removed": removed,
         "stricter": stricter,
         "looser": looser,
         "looser_examples": looser_examples,
@@ -98,6 +104,13 @@ def main(argv=None):
         r = compare(data, args.layout, legacy)
         print(f"== {f}: {r['bytes']} bytes  new {r['new_us_per_byte']:.0f} us/B  "
               f"legacy {r['legacy_us_per_byte']:.0f} us/B")
+        n = r["bytes"]
+        n_str = sum(r["stricter"].values())
+        n_loose = sum(r["looser"].values())
+        print(f"   identical masks {r['identical']}/{n} ({100 * r['identical'] / n:.1f}%), "
+              f"new stricter at {n_str}, new looser at {n_loose}, "
+              f"legacy-allowed bytes removed: {r['removed']} "
+              f"({r['removed'] / n:.2f} per position)")
         print(f"   {'field':42s} {'positions':>9s} {'stricter':>9s} {'looser':>7s}")
         for where, n in r["positions"].most_common():
             s, l = r["stricter"][where], r["looser"][where]

@@ -162,6 +162,8 @@ def summarize(results: list[dict]) -> dict:
         "files": len(results),
         "files_ok": len(results) - len(failures),
         "bytes": total_bytes,
+        # undeduplicated table: one 256-bit mask (32 bytes) per stream byte
+        "mask_storage_gb": total_bytes * 32 / 1e9,
         "cpu_seconds": sum(r["seconds"] for r in results),
         "mask_us_per_byte": mask_seconds / total_bytes * 1e6 if total_bytes else None,
         "mean_legal_bytes": (
@@ -183,7 +185,7 @@ def summarize(results: list[dict]) -> dict:
     }
 
 
-def _manifest_paths(manifest: str) -> list[str]:
+def _manifest_paths(manifest: str, max_rows: int = 0) -> list[str]:
     """``status == ok`` rows of a corpus manifest.jsonl (same resolution rule as
     litgpt/byte/data.py: relative paths live next to the manifest, under h264/)."""
     root = Path(manifest).parent
@@ -204,6 +206,8 @@ def _manifest_paths(manifest: str) -> list[str]:
                     path = Path("h264") / path
                 path = root / path
             out.append(str(path))
+            if max_rows and len(out) >= max_rows:  # = load_manifest_rows(max_rows)
+                break
     return out
 
 
@@ -225,6 +229,9 @@ def main(argv=None) -> int:
     ap.add_argument("inputs", nargs="*", help="files or directories (*.h264)")
     ap.add_argument("--list", help="text file with one path per line")
     ap.add_argument("--manifest", help="corpus manifest.jsonl (status==ok rows)")
+    ap.add_argument("--max-manifest-rows", type=int, default=0,
+                    help="first N status==ok rows in manifest order "
+                         "(same subset as training data.max_rows)")
     ap.add_argument("--layout", choices=("frame", "mb"), default="frame",
                     help="frame: one slice per picture (JPEG-LM/default); mb: one MB per slice (AVC-LM)")
     ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
@@ -245,7 +252,7 @@ def main(argv=None) -> int:
 
     paths = _collect(args.inputs, args.list, 0, args.seed)
     if args.manifest:
-        paths += _manifest_paths(args.manifest)
+        paths += _manifest_paths(args.manifest, args.max_manifest_rows)
     paths = sorted(set(paths))
     if args.num_shards > 1:
         paths = paths[args.shard_index :: args.num_shards]
@@ -255,6 +262,10 @@ def main(argv=None) -> int:
         ap.error("no input files")
     if args.dump_dir:
         Path(args.dump_dir).mkdir(parents=True, exist_ok=True)
+        names = Counter(Path(p).name for p in paths)
+        dup = [n for n, c in names.items() if c > 1]
+        if dup:
+            ap.error(f"--dump-dir needs unique file names; duplicates: {dup[:5]}")
     opts = {k: getattr(args, k) for k in
             ("layout", "seed", "reference_rate", "probe_rate", "probe_len", "dump_dir")}
 
@@ -297,7 +308,22 @@ def main(argv=None) -> int:
                 _progress(results, len(results), total, started)
     if sink is not None:
         sink.close()
+    if args.dump_dir:
+        _write_dump_index(Path(args.dump_dir), results)
     return _report(results, args.layout, time.perf_counter() - started, args.json)
+
+
+def _write_dump_index(dump_dir: Path, results) -> None:
+    """index.jsonl: h264 path -> .masks file (only files that passed)."""
+    with (dump_dir / "index.jsonl").open("w", encoding="utf-8") as f:
+        for r in sorted(results, key=lambda r: r["path"]):
+            if r["ok"]:
+                f.write(json.dumps({
+                    "h264_path": r["path"],
+                    "masks": Path(r["path"]).name + ".masks",
+                    "bytes": r["bytes"],
+                    "mask_bytes": 32 * r["bytes"],
+                }) + "\n")
 
 
 def _report(results, layout, wall_seconds, json_path) -> int:

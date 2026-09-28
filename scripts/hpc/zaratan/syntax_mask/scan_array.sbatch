@@ -25,6 +25,7 @@ REFERENCE_RATE=${REFERENCE_RATE:-0.001}
 PROBE_RATE=${PROBE_RATE:-0.0005}
 PROBE_LEN=${PROBE_LEN:-64}
 LIMIT=${LIMIT:-0}
+MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-0}
 DUMP_DIR=${DUMP_DIR:-}
 PROJECT_SCRATCH=${PROJECT_SCRATCH:-"/home/${USER}/scratch.metzler-prj"}
 CONDA_ROOT=${CONDA_ROOT:-"${PROJECT_SCRATCH}/miniforge3"}
@@ -54,6 +55,7 @@ cmd=(
     --resume
 )
 [[ "${LIMIT}" != 0 ]] && cmd+=(--limit "${LIMIT}")
+[[ "${MAX_MANIFEST_ROWS}" != 0 ]] && cmd+=(--max-manifest-rows "${MAX_MANIFEST_ROWS}")
 [[ -n "${DUMP_DIR}" ]] && cmd+=(--dump-dir "${DUMP_DIR}")
 
 echo "${cmd[*]}"

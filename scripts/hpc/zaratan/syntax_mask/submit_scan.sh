@@ -10,7 +10,12 @@
 #   RUN_DIR=... ARRAY=3,17 NUM_SHARDS=32 bash scripts/hpc/zaratan/syntax_mask/submit_scan.sh
 #
 # Overrides: MANIFEST LAYOUT(frame|mb) NUM_SHARDS CPUS TIME RUN_DIR ARRAY
-#            REFERENCE_RATE PROBE_RATE PROBE_LEN LIMIT DUMP_DIR SBATCH_ACCOUNT
+#            REFERENCE_RATE PROBE_RATE PROBE_LEN LIMIT MAX_MANIFEST_ROWS DUMP_DIR
+#            SBATCH_ACCOUNT
+# Masks for the small-sample runs (data.max_rows: 256):
+#   MAX_MANIFEST_ROWS=256 NUM_SHARDS=1 CPUS=32 TIME=01:00:00 \
+#   DUMP_DIR=/home/$USER/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/syntax_masks/first256 \
+#   bash scripts/hpc/zaratan/syntax_mask/submit_scan.sh
 
 set -euo pipefail
 
@@ -45,6 +50,7 @@ export REFERENCE_RATE=${REFERENCE_RATE:-0.001}
 export PROBE_RATE=${PROBE_RATE:-0.0005}
 export PROBE_LEN=${PROBE_LEN:-64}
 export LIMIT=${LIMIT:-0}
+export MAX_MANIFEST_ROWS=${MAX_MANIFEST_ROWS:-0}
 export DUMP_DIR=${DUMP_DIR:-}
 
 scan_id=$(
