@@ -147,6 +147,37 @@ The evaluator protects existing output; move aside an incomplete
 retrying the same protocol. It does not delete or overwrite anything
 automatically.
 
+## Step-0 syntax-prior measurement
+
+`eval_syntax_prior.py` is a separate, read-only audit of the existing fixed
+teacher-forced holes. It uses the same MEGABYTE target alignment as `eval_tf.py`
+and walks the *original* H.264 byte order through the constrained-decoding
+automaton. It reports the raw model probability assigned to prohibited byte
+IDs and the rate at which the highest-scoring byte is prohibited. It also
+reports bytes-plus-EOS argmax categories (illegal byte or EOS), strict-mask
+coverage, and any GT holes rejected by the automaton.
+The probability denominator is the actual unmasked inference action set:
+256 bytes plus EOS, excluding FIM control tokens. The primary
+strict-only values exclude parser-permissive positions. Here "illegal" means
+excluded by the current automaton and dataset profile; the mask does not catch
+every FFmpeg decoder error. This tests legality on
+ground-truth prefixes, not model-generated prefixes, and does not evaluate
+premature EOS as an illegal *byte*.
+
+Run each completed 20k checkpoint on the same held-out 35-hole set:
+
+```bash
+SMALL_SAMPLE_CONFIG=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-small-27x1024-qwen3-patch256-idr50-20k/small_sample_config.yaml \
+  sbatch scripts/hpc/zaratan/jpeglm_small_sample/eval_syntax_prior_a100.sbatch
+SMALL_SAMPLE_CONFIG=/home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-small-27x1024-pythia-patch256-idr50-20k/small_sample_config.yaml \
+  sbatch scripts/hpc/zaratan/jpeglm_small_sample/eval_syntax_prior_a100.sbatch
+```
+
+Outputs go under each run's `eval_syntax_prior/final/feasible_35_holes_v1/val/`.
+The audit never overwrites an existing output directory. A model comparison
+must check both parser coverage and the scored sample IDs, not just the two
+headline rates.
+
 To rerun both evaluation splits in the two-A100 Slurm job without retraining,
 set `SMALL_SAMPLE_EVAL_ONLY=1` when invoking `submit.py` with the unchanged
 YAML. This requires an existing final checkpoint and training split, and the
