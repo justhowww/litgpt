@@ -55,6 +55,8 @@ LENGTH_BUCKET_POOL_SIZE=${LENGTH_BUCKET_POOL_SIZE:-8192}
 
 P_FIM=${P_FIM:-0.5}
 FIM_IDR_SAMPLING_PROBABILITY=${FIM_IDR_SAMPLING_PROBABILITY:-}
+SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
+SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
 FIM_LOSS_SCOPE=${FIM_LOSS_SCOPE:-full}
 FIM_SPAN_LOSS_WEIGHT=${FIM_SPAN_LOSS_WEIGHT:-0}
@@ -210,6 +212,13 @@ cmd=(
 
 if [[ -n "${FIM_IDR_SAMPLING_PROBABILITY}" ]]; then
     cmd+=(--fim-idr-sampling-probability "${FIM_IDR_SAMPLING_PROBABILITY}")
+fi
+
+if [[ -n "${SYNTAX_MASK_DIR}" ]]; then
+    cmd+=(--syntax-mask-dir "${SYNTAX_MASK_DIR}" --syntax-loss-weight "${SYNTAX_LOSS_WEIGHT}")
+elif [[ "${SYNTAX_LOSS_WEIGHT}" != "0" ]]; then
+    echo "SYNTAX_LOSS_WEIGHT requires SYNTAX_MASK_DIR" >&2
+    exit 1
 fi
 
 if [[ "${ENABLE_LENGTH_BUCKETING}" == "1" ]]; then

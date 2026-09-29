@@ -84,7 +84,12 @@ FIELDS = {
 
 # Keep the required keys of previously frozen YAMLs unchanged. Only the new
 # IDR-balanced run opts into this additional training setting.
-OPTIONAL_FIELDS = {"fim": {"idr_sampling_probability": "FIM_IDR_SAMPLING_PROBABILITY"}}
+OPTIONAL_FIELDS = {
+    "fim": {"idr_sampling_probability": "FIM_IDR_SAMPLING_PROBABILITY"},
+    # Training-time syntax guidance: precomputed legal-next-byte masks.
+    "data": {"syntax_mask_dir": "SYNTAX_MASK_DIR"},
+    "training": {"syntax_loss_weight": "SYNTAX_LOSS_WEIGHT"},
+}
 
 BOOLEAN_KEYS = {
     "ENABLE_LENGTH_BUCKETING",
@@ -164,6 +169,14 @@ def load_config(path: Path) -> dict:
             raise ValueError("fim.idr_sampling_probability must be in [0, 1]")
         if float(values["P_FIM"]) <= 0:
             raise ValueError("IDR-balanced sampling requires fim.p_fim > 0")
+    if "SYNTAX_LOSS_WEIGHT" in values:
+        weight = float(values["SYNTAX_LOSS_WEIGHT"])
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("training.syntax_loss_weight must be nonnegative and finite")
+        if weight > 0 and "SYNTAX_MASK_DIR" not in values:
+            raise ValueError("training.syntax_loss_weight requires data.syntax_mask_dir")
+    if "SYNTAX_MASK_DIR" in values and not Path(values["SYNTAX_MASK_DIR"]).is_absolute():
+        raise ValueError("data.syntax_mask_dir must be an absolute path")
     if values["MODEL_ARCHITECTURE"] not in {"pythia", "qwen3"}:
         raise ValueError("model.architecture must be pythia or qwen3")
     if values["WINDOW_UNIT"] != "gop":
@@ -293,7 +306,7 @@ def main() -> None:
     environment = os.environ.copy()
     for key in (
         "AFTER_JOBID", "EXCLUDE_NODES", "DEPENDENCY_TYPE", "TRAINING_LOCK_WAIT_SEC",
-        "FIM_IDR_SAMPLING_PROBABILITY",
+        "FIM_IDR_SAMPLING_PROBABILITY", "SYNTAX_MASK_DIR", "SYNTAX_LOSS_WEIGHT",
     ):
         environment.pop(key, None)
     environment.update(values)

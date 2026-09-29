@@ -76,6 +76,7 @@ class ByteTrainingRuntime:
     eos_loss_weight: float = 1.0
     eos_aux_loss_weight: float = 0.0
     fim_span_loss_weight: float = 0.0
+    syntax_loss_weight: float = 0.0
     reconstruction_config: ReconstructionEvalConfig | None = None
     reconstruction_samples: dict[str, list[ReconstructionSample]] = field(
         default_factory=dict
@@ -113,6 +114,7 @@ class ByteTrainingRuntime:
         mrt_config: MRTConfig | None,
         free_run_config: FreeRunEvalConfig | None = None,
         grpo_config: GRPOConfig | None = None,
+        syntax_loss_weight: float = 0.0,
     ) -> "ByteTrainingRuntime":
         """Prepare byte probes and online-training context sources."""
         reconstruction_samples: dict[str, list[ReconstructionSample]] = {}
@@ -268,12 +270,15 @@ class ByteTrainingRuntime:
             raise ValueError("CE loss weight must be non-negative")
         if fim_span_loss_weight < 0:
             raise ValueError("FIM span loss weight must be non-negative")
+        if syntax_loss_weight < 0:
+            raise ValueError("Syntax loss weight must be non-negative")
         return cls(
             ce_loss_weight=ce_loss_weight,
             ce_byte_only=ce_byte_only,
             eos_loss_weight=eos_loss_weight,
             eos_aux_loss_weight=eos_aux_loss_weight,
             fim_span_loss_weight=fim_span_loss_weight,
+            syntax_loss_weight=syntax_loss_weight,
             reconstruction_config=reconstruction_config,
             reconstruction_samples=reconstruction_samples,
             mrt_config=mrt_config,
@@ -303,6 +308,7 @@ class ByteTrainingRuntime:
         targets: torch.Tensor,
         target_region_ids: torch.Tensor | None = None,
         fim_frame_nal_type: torch.Tensor | None = None,
+        syntax_masks: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return byte_training_loss_terms(
             logits,
@@ -313,6 +319,8 @@ class ByteTrainingRuntime:
             target_region_ids=target_region_ids,
             fim_span_loss_weight=self.fim_span_loss_weight,
             fim_frame_nal_type=fim_frame_nal_type,
+            syntax_masks=syntax_masks,
+            syntax_loss_weight=self.syntax_loss_weight,
         )
 
     def should_run_mrt(self, next_step: int, is_accumulating: bool) -> bool:
@@ -1446,6 +1454,8 @@ def byte_training_loss_terms(
     target_region_ids: torch.Tensor | None = None,
     fim_span_loss_weight: float = 0.0,
     fim_frame_nal_type: torch.Tensor | None = None,
+    syntax_masks: torch.Tensor | None = None,
+    syntax_loss_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Return raw loss terms and their weighted training objective.
 
@@ -1460,6 +1470,10 @@ def byte_training_loss_terms(
         raise ValueError("fim_span_loss_weight must be non-negative")
     if eos_loss_weight <= 0:
         raise ValueError("eos_loss_weight must be positive")
+    if syntax_loss_weight < 0:
+        raise ValueError("syntax_loss_weight must be non-negative")
+    if syntax_loss_weight > 0 and syntax_masks is None:
+        raise ValueError("syntax_loss_weight > 0 requires syntax_masks in the batch")
     if ce_byte_only:
         supervised_targets = targets[targets != IGNORE_INDEX]
         if bool((supervised_targets >= BYTE_VOCAB_SIZE).any()):
@@ -1574,18 +1588,136 @@ def byte_training_loss_terms(
             eos_losses * negative_float
         ).sum() / negative_float.sum().clamp_min(1)
         eos_aux = 0.5 * (positive_loss + negative_loss)
+    syntax_terms: dict[str, torch.Tensor] = {}
+    syntax_ce = zero
+    if syntax_masks is not None:
+        syntax_terms = syntax_legality_terms(
+            flat_logits, log_normalizer, flat_targets, supervised, syntax_masks, targets.shape
+        )
+        syntax_ce = syntax_terms["syntax_ce"]
     objective = (
         full_ce
         + fim_span_loss_weight * fim_span_ce
         + eos_aux_loss_weight * eos_aux
+        + syntax_loss_weight * syntax_ce
     )
     return {
         "full_ce": full_ce,
         "fim_span_ce": fim_span_ce,
         "eos_aux": eos_aux,
         "objective": objective,
+        **syntax_terms,
         **frame_stats,
     }
+
+
+def unpack_syntax_masks(syntax_masks: torch.Tensor) -> torch.Tensor:
+    """``[..., 32]`` uint8 (bit b%8 of byte b//8 = byte b legal) -> ``[..., 256]`` bool."""
+    shifts = torch.arange(8, device=syntax_masks.device, dtype=torch.uint8)
+    bits = (syntax_masks.unsqueeze(-1) >> shifts) & 1
+    return bits.reshape(*syntax_masks.shape[:-1], BYTE_VOCAB_SIZE).bool()
+
+
+def syntax_legality_terms(
+    flat_logits: torch.Tensor,
+    log_normalizer: torch.Tensor,
+    flat_targets: torch.Tensor,
+    supervised: torch.Tensor,
+    syntax_masks: torch.Tensor,
+    target_shape: torch.Size,
+) -> dict[str, torch.Tensor]:
+    """``−log p(legal)`` at syntax-constrained byte labels.
+
+    Legal = the H.264-legal bytes plus the non-EOS control ids (markers are a
+    format question, not syntax, so they are neither rewarded nor penalized).
+    EOS counts as illegal: a constrained position always has a real next byte,
+    so stopping there is premature. Rows with an all-zero mask are
+    unconstrained and contribute nothing.
+    """
+    if syntax_masks.shape[:-1] != target_shape or syntax_masks.size(-1) != 32:
+        raise ValueError("syntax_masks must have shape targets.shape + (32,)")
+    vocab = flat_logits.size(-1)
+    legal_bytes = unpack_syntax_masks(syntax_masks.to(flat_logits.device)).reshape(
+        -1, BYTE_VOCAB_SIZE
+    )
+    constrained = (
+        legal_bytes.any(dim=-1)
+        & supervised
+        & (flat_targets >= 0)
+        & (flat_targets < BYTE_VOCAB_SIZE)
+    )
+    neutral = torch.ones(vocab - BYTE_VOCAB_SIZE, dtype=torch.bool, device=flat_logits.device)
+    if SEQ_EOS_ID < vocab:
+        neutral[SEQ_EOS_ID - BYTE_VOCAB_SIZE] = False
+    legal = torch.cat(
+        (legal_bytes, neutral.unsqueeze(0).expand(legal_bytes.size(0), -1)), dim=-1
+    )
+    # Unconstrained rows keep the full vocabulary so their (zero-weighted)
+    # logsumexp stays finite and cannot put NaN into the gradient.
+    legal = legal | ~constrained.unsqueeze(-1)
+    log_legal = torch.logsumexp(
+        flat_logits.masked_fill(~legal, float("-inf")), dim=-1
+    )
+    syntax_nll = (log_normalizer - log_legal).masked_fill(~constrained, 0.0)
+    count = constrained.to(syntax_nll.dtype).sum()
+    syntax_ce = syntax_nll.sum() / count.clamp_min(1)
+    illegal_mass = (-torch.expm1(-syntax_nll.detach())) * constrained
+    eos_mass = (
+        torch.exp(flat_logits[:, SEQ_EOS_ID].detach() - log_normalizer.detach())
+        * constrained
+        if SEQ_EOS_ID < vocab
+        else torch.zeros_like(illegal_mass)
+    )
+    return {
+        "syntax_ce": syntax_ce,
+        "syntax_illegal_mass": illegal_mass.sum() / count.clamp_min(1),
+        "syntax_eos_mass": eos_mass.sum() / count.clamp_min(1),
+        "syntax_positions": count.detach(),
+    }
+
+
+@torch.no_grad()
+def _accumulate_val_syntax(
+    sums: dict[str, dict[str, float]],
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    syntax_masks: torch.Tensor,
+    target_region_ids: torch.Tensor | None,
+    max_seq_length: int,
+) -> None:
+    """Illegal-byte mass, EOS mass and illegal top choice (bytes + EOS)."""
+    flat_logits = logits.reshape(-1, logits.size(-1)).float()
+    flat_targets = targets.reshape(-1)
+    legal_bytes = unpack_syntax_masks(syntax_masks.to(logits.device)).reshape(-1, BYTE_VOCAB_SIZE)
+    constrained = (
+        legal_bytes.any(dim=-1)
+        & (flat_targets >= 0)
+        & (flat_targets < BYTE_VOCAB_SIZE)
+    )
+    if not bool(constrained.any()):
+        return
+    # Inference action set: 256 bytes plus EOS (FIM markers are never sampled).
+    actions = torch.cat(
+        (flat_logits[:, :BYTE_VOCAB_SIZE], flat_logits[:, SEQ_EOS_ID : SEQ_EOS_ID + 1]),
+        dim=-1,
+    )
+    probabilities = actions.softmax(dim=-1)
+    illegal = (probabilities[:, :BYTE_VOCAB_SIZE] * ~legal_bytes).sum(dim=-1)
+    eos = probabilities[:, BYTE_VOCAB_SIZE]
+    top = actions.argmax(dim=-1)
+    top_legal = legal_bytes.gather(
+        1, top.clamp(max=BYTE_VOCAB_SIZE - 1).unsqueeze(1)
+    ).squeeze(1) & (top < BYTE_VOCAB_SIZE)
+    if target_region_ids is not None:
+        middle = target_region_ids[:, :max_seq_length].reshape(-1).to(logits.device) == REGION_BRIDGE
+    else:
+        middle = torch.zeros_like(constrained)
+    for name, selector in (("fim_middle", middle), ("other", ~middle)):
+        rows = constrained & selector
+        sums[name]["illegal"] += float(illegal[rows].sum())
+        sums[name]["eos"] += float(eos[rows].sum())
+        sums[name]["top_illegal"] += float((~top_legal[rows]).sum())
+        sums[name]["count"] += float(rows.sum())
 
 
 def namespace_reconstruction_metrics(
@@ -1649,6 +1781,12 @@ def validate(
     eos_probability_sum = {name: 0.0 for name in task_regions}
     eos_rank_sum = {name: 0.0 for name in task_regions}
     eos_count = {name: 0 for name in task_regions}
+    # Teacher-forced syntax legality, split into FIM middle bytes and all other
+    # constrained bytes; populated only when batches carry syntax masks.
+    syntax_sums = {
+        name: {"illegal": 0.0, "eos": 0.0, "top_illegal": 0.0, "count": 0.0}
+        for name in ("fim_middle", "other")
+    }
     for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
@@ -1657,6 +1795,15 @@ def validate(
         )
         logits = model(**model_inputs)
         losses.append(chunked_cross_entropy(logits, targets))
+        if isinstance(batch, dict) and batch.get("syntax_masks") is not None:
+            _accumulate_val_syntax(
+                syntax_sums,
+                logits,
+                targets,
+                batch["syntax_masks"][:, : model.max_seq_length],
+                batch.get("target_region_ids"),
+                model.max_seq_length,
+            )
 
         region_ids = (
             batch.get("target_region_ids")
@@ -1711,6 +1858,14 @@ def validate(
             eos_metrics[f"val_eos_rank_{name}"] = (
                 eos_rank_sum[name] / eos_count[name]
             )
+    for name, sums in syntax_sums.items():
+        if sums["count"] > 0:
+            eos_metrics[f"val_syntax_illegal_mass_{name}"] = sums["illegal"] / sums["count"]
+            eos_metrics[f"val_syntax_eos_mass_{name}"] = sums["eos"] / sums["count"]
+            eos_metrics[f"val_syntax_top_illegal_rate_{name}"] = (
+                sums["top_illegal"] / sums["count"]
+            )
+            eos_metrics[f"val_syntax_positions_{name}"] = sums["count"]
     model.train()
     fabric.barrier()
     return val_loss, task_losses, eos_metrics

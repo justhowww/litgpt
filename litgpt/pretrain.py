@@ -154,6 +154,7 @@ def setup(
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
     fim_span_loss_weight: float = 0.0,
+    syntax_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
     free_run_eval: FreeRunEvalConfig | None = None,
     grpo: GRPOConfig | None = None,
@@ -270,6 +271,7 @@ def setup(
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
         fim_span_loss_weight=fim_span_loss_weight,
+        syntax_loss_weight=syntax_loss_weight,
         mrt=mrt,
         free_run_eval=free_run_eval,
         grpo=grpo,
@@ -300,6 +302,7 @@ def main(
     eos_loss_weight: float = 1.0,
     eos_aux_loss_weight: float = 0.0,
     fim_span_loss_weight: float = 0.0,
+    syntax_loss_weight: float = 0.0,
     mrt: MRTConfig | None = None,
     free_run_eval: FreeRunEvalConfig | None = None,
     grpo: GRPOConfig | None = None,
@@ -352,6 +355,7 @@ def main(
         eos_loss_weight=eos_loss_weight,
         eos_aux_loss_weight=eos_aux_loss_weight,
         fim_span_loss_weight=fim_span_loss_weight,
+        syntax_loss_weight=syntax_loss_weight,
         reconstruction_config=reconstruction_eval,
         mrt_config=mrt,
         free_run_config=free_run_eval,
@@ -628,6 +632,12 @@ def fit(
     running_eos_aux = RunningMean(
         window=gradient_accumulation_iters, sync_on_compute=False
     ).to(fabric.device)
+    running_syntax = {
+        name: RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(
+            fabric.device
+        )
+        for name in ("syntax_ce", "syntax_illegal_mass", "syntax_eos_mass")
+    }
     # Per-rank, 100-step diagnostics for optional frame-balanced window FIM.
     # Reuse the NLL already computed by the objective; do not run another CE.
     fim_type_window = {
@@ -704,8 +714,14 @@ def fit(
                 train_data.get("fim_frame_nal_type")
                 if isinstance(train_data, dict) else None
             )
+            syntax_masks = (
+                train_data.get("syntax_masks")
+                if isinstance(train_data, dict) else None
+            )
+            if isinstance(syntax_masks, torch.Tensor):
+                syntax_masks = syntax_masks[:, : model.max_seq_length].contiguous()
             loss_terms = byte_runtime.loss_terms(
-                logits, targets, target_region_ids, fim_frame_nal_type
+                logits, targets, target_region_ids, fim_frame_nal_type, syntax_masks
             )
             loss = loss_terms["objective"]
             if memory_profiler is not None:
@@ -755,6 +771,9 @@ def fit(
         running_full_ce.update(loss_terms["full_ce"].detach())
         running_fim_span_ce.update(loss_terms["fim_span_ce"].detach())
         running_eos_aux.update(loss_terms["eos_aux"].detach())
+        if "syntax_ce" in loss_terms:
+            for name, meter in running_syntax.items():
+                meter.update(loss_terms[name].detach())
         if "fim_sample_count_idr" in loss_terms:
             for name in ("idr", "p"):
                 fim_type_window[f"{name}_nll"].add_(
@@ -815,6 +834,14 @@ def fit(
                 "training/full_ce": running_full_ce.compute().item(),
                 "training/fim_span_ce": running_fim_span_ce.compute().item(),
                 "training/eos_aux_loss": running_eos_aux.compute().item(),
+                **(
+                    {
+                        f"training/{name}": meter.compute().item()
+                        for name, meter in running_syntax.items()
+                    }
+                    if "syntax_ce" in loss_terms
+                    else {}
+                ),
                 "training/objective": loss,
                 "iter": state["iter_num"],
                 "step": completed_steps,
@@ -885,12 +912,19 @@ def fit(
             if (
                 byte_runtime.fim_span_loss_weight > 0
                 or byte_runtime.eos_aux_loss_weight > 0
+                or "training/syntax_ce" in metrics
             ):
                 objective_detail = (
                     f" full: {metrics['training/full_ce']:.3f},"
                     f" span: {metrics['training/fim_span_ce']:.3f},"
                     f" eos_aux: {metrics['training/eos_aux_loss']:.3f},"
                 )
+                if "training/syntax_ce" in metrics:
+                    objective_detail += (
+                        f" syntax: {metrics['training/syntax_ce']:.3f}"
+                        f" (illegal {metrics['training/syntax_illegal_mass']:.3f},"
+                        f" eos {metrics['training/syntax_eos_mass']:.3f}),"
+                    )
             fabric.print(
                 f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
                 f" loss train: {metrics['loss']:.3f},"

@@ -167,6 +167,10 @@ class ByteDataConfig:
     length_bucket_pool_size: int = 8192
     # NB: counts VCL NALs, which == frames only for one-slice-per-frame corpora. Under
     # AVC-LM's slice-max-mbs=1 (one slice per macroblock) this becomes a min-slices gate.
+    # Directory written by ``syntax_mask.scan --dump-dir``: ``<clip>.h264.masks``
+    # holds one 256-bit legal-next-byte set (32 bytes) per file byte. When set,
+    # window samples carry per-label ``syntax_masks`` for the syntax loss.
+    syntax_mask_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1121,9 +1125,12 @@ class ByteStreamWindowDataset(Dataset):
         nal_index: dict[str, list[NALUnit]] | None = None,
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
+        syntax_mask_dir: str | Path | None = None,
     ) -> None:
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
+        if syntax_mask_dir is not None and not Path(syntax_mask_dir).is_dir():
+            raise FileNotFoundError(f"syntax mask directory not found: {syntax_mask_dir}")
         if min_frames < 1:
             raise ValueError("min_frames must be positive")
         if not 0.0 <= p_fim <= 1.0:
@@ -1169,6 +1176,8 @@ class ByteStreamWindowDataset(Dataset):
         self.fixed_indices: frozenset[int] = frozenset()
         self.seed = seed
         self.ignore_index = ignore_index
+        self.syntax_mask_dir = None if syntax_mask_dir is None else Path(syntax_mask_dir)
+        self._checked_mask_files: set[Path] = set()
         self.gops_seen = 0
         self.gops_oversized = 0
         self.gops_too_short = 0
@@ -1731,7 +1740,18 @@ class ByteStreamWindowDataset(Dataset):
                 raw_offset if self.use_eos else raw_offset[:-1],
             )
         )
-        return self._pack_item(input_ids, labels, region_ids, offset_ids, sample, "ar")
+        syntax_masks = None
+        if self.syntax_mask_dir is not None:
+            # labels = window (+ EOS): label k is window byte k; EOS is unconstrained.
+            label_offsets = torch.full((labels.numel(),), -1, dtype=torch.long)
+            label_offsets[: window.numel()] = torch.arange(window.numel())
+            syntax_masks = self._syntax_label_masks(
+                sample, window.numel(), labels, label_offsets
+            )
+        return self._pack_item(
+            input_ids, labels, region_ids, offset_ids, sample, "ar",
+            syntax_masks=syntax_masks,
+        )
 
     def _build_fim_item(
         self,
@@ -1817,6 +1837,17 @@ class ByteStreamWindowDataset(Dataset):
             loss_scope=self.fim_loss_scope,
             ignore_index=self.ignore_index,
         )
+        syntax_masks = None
+        if self.syntax_mask_dir is not None:
+            syntax_masks = self._syntax_label_masks(
+                sample,
+                window.numel(),
+                labels,
+                self._fim_label_window_offsets(
+                    frame_lo, split, gap, prefix.numel(), orphan.numel(),
+                    middle_in.numel(), labels.numel(),
+                ),
+            )
         return self._pack_item(
             input_ids,
             labels,
@@ -1824,6 +1855,7 @@ class ByteStreamWindowDataset(Dataset):
             offset_ids,
             sample,
             "fim",
+            syntax_masks=syntax_masks,
             fim_gap=gap,
             fim_split=split,
             frame_lo=frame_lo,
@@ -1848,9 +1880,11 @@ class ByteStreamWindowDataset(Dataset):
         offset_ids: Tensor,
         sample: WindowSample,
         task: TaskName,
+        *,
+        syntax_masks: Tensor | None = None,
         **fim_meta: int,
     ) -> dict[str, Any]:
-        return {
+        item = {
             "input_ids": input_ids,
             "labels": labels,
             "region_ids": region_ids,
@@ -1870,6 +1904,95 @@ class ByteStreamWindowDataset(Dataset):
                 **fim_meta,
             },
         }
+        if syntax_masks is not None:
+            item["syntax_masks"] = syntax_masks
+        return item
+
+    def _fim_label_window_offsets(
+        self,
+        frame_lo: int,
+        split: int,
+        gap: int,
+        prefix_len: int,
+        orphan_len: int,
+        middle_in_len: int,
+        num_labels: int,
+    ) -> Tensor:
+        """Window offset of the byte each FIM label predicts, or -1.
+
+        A label is syntax-constrained only when the model has seen that byte's
+        whole original-order prefix: context, prefix, and middle bytes. Orphan
+        bytes depend on the hidden middle, and markers/EOS are not bytes, so
+        they stay unconstrained.
+        """
+        pieces = []
+        if self.fim_format == "psm":
+            pieces += [
+                torch.arange(frame_lo),                       # context
+                torch.full((1,), -1),                         # FIM_BEGIN
+                torch.arange(frame_lo, frame_lo + prefix_len),  # prefix
+                torch.full((1,), -1),                         # FIM_HOLE
+            ]
+        else:
+            pieces.append(torch.arange(split))                # context + prefix
+        pieces.append(torch.full((orphan_len,), -1))          # orphan
+        middle = torch.full((middle_in_len,), -1)             # FIM_END / SPAN_BOS
+        middle[1:] = torch.arange(split, split + middle_in_len - 1)
+        pieces.append(middle)
+        input_offsets = torch.cat(pieces).long()
+        # labels[t] predicts input[t + 1]; the final label is missing_tail[-1].
+        last = -1 if self.use_eos else split + gap - 1
+        label_offsets = torch.cat((input_offsets[1:], torch.tensor([last])))
+        if label_offsets.numel() != num_labels:
+            raise RuntimeError("FIM syntax offsets disagree with the label layout")
+        if self.fim_loss_scope == "span":
+            label_offsets[: num_labels - middle_in_len] = -1
+        return label_offsets
+
+    def _syntax_label_masks(
+        self,
+        sample: WindowSample,
+        window_len: int,
+        labels: Tensor,
+        label_offsets: Tensor,
+    ) -> Tensor:
+        """``[len(labels), 32]`` uint8 legal-byte sets; all-zero rows are unconstrained.
+
+        The mask file is indexed by original file offset. A GOP window is the
+        contiguous file range starting at its first NAL's start code.
+        """
+        path = self.syntax_mask_dir / f"{sample.h264_path.name}.masks"
+        if path not in self._checked_mask_files:
+            expected = 32 * sample.h264_path.stat().st_size
+            actual = path.stat().st_size if path.is_file() else -1
+            if actual != expected:
+                raise ValueError(
+                    f"syntax mask file {path} has {actual} bytes, expected {expected} "
+                    f"for {sample.h264_path}"
+                )
+            self._checked_mask_files.add(path)
+        base = self.nal_index[str(sample.h264_path)][sample.start_nal].start
+        with path.open("rb") as file:
+            file.seek(32 * base)
+            buffer = bytearray(file.read(32 * window_len))
+        window_masks = torch.frombuffer(buffer, dtype=torch.uint8).view(window_len, 32)
+        masks = torch.zeros((labels.numel(), 32), dtype=torch.uint8)
+        selected = label_offsets >= 0
+        masks[selected] = window_masks[label_offsets[selected]]
+        # The ground-truth byte must be legal wherever a mask applies; a failure
+        # means misaligned offsets or masks built for a different file.
+        targets = labels[selected]
+        if bool((targets < 0).any() or (targets >= BYTE_VOCAB_SIZE).any()):
+            raise RuntimeError("syntax-constrained label is not a byte")
+        rows = masks[selected]
+        bits = (rows.gather(1, (targets >> 3).unsqueeze(1)).squeeze(1).long() >> (targets & 7)) & 1
+        if not bool(bits.all()):
+            bad = int((bits == 0).nonzero()[0])
+            raise RuntimeError(
+                f"GT byte illegal under syntax mask: {sample.h264_path} "
+                f"window offset {int(label_offsets[selected][bad])}"
+            )
+        return masks
 
 
 def collate_byte_samples(
@@ -1917,6 +2040,7 @@ def collate_byte_samples(
             if byte_patch_size > 1
             else {}
         ),
+        **_collate_syntax_masks(samples, max_seq_length),
         "token_counts": {
             "raw": torch.tensor(
                 [sample["token_counts"]["raw"] for sample in samples], dtype=torch.int64
@@ -1933,6 +2057,22 @@ def collate_byte_samples(
                 dtype=torch.int64,
             ).unsqueeze(1),
         },
+    }
+
+
+def _collate_syntax_masks(
+    samples: list[dict[str, Any]], max_seq_length: int
+) -> dict[str, Tensor]:
+    """Pad/truncate per-label syntax masks along the same axis as ``labels``."""
+    present = ["syntax_masks" in sample for sample in samples]
+    if not any(present):
+        return {}
+    if not all(present):
+        raise ValueError("syntax_masks must be present for every sample in a batch")
+    return {
+        "syntax_masks": pad_and_truncate(
+            [sample["syntax_masks"] for sample in samples], max_seq_length, 0
+        )
     }
 
 
@@ -2037,8 +2177,26 @@ def patch_byte_sample(sample: dict[str, Any], patch_size: int) -> dict[str, Any]
 
     if input_patches.shape != output_labels.shape:
         raise RuntimeError("patched input/target position counts disagree")
+    patched_syntax = {}
+    if "syntax_masks" in sample:
+        # Mirror the label transform exactly: right-pad the target tail with
+        # unconstrained (all-zero) rows, then prepend the ignored prompt rows.
+        target_masks = sample["syntax_masks"][first:]
+        pad = (-target_masks.size(0)) % patch_size
+        if pad:
+            target_masks = torch.cat(
+                (target_masks, target_masks.new_zeros((pad, target_masks.size(1))))
+            )
+        target_masks = target_masks.view(-1, patch_size, target_masks.size(1))
+        prompt_masks = target_masks.new_zeros(
+            (prompt_ids.size(0) - 1, patch_size, target_masks.size(2))
+        )
+        patched_syntax["syntax_masks"] = torch.cat((prompt_masks, target_masks))
+        if patched_syntax["syntax_masks"].shape[:2] != output_labels.shape:
+            raise RuntimeError("patched syntax masks and labels disagree")
     return {
         **sample,
+        **patched_syntax,
         "input_ids": input_patches,
         "labels": output_labels,
         "region_ids": input_regions,
@@ -2173,7 +2331,10 @@ class ByteDataModule(DataModule):
                     ),
                     nal_index=nal_index,
                     seed=self.config.seed,
+                    syntax_mask_dir=self.config.syntax_mask_dir,
                 )
+            if self.config.syntax_mask_dir is not None:
+                raise ValueError("syntax masks require dataset_mode='window'")
             return ByteSliceDataset(
                 rows_subset,
                 max_seq_length=byte_max_seq_length,

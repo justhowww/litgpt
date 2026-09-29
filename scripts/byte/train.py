@@ -325,6 +325,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--syntax-mask-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of precomputed syntax masks (syntax_mask.scan --dump-dir). "
+            "Adds per-label legal-byte sets to window samples and logs "
+            "teacher-forced syntax legality."
+        ),
+    )
+    parser.add_argument(
+        "--syntax-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for -log p(legal) at syntax-constrained byte labels; EOS "
+            "counts as illegal there. Requires --syntax-mask-dir."
+        ),
+    )
+    parser.add_argument(
         "--fim-span-loss-weight",
         type=float,
         default=0.0,
@@ -583,6 +602,12 @@ def main() -> None:
         raise ValueError("--eos-aux-loss-weight requires --use-eos")
     if args.fim_span_loss_weight < 0:
         raise ValueError("--fim-span-loss-weight must be non-negative")
+    if args.syntax_loss_weight < 0:
+        raise ValueError("--syntax-loss-weight must be non-negative")
+    if args.syntax_loss_weight > 0 and args.syntax_mask_dir is None:
+        raise ValueError("--syntax-loss-weight requires --syntax-mask-dir")
+    if args.syntax_mask_dir is not None and args.dataset_mode != "window":
+        raise ValueError("--syntax-mask-dir requires --dataset-mode window")
     if args.fim_span_loss_weight > 0 and (
         args.p_fim <= 0 or args.fim_loss_scope != "full"
     ):
@@ -713,6 +738,9 @@ def main() -> None:
         window_unit=args.window_unit,
         length_bucketing=args.length_bucketing,
         length_bucket_pool_size=args.length_bucket_pool_size,
+        syntax_mask_dir=(
+            None if args.syntax_mask_dir is None else str(args.syntax_mask_dir)
+        ),
     )
     max_manifest_rows = None if args.max_manifest_rows == 0 else args.max_manifest_rows
     data = ByteDataModule(
@@ -864,6 +892,7 @@ def main() -> None:
         eos_loss_weight=args.eos_loss_weight,
         eos_aux_loss_weight=args.eos_aux_loss_weight,
         fim_span_loss_weight=args.fim_span_loss_weight,
+        syntax_loss_weight=args.syntax_loss_weight,
         mrt=mrt,
         free_run_eval=free_run_eval,
         grpo=grpo,
