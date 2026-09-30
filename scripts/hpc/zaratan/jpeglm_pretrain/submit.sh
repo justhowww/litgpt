@@ -66,6 +66,11 @@ fi
 if [[ -n "${EXCLUDE_NODES:-}" ]]; then
     sbatch_args+=(--exclude="${EXCLUDE_NODES}")
 fi
+# Optional wall-clock cap, e.g. for fixed-budget ablations that keep a long LR
+# schedule but stop early. The job script's own #SBATCH --time is the default.
+if [[ -n "${SBATCH_TIME:-}" ]]; then
+    sbatch_args+=(--time="${SBATCH_TIME}")
+fi
 if [[ -n "${AFTER_JOBID:-}" ]]; then
     case "${DEPENDENCY_TYPE}" in
         afterok|afterany) ;;
