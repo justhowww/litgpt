@@ -39,6 +39,8 @@ def stratum_argv(
     length: int,
     checkpoint: Path,
     out_dir: Path,
+    ffmpeg_binary: Path,
+    ffprobe_binary: Path,
 ) -> list[str]:
     """CLI mirror of eval_tf.build_samples' Namespace plus generation settings."""
     return [
@@ -46,6 +48,8 @@ def stratum_argv(
         "--nal-index-path", values["NAL_INDEX"],
         "--checkpoint-dirs", str(checkpoint),
         "--out-dir", str(out_dir),
+        "--ffmpeg-binary", str(ffmpeg_binary),
+        "--ffprobe-binary", str(ffprobe_binary),
         "--model-dtype", "bf16",
         "--train-split-file", str(Path(values["OUT_DIR"]) / "train_split.json"),
         "--eval-split", split,
@@ -84,6 +88,8 @@ def main() -> None:
     parser.add_argument("config", type=Path, help="Frozen small-sample YAML in the run directory")
     parser.add_argument("--checkpoint", default="final", help="final or step-XXXXXXXX")
     parser.add_argument("--split", choices=("val", "train"), default="train")
+    parser.add_argument("--ffmpeg-binary", type=Path, default=Path("ffmpeg"))
+    parser.add_argument("--ffprobe-binary", type=Path, default=Path("ffprobe"))
     args = parser.parse_args()
 
     values = load_config(args.config)
@@ -107,7 +113,10 @@ def main() -> None:
     strata, omitted = eval_tf.evaluation_strata(evaluation)
     for frame_type, length in strata:
         out_dir = out_root / f"{frame_type}_{length}B"
-        argv = stratum_argv(values, evaluation, args.split, frame_type, length, checkpoint, out_dir)
+        argv = stratum_argv(
+            values, evaluation, args.split, frame_type, length, checkpoint,
+            out_dir, args.ffmpeg_binary, args.ffprobe_binary,
+        )
         print(f"== {args.split} {frame_type} {length}B -> {out_dir}", flush=True)
         saved = sys.argv
         sys.argv = ["eval_fim_avclm.py", *argv]
