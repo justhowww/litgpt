@@ -14,6 +14,14 @@ It also records baseline CE by byte offset inside a patch (0..P-1). If the
 local model does most of the work, removing the global signal costs little and
 CE falls steeply across each patch as in-patch context accumulates.
 
+Per-field breakdown: every scored byte whose original-order prefix the model
+has seen (context, prefix, middle; not the orphan) is labelled with the H.264
+syntax category that owns it (h264_syntax spans; "mixed" if a byte straddles
+categories) and with its frame's index in the window. Slice headers repeat or
+increment from frame to frame, so a working global model should make them
+nearly free once earlier frames are visible ("slice_header" by frame index),
+and zeroing the global signal should hurt them sharply.
+
 Windows come from videos NOT in the run's train_split.json (held out), built
 with the run's own window unit/FIM settings; holes are deterministic per
 window, and FIM frames are drawn 50/50 IDR/P so both frame types are scored.
@@ -49,6 +57,7 @@ from litgpt.byte.data import (  # noqa: E402
     load_manifest_rows,
     patch_byte_sample,
 )
+from litgpt.byte import h264_syntax as HS  # noqa: E402
 from litgpt.byte.reconstruction import _unwrap_model  # noqa: E402
 from scripts.byte.eval.helpers.checkpoint_eval_helpers import load_model  # noqa: E402
 
@@ -72,6 +81,50 @@ class GlobalSignalHook:
             shift = max(1, output.size(1) // 2)
             return torch.roll(output, shifts=shift, dims=1)
         raise ValueError(self.mode)
+
+
+def window_labels(dataset, item):
+    """Per-label (category, frame index) for byte labels, aligned with score_window."""
+    meta = item["sample_meta"]
+    path = meta["h264_path"]
+    nals = dataset.nal_index[str(path)]
+    start, end = int(meta["start_nal"]), int(meta["end_nal"])
+    base = nals[start].start
+    window = Path(path).read_bytes()[base : nals[end - 1].end]
+    owners: list[set] = [set() for _ in range(len(window))]
+    try:
+        for span in HS.parse_stream(window, parse_slice_data=True).all_spans():
+            for b in range(max(0, span.byte_start), min(len(window), span.byte_end)):
+                owners[b].add(span.category.value)
+    except Exception:  # noqa: BLE001 - unparsable window: leave bytes unclassified
+        pass
+    category = [
+        next(iter(o)) if len(o) == 1 else ("mixed" if o else "unclassified") for o in owners
+    ]
+    frame = [-1] * len(window)  # -1 = parameter sets / SEI before the first slice
+    k = -1
+    for nal in nals[start:end]:
+        if nal.nal_type in (1, 5):
+            k += 1
+        for b in range(nal.start - base, nal.end - base):
+            frame[b] = k
+    labels = item["labels"]
+    keep = (labels != IGNORE_INDEX) & (labels < BYTE_VOCAB_SIZE)
+    gap, split = int(meta["fim_gap"]), int(meta["fim_split"])
+    frame_lo, frame_hi = int(meta["frame_lo"]), int(meta["frame_hi"])
+    offsets = dataset._fim_label_window_offsets(
+        frame_lo, split, gap, split - frame_lo, frame_hi - split - gap,
+        gap + (1 if dataset.use_eos else 0), labels.numel(),
+    )
+    out_cat, out_frame = [], []
+    for off in offsets[keep].tolist():
+        if off < 0:
+            out_cat.append("orphan")
+            out_frame.append(-2)
+        else:
+            out_cat.append(category[off])
+            out_frame.append(frame[off])
+    return out_cat, out_frame
 
 
 def heldout_rows(manifest: Path, split_file: Path, num_videos: int, seed: int):
@@ -158,12 +211,19 @@ def main() -> None:
     offset_sum = torch.zeros(patch_size, dtype=torch.float64)
     offset_cnt = torch.zeros(patch_size, dtype=torch.float64)
     offset_sum_zero = torch.zeros(patch_size, dtype=torch.float64)
+    field_sum = {c: defaultdict(float) for c in ("baseline", "zero")}
+    field_cnt = defaultdict(int)
+    header_sum = {c: defaultdict(float) for c in ("baseline", "zero")}
+    header_cnt = defaultdict(int)
+    frame_sum = defaultdict(float)
+    frame_cnt = defaultdict(int)
     started = time.perf_counter()
     for index in range(len(dataset)):
         item = dataset[index]
         frame = {5: "idr", 1: "p"}.get(item["sample_meta"].get("fim_frame_nal_type"), "other")
         if item["input_ids"].numel() > budget + 8:
             continue
+        cats, frames = window_labels(dataset, item)
         for condition in CONDITIONS:
             hook.mode = condition
             nll, offs, middle = score_window(model, item, patch_size, device)
@@ -175,6 +235,18 @@ def main() -> None:
                 if condition == "baseline":
                     counts[name] += int(mask.sum())
             if condition in ("baseline", "zero"):
+                if len(cats) != nll.numel():
+                    raise RuntimeError(f"label alignment: {len(cats)} labels vs {nll.numel()} scores")
+                for value, cat, fr in zip(nll.tolist(), cats, frames):
+                    field_sum[condition][cat] += value
+                    if cat == "slice_header":
+                        header_sum[condition][fr] += value
+                    if condition == "baseline":
+                        field_cnt[cat] += 1
+                        frame_sum[fr] += value
+                        frame_cnt[fr] += 1
+                        if cat == "slice_header":
+                            header_cnt[fr] += 1
                 target = offset_sum if condition == "baseline" else offset_sum_zero
                 target.index_add_(0, offs, nll)
                 if condition == "baseline":
@@ -197,6 +269,15 @@ def main() -> None:
         "relative_increase": {
             c: {g: ce[c][g] / ce["baseline"][g] - 1 for g in ce["baseline"]} for c in CONDITIONS if c != "baseline"
         },
+        "ce_by_field": {
+            c: {k: field_sum[c][k] / field_cnt[k] for k in sorted(field_cnt)} for c in ("baseline", "zero")
+        },
+        "bytes_by_field": dict(sorted(field_cnt.items())),
+        "slice_header_ce_by_frame_index": {
+            c: {str(k): header_sum[c][k] / header_cnt[k] for k in sorted(header_cnt)} for c in ("baseline", "zero")
+        },
+        "slice_header_bytes_by_frame_index": {str(k): v for k, v in sorted(header_cnt.items())},
+        "baseline_ce_by_frame_index": {str(k): frame_sum[k] / frame_cnt[k] for k in sorted(frame_cnt)},
         "baseline_ce_by_patch_offset": (offset_sum / offset_cnt.clamp_min(1)).tolist(),
         "zero_global_ce_by_patch_offset": (offset_sum_zero / offset_cnt.clamp_min(1)).tolist(),
         "bytes_by_patch_offset": offset_cnt.tolist(),
@@ -216,6 +297,14 @@ def main() -> None:
     prof = result["baseline_ce_by_patch_offset"]
     marks = sorted({0, 1, 2, 4, 8, 16, 32, 64, 128, patch_size - 1} & set(range(patch_size)))
     print("baseline CE by offset in patch: " + ", ".join(f"{k}:{prof[k]:.2f}" for k in marks))
+    print("\nCE by syntax field (nats/byte): baseline -> zero-global   [bytes]")
+    for k in sorted(field_cnt, key=lambda k: -field_cnt[k]):
+        b, z = result["ce_by_field"]["baseline"][k], result["ce_by_field"]["zero"][k]
+        print(f"  {k:18s} {b:6.3f} -> {z:6.3f}  ({100 * (z / b - 1):+6.1f}%)  [{field_cnt[k]:,}]")
+    print("slice-header CE by frame index in window (baseline / zero-global):")
+    for k in sorted(header_cnt):
+        print(f"  frame {k:>3}: {header_sum['baseline'][k] / header_cnt[k]:6.3f} / "
+              f"{header_sum['zero'][k] / header_cnt[k]:6.3f}  [{header_cnt[k]:,} bytes]")
     print(f"written: {args.out}")
 
 

@@ -4,7 +4,7 @@
 #   RUN_DIR=/path/to/runs/<run> CHECKPOINT=step-00200000 \
 #     sbatch scripts/hpc/zaratan/jpeglm_pretrain/eval_global_ablation_a100.sbatch
 #
-# Writes RUN_DIR/eval_global_ablation/<CHECKPOINT>.json (never overwrites).
+# Writes RUN_DIR/eval_global_ablation/<OUT_NAME or CHECKPOINT>.json (never overwrites).
 
 #SBATCH --job-name=megabyte-global-ablation
 #SBATCH --account=metzler-prj-cmsc
@@ -23,6 +23,7 @@ export SLURM_EXPORT_ENV=ALL
 : "${RUN_DIR:?Set RUN_DIR to the training run directory}"
 CHECKPOINT=${CHECKPOINT:-latest}
 NUM_VIDEOS=${NUM_VIDEOS:-200}
+OUT_NAME=${OUT_NAME:-"${CHECKPOINT}"}
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
 
@@ -36,4 +37,4 @@ srun python -u scripts/byte/eval/megabyte_global_ablation.py \
     "${RUN_DIR}/${CHECKPOINT}" \
     --train-split-file "${RUN_DIR}/train_split.json" \
     --num-videos "${NUM_VIDEOS}" \
-    --out "${RUN_DIR}/eval_global_ablation/${CHECKPOINT}.json"
+    --out "${RUN_DIR}/eval_global_ablation/${OUT_NAME}.json"
