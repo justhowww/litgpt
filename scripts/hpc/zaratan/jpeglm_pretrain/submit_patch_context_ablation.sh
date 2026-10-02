@@ -4,6 +4,11 @@
 #
 #   B  patch 32, one GOP per window       -> is a 256-byte patch (> a P frame) the bottleneck?
 #   D  patch 32, consecutive GOPs packed  -> does earlier-GOP (reference) context help, esp. IDR?
+#   F  no MEGABYTE: plain 1B byte-level transformer (patch 1, every byte attends to
+#      every earlier byte), 16 KB context (99.9% of GOPs whole), one GOP per window,
+#      same data/objective/batch as B -> does the patch hierarchy lose content
+#      information? ~23x B's FLOPs per byte; default cap 24 h. Compare with B at
+#      matched bytes seen (logged raw_tokens), not matched steps.
 #
 # B changes only global size + patch vs A (global FLOPs/byte ~= A: 1.0B/32 vs 7B/256)
 # and keeps A's exact window set (131 KB raw budget, window_unit=gop).
@@ -35,7 +40,6 @@ export MODEL_ARCHITECTURE=qwen3
 export N_LAYER=${N_LAYER:-20}
 export N_EMBD=${N_EMBD:-2048}
 export N_HEAD=${N_HEAD:-16}
-export BYTE_PATCH_SIZE=32
 export P_FIM=1.0
 export FIM_FORMAT=psm
 export FIM_LOSS_SCOPE=full
@@ -61,11 +65,13 @@ export ENABLE_LENGTH_BUCKETING=1
 export LENGTH_BUCKET_POOL_SIZE=8192
 export ACTIVATION_CHECKPOINTING=1
 export COMPILE=1
-export SBATCH_TIME=${SBATCH_TIME:-12:00:00}
+SBATCH_TIME_OVERRIDE=${SBATCH_TIME:-}
 
 for variant in ${VARIANTS}; do
     case "${variant}" in
         B)
+            patch=32
+            time=12:00:00
             window_unit=gop
             raw_context=131072   # same windows as A (no GOP dropped)
             gbs=64
@@ -73,19 +79,33 @@ for variant in ${VARIANTS}; do
             tag=byte-jpeglm-1b-qwen3-patch32-gop-fim-p100-idr50-ablB
             ;;
         D)
+            patch=32
+            time=12:00:00
             window_unit=byte_budget
             raw_context=32768    # ~5 consecutive GOPs (a whole clip) per window
             gbs=16
             micro=4
             tag=byte-jpeglm-1b-qwen3-patch32-bb32k-fim-p100-idr50-ablD
             ;;
+        F)
+            patch=1              # plain transformer: no global/local split
+            time=24:00:00
+            window_unit=gop
+            raw_context=16384    # 99.9% of GOPs fit whole
+            gbs=64
+            micro=4
+            tag=byte-jpeglm-1b-qwen3-bytes-ctx16k-gop-fim-p100-idr50-ablF
+            ;;
         *)
-            echo "Unknown variant ${variant}; expected B or D" >&2
+            echo "Unknown variant ${variant}; expected B, D or F" >&2
             exit 2
             ;;
     esac
-    echo "== variant ${variant}: window_unit=${window_unit} raw_context=${raw_context}B" \
-         "block=$((raw_context / BYTE_PATCH_SIZE)) gbs=${gbs} micro=${micro} time=${SBATCH_TIME}"
+    time=${SBATCH_TIME_OVERRIDE:-${time}}
+    echo "== variant ${variant}: patch=${patch} window_unit=${window_unit} raw_context=${raw_context}B" \
+         "block=$((raw_context / patch)) gbs=${gbs} micro=${micro} time=${time}"
+    BYTE_PATCH_SIZE="${patch}" \
+    SBATCH_TIME="${time}" \
     WINDOW_UNIT="${window_unit}" \
     RAW_CONTEXT_BYTES="${raw_context}" \
     GLOBAL_BATCH_SIZE="${gbs}" \
