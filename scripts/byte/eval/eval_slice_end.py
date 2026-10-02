@@ -230,21 +230,31 @@ def materialize(args, holes_doc: dict, manifest: Path, split_meta: dict, budget:
         frame_guard_bytes=0,
         corruption_eligibility_bytes=holes_doc["max_remainder"],
     )
-    out = []
+    out, skipped = [], []
     for hole in holes_doc["holes"]:
         key = (hole["h264_path"], hole["start_nal"], hole["end_nal"])
         if key not in index:
-            raise RuntimeError(f"pinned window not rebuilt: {key}")
+            # A model with a shorter context (e.g. F, 16 KB) does not rebuild GOPs
+            # that exceed it. Skip; cross-run comparisons use the common holes.
+            skipped.append({"hole_id": hole["hole_id"], "reason": "window_not_rebuilt"})
+            continue
         spec = (hole["frame_lo"], hole["frame_hi"], hole["split"], hole["gap"])
-        sample, _verified, reason = FIM._materialize_fim_sample(
-            ns, dataset, policy, FIM.HoleRequest(index[key], spec, None)
-        )
+        try:
+            sample, _verified, reason = FIM._materialize_fim_sample(
+                ns, dataset, policy, FIM.HoleRequest(index[key], spec, None)
+            )
+        except ValueError as exc:  # frame no longer fits this model's window budget
+            sample, reason = None, str(exc)
         if sample is None:
-            raise RuntimeError(f"hole {hole['hole_id']} not materialized: {reason}")
+            skipped.append({"hole_id": hole["hole_id"], "reason": reason})
+            continue
         if sample.bytes_after_hole:
             raise AssertionError("slice-end hole must have an empty in-frame suffix")
         out.append((hole, sample))
-    return out
+    if skipped:
+        print(f"[holes] skipped {len(skipped)}/{len(holes_doc['holes'])} holes for this model's "
+              f"{budget}-byte window: {skipped}", flush=True)
+    return out, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +656,8 @@ def main() -> None:
         args.holes_file.write_text(json.dumps(holes_doc, indent=1) + "\n", encoding="utf-8")
         print(f"[holes] wrote {len(holes_doc['holes'])} holes to {args.holes_file}; skips={holes_doc['skips']}",
               flush=True)
-    samples = materialize(args, holes_doc, manifest, split_meta, budget)
+    samples, skipped_holes = materialize(args, holes_doc, manifest, split_meta, budget)
+    (args.out_dir / "skipped_holes.json").write_text(json.dumps(skipped_holes, indent=1) + "\n", encoding="utf-8")
     if args.limit_holes:
         samples = samples[: args.limit_holes]
     (args.out_dir / "config.json").write_text(
