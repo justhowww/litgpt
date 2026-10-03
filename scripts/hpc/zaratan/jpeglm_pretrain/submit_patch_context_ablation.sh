@@ -9,6 +9,13 @@
 #      same data/objective/batch as B -> does the patch hierarchy lose content
 #      information? ~23x B's FLOPs per byte; default cap 24 h. Compare with B at
 #      matched bytes seen (logged raw_tokens), not matched steps.
+#   G  paper-shaped MEGABYTE: patch 8, global 24 x 2048 (~1.16B; 256 global dims per
+#      byte slot), local 15 x 1024 / 16 heads (~181M; local/global ~16% of params,
+#      ~1.3x compute per byte), same windows as A and B (131 KB, <= 16,384 global
+#      positions) -> MEGABYTE's best PG-19 shape. Does a correctly balanced
+#      MEGABYTE close F's lead on P-frame content (setup), or not (fixed patches
+#      inherently lose byte-exact copying)? Default cap 24 h; compare with F and B
+#      at matched wall-clock and matched steps.
 #
 # B changes only global size + patch vs A (global FLOPs/byte ~= A: 1.0B/32 vs 7B/256)
 # and keeps A's exact window set (131 KB raw budget, window_unit=gop).
@@ -37,7 +44,6 @@ VARIANTS=${VARIANTS:-"B D"}
 # Shared: everything not listed per variant matches run A.
 export STAGED_CORPUS
 export MODEL_ARCHITECTURE=qwen3
-export N_LAYER=${N_LAYER:-20}
 export N_EMBD=${N_EMBD:-2048}
 export N_HEAD=${N_HEAD:-16}
 export P_FIM=1.0
@@ -70,6 +76,7 @@ SBATCH_TIME_OVERRIDE=${SBATCH_TIME:-}
 for variant in ${VARIANTS}; do
     case "${variant}" in
         B)
+            layers=20; local_layers=4; local_embd=512; local_heads=8
             patch=32
             time=12:00:00
             window_unit=gop
@@ -79,6 +86,7 @@ for variant in ${VARIANTS}; do
             tag=byte-jpeglm-1b-qwen3-patch32-gop-fim-p100-idr50-ablB
             ;;
         D)
+            layers=20; local_layers=4; local_embd=512; local_heads=8
             patch=32
             time=12:00:00
             window_unit=byte_budget
@@ -88,6 +96,7 @@ for variant in ${VARIANTS}; do
             tag=byte-jpeglm-1b-qwen3-patch32-bb32k-fim-p100-idr50-ablD
             ;;
         F)
+            layers=20; local_layers=4; local_embd=512; local_heads=8   # local unused at patch 1
             patch=1              # plain transformer: no global/local split
             time=24:00:00
             window_unit=gop
@@ -96,14 +105,29 @@ for variant in ${VARIANTS}; do
             micro=4
             tag=byte-jpeglm-1b-qwen3-bytes-ctx16k-gop-fim-p100-idr50-ablF
             ;;
+        G)
+            layers=24; local_layers=15; local_embd=1024; local_heads=16
+            patch=8
+            time=24:00:00
+            window_unit=gop
+            raw_context=131072   # same windows as A and B
+            gbs=64
+            micro=4
+            tag=byte-jpeglm-1b-qwen3-patch8-local180m-gop-fim-p100-idr50-ablG
+            ;;
         *)
-            echo "Unknown variant ${variant}; expected B, D or F" >&2
+            echo "Unknown variant ${variant}; expected B, D, F or G" >&2
             exit 2
             ;;
     esac
     time=${SBATCH_TIME_OVERRIDE:-${time}}
-    echo "== variant ${variant}: patch=${patch} window_unit=${window_unit} raw_context=${raw_context}B" \
+    echo "== variant ${variant}: global ${layers}x${N_EMBD} local ${local_layers}x${local_embd}/${local_heads}h" \
+         "patch=${patch} window_unit=${window_unit} raw_context=${raw_context}B" \
          "block=$((raw_context / patch)) gbs=${gbs} micro=${micro} time=${time}"
+    N_LAYER="${layers}" \
+    MEGABYTE_LOCAL_LAYERS="${local_layers}" \
+    MEGABYTE_LOCAL_EMBD="${local_embd}" \
+    MEGABYTE_LOCAL_HEADS="${local_heads}" \
     BYTE_PATCH_SIZE="${patch}" \
     SBATCH_TIME="${time}" \
     WINDOW_UNIT="${window_unit}" \
