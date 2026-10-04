@@ -19,8 +19,13 @@ Conditions (every hole):
   random_legal  no model: uniform over bytes legal under the new mask
   concealment   FFmpeg concealment of the truncated slice (reference row per hole)
 
-Model conditions run greedy once plus ``--samples-per-hole`` sampled draws;
-random_legal runs the sampled draws only. Every repaired GOP is strictly decoded;
+Model conditions run greedy once plus ``--samples-per-hole`` sampled draws at
+each of ``--temperatures`` (decoding ``sample`` at T=1, ``sample_t0.5`` etc.);
+random_legal runs the sampled draws only. Every model fill records its log-prob
+under the unmodified model (bytes + EOS, before temperature / top-p / mask). The
+summary adds a ``<decoding>_best`` row per sampled decoding: for each hole, the
+draw with the highest mean log-prob per token (best-of-N by the model's own
+likelihood, never by the GT). Every repaired GOP is strictly decoded;
 content metrics use the strict frames when valid and FFmpeg's lenient decode
 otherwise (both are recorded). With ``--cross-check-masks`` each masked run
 also steps the other mask and logs where the two disagree.
@@ -321,8 +326,9 @@ class ModelStepper:
 
 
 @torch.inference_mode()
-def generate_model(raw, sample, device, *, condition, greedy, args, seed) -> dict:
-    temperature, top_k, top_p = (0.0, 0, 1.0) if greedy else (args.temperature, args.top_k, args.top_p)
+def generate_model(raw, sample, device, *, condition, temperature, args, seed) -> dict:
+    """``temperature == 0`` is greedy (top-k / top-p off)."""
+    top_k, top_p = (0, 1.0) if temperature <= 0 else (args.top_k, args.top_p)
     mask = cross = None
     if condition != "unmasked":
         kind = "old" if condition == "masked_old" else "new"
@@ -341,14 +347,18 @@ def generate_model(raw, sample, device, *, condition, greedy, args, seed) -> dic
     eos_prob_at_end = None
     rejected = 0
     mass = []
+    logprob_sum, logprob_tokens = 0.0, 0
     started = time.perf_counter()
     try:
         for step in range(max_new):
             logits = stepper.next_logits()
             with_eos = torch.cat((logits[:BYTE_VOCAB_SIZE], logits[SEQ_EOS_ID : SEQ_EOS_ID + 1])).float()
+            log_probs = F.log_softmax(with_eos, dim=-1)
             if mask is not None:
                 if mask.slice_complete():
-                    eos_prob_at_end = float(F.softmax(with_eos, dim=-1)[-1])
+                    eos_prob_at_end = float(log_probs[-1].exp())
+                    logprob_sum += float(log_probs[-1])  # the forced EOS
+                    logprob_tokens += 1
                     stop = "slice_end"
                     break
                 allowed = mask.allowed()
@@ -374,8 +384,12 @@ def generate_model(raw, sample, device, *, condition, greedy, args, seed) -> dic
             else:
                 token = FIM._sample_token(with_eos, temperature, top_k, top_p)
                 if token == BYTE_VOCAB_SIZE:
+                    logprob_sum += float(log_probs[-1])
+                    logprob_tokens += 1
                     stop = "eos"
                     break
+            logprob_sum += float(log_probs[token])
+            logprob_tokens += 1
             out.append(token)
             if step == max_new - 1:
                 break
@@ -391,6 +405,10 @@ def generate_model(raw, sample, device, *, condition, greedy, args, seed) -> dic
         "mask_argmax_rejected": rejected,
         "mask_allowed_mass_mean": statistics.fmean(mass) if mass else None,
         "cross_check": cross.report() if cross is not None and cross.steps else None,
+        "temperature": temperature,
+        "logprob_sum": logprob_sum,
+        "logprob_tokens": logprob_tokens,
+        "logprob_mean": logprob_sum / logprob_tokens if logprob_tokens else None,
         "seconds": time.perf_counter() - started,
     }
 
@@ -480,6 +498,21 @@ def _rate(rows, pred):
     return sum(1 for r in rows if pred(r)) / len(rows) if rows else None
 
 
+def best_of_rows(gens: list[dict]) -> list[dict]:
+    """Per hole and sampled decoding, the draw the model itself scores highest."""
+    pools: dict[tuple, list] = defaultdict(list)
+    for g in gens:
+        if g["decoding"].startswith("sample") and g.get("logprob_mean") is not None:
+            pools[(g["hole_id"], g["condition"], g["decoding"])].append(g)
+    out = []
+    for (_hid, _cond, decoding), rows in pools.items():
+        if len(rows) < 2:
+            continue
+        best = max(rows, key=lambda r: r["logprob_mean"])
+        out.append({**best, "decoding": f"{decoding}_best", "best_of": len(rows)})
+    return out
+
+
 def summarize(out_dir: Path) -> list[dict]:
     refs = {r["hole_id"]: r for r in read_jsonl(out_dir / "references.jsonl") if r.get("ok")}
     gens = [g for g in read_jsonl(out_dir / "generations.jsonl") if g["hole_id"] in refs]
@@ -491,6 +524,7 @@ def summarize(out_dir: Path) -> list[dict]:
         if g.get("drift_psnr_mean") is not None and drift_c is not None:
             g["drift_lift_vs_concealment"] = g["drift_psnr_mean"] - drift_c
         g["gen_len_ratio"] = g["gen_len"] / max(1, refs[g["hole_id"]]["gap"])
+    gens += best_of_rows(gens)
 
     def row_for(name: dict, rows: list[dict]) -> dict:
         lifts = [r["psnr_lift_vs_concealment"] for r in rows if r.get("psnr_lift_vs_concealment") is not None]
@@ -518,6 +552,7 @@ def summarize(out_dir: Path) -> list[dict]:
                 if cross else None
             ),
             "cross_check_runs_with_disagreement": sum(1 for c in cross if c["disagree_steps"]) if cross else None,
+            "logprob_mean": _mean(rows, "logprob_mean"),
             "seconds_mean": _mean(rows, "seconds"),
         }
 
@@ -561,13 +596,13 @@ def summarize(out_dir: Path) -> list[dict]:
 
 
 def print_table(table: list[dict]) -> None:
-    print(f"{'condition':13s} {'dec':6s} {'type':4s} {'n':>4s} {'strict':>7s} {'endOK':>6s} "
+    print(f"{'condition':13s} {'dec':16s} {'type':4s} {'n':>4s} {'strict':>7s} {'endOK':>6s} "
           f"{'PSNR':>6s} {'lift':>6s} {'win':>5s} {'drift':>6s} {'len':>5s}")
     for r in table:
         if r["cut_pos"] != "all":
             continue
         f = lambda k, w=6, p=2: (f"{r[k]:{w}.{p}f}" if isinstance(r.get(k), (int, float)) else f"{'-':>{w}s}")  # noqa: E731
-        print(f"{r['condition']:13s} {r['decoding']:6s} {r['frame_type']:4s} {r['n']:4d} "
+        print(f"{r['condition']:13s} {r['decoding']:16s} {r['frame_type']:4s} {r['n']:4d} "
               f"{f('strict_valid_rate', 7)} {f('ends_at_slice_end_rate')} {f('target_psnr_mean')} "
               f"{f('psnr_lift_vs_concealment_mean')} {f('beats_concealment_rate', 5)} "
               f"{f('drift_psnr_mean')} {f('gen_len_ratio_median', 5)}")
@@ -604,7 +639,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--conditions", nargs="+", default=list(CONDITIONS), choices=CONDITIONS)
     ap.add_argument("--samples-per-hole", type=int, default=3)
     ap.add_argument("--greedy", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temperatures", type=float, nargs="+", default=[1.0],
+                    help="sampling temperatures; each runs --samples-per-hole draws (best-of-N in the summary)")
     ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--max-gen-bytes", type=int, default=4096)
@@ -694,9 +730,16 @@ def main() -> None:
 
         viz_frames: dict[str, Any] = {}
         for condition in args.conditions:
-            runs = [("greedy", 0)] if (args.greedy and condition in MODEL_CONDITIONS) else []
-            runs += [("sample", i) for i in range(args.samples_per_hole)]
-            for decoding, sample_idx in runs:
+            if condition in MODEL_CONDITIONS:
+                runs = [("greedy", 0.0, 0)] if args.greedy else []
+                runs += [
+                    ("sample" if temp == 1.0 else f"sample_t{temp:g}", temp, i)
+                    for temp in args.temperatures
+                    for i in range(args.samples_per_hole)
+                ]
+            else:
+                runs = [("sample", 1.0, i) for i in range(args.samples_per_hole)]
+            for decoding, temperature, sample_idx in runs:
                 key = (hid, condition, decoding, sample_idx)
                 if key in gens_done:
                     continue
@@ -706,7 +749,7 @@ def main() -> None:
                 else:
                     gen = generate_model(
                         raw, sample, device, condition=condition,
-                        greedy=decoding == "greedy", args=args, seed=seed,
+                        temperature=temperature, args=args, seed=seed,
                     )
                 data = gen.pop("generated")
                 row = {

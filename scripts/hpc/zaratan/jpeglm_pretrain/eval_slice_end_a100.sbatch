@@ -9,6 +9,10 @@
 #   RUN_DIR=... LIMIT_HOLES=2 SAMPLES_PER_HOLE=1 OUT_NAME=smoke \
 #     sbatch --time=0-01:00:00 scripts/hpc/zaratan/jpeglm_pretrain/eval_slice_end_a100.sbatch
 #
+# Decoding study (temperature sweep + best-of-N by the model's own log-prob):
+#   RUN_DIR=... CHECKPOINT=... OUT_NAME=<ckpt>-decoding CONDITIONS=masked_new \
+#     TEMPERATURES="0.3 0.5 0.7 1.0" SAMPLES_PER_HOLE=4 sbatch .../eval_slice_end_a100.sbatch
+#
 # Held-out holes are pinned corpus-wide (STAGED_CORPUS/eval_sets/), so every run
 # and checkpoint is scored on the same holes; train-split holes are per run.
 # Resumable: resubmitting with the same OUT_NAME skips finished generations.
@@ -33,6 +37,7 @@ CHECKPOINT=${CHECKPOINT:-latest}
 SPLIT=${SPLIT:-val}
 OUT_NAME=${OUT_NAME:-"${CHECKPOINT}"}
 SAMPLES_PER_HOLE=${SAMPLES_PER_HOLE:-3}
+TEMPERATURES=${TEMPERATURES:-"1.0"}   # e.g. "0.3 0.5 0.7 1.0" for the decoding study
 HOLES_PER_STRATUM=${HOLES_PER_STRATUM:-20}
 LIMIT_HOLES=${LIMIT_HOLES:-0}
 CONDITIONS=${CONDITIONS:-"unmasked masked_old masked_new random_legal"}
@@ -67,6 +72,7 @@ srun python -u scripts/byte/eval/eval_slice_end.py \
     --holes-file "${HOLES_FILE}" \
     --holes-per-stratum "${HOLES_PER_STRATUM}" \
     --samples-per-hole "${SAMPLES_PER_HOLE}" \
+    --temperatures ${TEMPERATURES} \
     --limit-holes "${LIMIT_HOLES}" \
     --conditions ${CONDITIONS} \
     --ffmpeg-binary "${FFMPEG_BINARY}" \
