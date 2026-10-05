@@ -1891,6 +1891,58 @@ def teacher_forced_span_metrics(
 _INDEX_RE = re.compile(r"\[\d+\]")
 
 
+def byte_exact_diagnostics(sample: WindowFimSample, generated: bytes) -> dict[str, Any]:
+    """Compare the generated middle with the removed GT bytes, byte for byte.
+
+    ``first_divergence_offset`` is relative to the hole start. When one sequence
+    is a prefix of the other, the divergence is a length mismatch: ``early_stop``
+    (generation ended inside the GT middle) or ``overrun`` (it kept going past it).
+    Otherwise the GT syntax elements owning the first wrong byte are named.
+    """
+    target = sample.target_bytes
+    common = 0
+    for want, got in zip(target, generated):
+        if want != got:
+            break
+        common += 1
+    exact = generated == target
+    row: dict[str, Any] = {
+        "byte_exact": exact,
+        "common_prefix_bytes": common,
+        "common_prefix_fraction": common / max(len(target), 1),
+        "first_divergence_offset": None if exact else common,
+        "first_divergence_kind": None,
+        "first_divergence_syntax": None,
+        "first_divergence_category": None,
+    }
+    if exact:
+        return row
+    if common == len(generated):
+        row["first_divergence_kind"] = "early_stop"
+        return row
+    if common == len(target):
+        row["first_divergence_kind"] = "overrun"
+        return row
+    row["first_divergence_kind"] = "wrong_byte"
+    absolute = sample.split + common
+    try:
+        spans = HS.parse_stream(
+            sample.gt_truncated_stream, parse_slice_data=True
+        ).all_spans()
+    except Exception:
+        row["first_divergence_syntax"] = "parser unavailable"
+        return row
+    owners = [s for s in spans if s.byte_start <= absolute < s.byte_end]
+    row["first_divergence_syntax"] = (
+        ", ".join(dict.fromkeys(_INDEX_RE.sub("", s.name) for s in owners))
+        or "unattributed"
+    )
+    row["first_divergence_category"] = (
+        ", ".join(sorted({s.category.value for s in owners})) or None
+    )
+    return row
+
+
 def repaired_stream_diagnostics(
     stream: bytes, generated_start: int, generated_length: int
 ) -> dict[str, Any]:
@@ -2214,6 +2266,27 @@ def summarize(
         "end_to_end_success_rate": end_to_end_success_rate,
         "termination_success_rate": termination_success_rate,
         "repair_decode_success_rate": repair_decode_success_rate,
+        "byte_exact_rate": AR.mean(
+            [1.0 if r.get("byte_exact") else 0.0 for r in details]
+        ),
+        "byte_exact_count": sum(1 for r in details if r.get("byte_exact")),
+        "common_prefix_fraction_mean": AR.mean(
+            [float(r.get("common_prefix_fraction", 0.0)) for r in details]
+        ),
+        "first_divergence_kind_hist": dict(
+            Counter(
+                r["first_divergence_kind"]
+                for r in details
+                if r.get("first_divergence_kind")
+            ).most_common()
+        ),
+        "first_divergence_syntax_hist": dict(
+            Counter(
+                r["first_divergence_syntax"]
+                for r in details
+                if r.get("first_divergence_syntax")
+            ).most_common()
+        ),
         "gt_parser_reconnect_rate": (
             AR.mean([1.0 if x else 0.0 for x in gt_reconnect_results])
             if gt_reconnect_results
@@ -2762,6 +2835,7 @@ def build_repair_result_row(
         "corrupted_concealed_decode_status": corrupted_concealed_status,
         "corrupted_concealed_ffmpeg_decode": corrupted_concealed_decode,
     }
+    row.update(byte_exact_diagnostics(sample, result.data))
     if teacher_forced_metrics is not None:
         row.update(teacher_forced_metrics)
     return row, model_stream

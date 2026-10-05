@@ -55,6 +55,8 @@ LENGTH_BUCKET_POOL_SIZE=${LENGTH_BUCKET_POOL_SIZE:-8192}
 
 P_FIM=${P_FIM:-0.5}
 FIM_IDR_SAMPLING_PROBABILITY=${FIM_IDR_SAMPLING_PROBABILITY:-}
+# Overfit/debug only: K cached holes per training window (0 = holes change every access).
+FIXED_FIM_HOLES_PER_WINDOW=${FIXED_FIM_HOLES_PER_WINDOW:-0}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -214,6 +216,10 @@ if [[ -n "${FIM_IDR_SAMPLING_PROBABILITY}" ]]; then
     cmd+=(--fim-idr-sampling-probability "${FIM_IDR_SAMPLING_PROBABILITY}")
 fi
 
+if [[ "${FIXED_FIM_HOLES_PER_WINDOW}" != "0" ]]; then
+    cmd+=(--fixed-fim-holes-per-window "${FIXED_FIM_HOLES_PER_WINDOW}")
+fi
+
 if [[ -n "${SYNTAX_MASK_DIR}" ]]; then
     cmd+=(--syntax-mask-dir "${SYNTAX_MASK_DIR}" --syntax-loss-weight "${SYNTAX_LOSS_WEIGHT}")
 elif [[ "${SYNTAX_LOSS_WEIGHT}" != "0" ]]; then
@@ -245,7 +251,7 @@ fi
 echo "[jpeglm] architecture=${MODEL_ARCHITECTURE} model=${N_LAYER}L/${N_EMBD}D/${N_HEAD}H patch=${BYTE_PATCH_SIZE} global_positions=${BLOCK_SIZE} raw_capacity=$((BLOCK_SIZE * BYTE_PATCH_SIZE))B"
 echo "[jpeglm] rows=${MAX_ROWS} steps=${STEPS} gbs=${GLOBAL_BATCH_SIZE} micro=${MICRO_BATCH_SIZE} devices=${DEVICES} activation_checkpointing=${ACTIVATION_CHECKPOINTING} compile=${COMPILE}"
 echo "[jpeglm] length_bucketing=${ENABLE_LENGTH_BUCKETING} pool_size=${LENGTH_BUCKET_POOL_SIZE} (training only)"
-echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} EOS=on split=held-out-video"
+echo "[jpeglm] p_fim=${P_FIM} format=${FIM_FORMAT} loss=${FIM_LOSS_SCOPE} gap=[${FIM_MIN_GAP},${FIM_MAX_GAP}] guard=${SLICE_HEADER_GUARD_BYTES} window=${WINDOW_UNIT} fixed_holes_per_window=${FIXED_FIM_HOLES_PER_WINDOW} EOS=on split=held-out-video"
 echo "[jpeglm] checkpoints: rolling latest every ${LATEST_SAVE_INTERVAL} steps; permanent milestone every ${SAVE_INTERVAL} steps; final=${SAVE_FINAL}"
 
 exec {training_lock_fd}>"${OUT_DIR}/.training.lock"
