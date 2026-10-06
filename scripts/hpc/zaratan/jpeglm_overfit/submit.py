@@ -58,6 +58,8 @@ FIELDS = {
     "slurm": {"account": "SBATCH_ACCOUNT", "mem": "SBATCH_MEM", "time": "SBATCH_TIME"},
     "eval": {"ffmpeg_binary": "FFMPEG_BINARY", "ffprobe_binary": "FFPROBE_BINARY"},
 }
+# Optional keys, with the default used when a YAML omits them (older configs).
+OPTIONAL_FIELDS = {"fim": {"format": ("FIM_FORMAT", "psm")}}
 BOOLEAN_KEYS = {"ACTIVATION_CHECKPOINTING", "COMPILE"}
 
 # Fixed by design: the simplest setup. Not configurable from YAML.
@@ -67,7 +69,6 @@ CONSTANTS = {
     "MEGABYTE_LOCAL_EMBD": "64",
     "MEGABYTE_LOCAL_HEADS": "4",
     "WINDOW_UNIT": "gop",
-    "FIM_FORMAT": "psm",
     "FIM_LOSS_SCOPE": "full",
     "SLICE_HEADER_GUARD_BYTES": "0",
     "ENABLE_LENGTH_BUCKETING": "0",
@@ -95,11 +96,15 @@ def load_config(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for group, names in FIELDS.items():
         section = config.get(group)
-        if not isinstance(section, dict) or set(section) != set(names):
-            got = set(section or {})
+        optional = OPTIONAL_FIELDS.get(group, {})
+        got = set(section or {}) if isinstance(section, dict) else set()
+        if not isinstance(section, dict) or set(names) - got or got - set(names) - set(optional):
             raise ValueError(
-                f"{group}: missing {sorted(set(names) - got)}; unknown {sorted(got - set(names))}"
+                f"{group}: missing {sorted(set(names) - got)}; "
+                f"unknown {sorted(got - set(names) - set(optional))}"
             )
+        for key, (env_name, default) in optional.items():
+            values[env_name] = str(section.get(key, default))
         for key, env_name in names.items():
             value = section[key]
             if env_name in BOOLEAN_KEYS:
@@ -111,6 +116,8 @@ def load_config(path: Path) -> dict[str, str]:
             else:
                 values[env_name] = str(value)
 
+    if values["FIM_FORMAT"] not in {"psm", "spm"}:
+        raise ValueError("fim.format must be psm or spm")
     p_fim = float(values["P_FIM"])
     holes = int(values["FIXED_FIM_HOLES_PER_WINDOW"])
     if not 0.0 <= p_fim <= 1.0:

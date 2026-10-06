@@ -58,7 +58,7 @@ fim_common=(
     --val-fraction "${VAL_FRACTION}"
     --split-by-video
     --seed 42
-    --fim-format psm
+    --fim-format "${FIM_FORMAT}"
     --fim-loss-scope full
     --use-eos
     --fim-min-gap "${FIM_MIN_GAP}"

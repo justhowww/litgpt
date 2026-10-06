@@ -142,6 +142,36 @@ def test_psm_layout_and_labels_only_on_missing_span(tmp_path):
     assert torch.equal(ids[end.item() + 1 :], labels[-gap:][:-1])
 
 
+@pytest.mark.parametrize("use_eos", [False, True])
+def test_spm_layout_puts_the_middle_right_after_the_prefix(tmp_path, use_eos):
+    ds, data = _dataset(tmp_path, fim_format="spm", fim_loss_scope="full", use_eos=use_eos)
+    item = ds[0]
+    meta = _meta(item)
+    ids, labels = item["input_ids"], item["labels"]
+    frame_lo, frame_hi = meta["frame_lo"], meta["frame_hi"]
+    split, gap = meta["fim_split"], meta["fim_gap"]
+    window = torch.tensor(list(data))
+
+    hole = (ids == FIM_HOLE_ID).nonzero().flatten()
+    begin = (ids == FIM_BEGIN_ID).nonzero().flatten()
+    assert len(hole) == len(begin) == 1 and not (ids == FIM_END_ID).any()
+    h, b = hole.item(), begin.item()
+    # [context, FIM_HOLE, orphan, FIM_BEGIN, prefix, missing (minus the last target)]
+    assert h == frame_lo and torch.equal(ids[:h], window[:frame_lo])
+    assert torch.equal(ids[h + 1 : b], window[split + gap : frame_hi])
+    tail = window[frame_lo : split + gap]
+    if not use_eos:
+        tail = tail[:-1]
+    assert torch.equal(ids[b + 1 :], tail)
+
+    # Full scope: plain next-token labels; the stream after FIM_BEGIN is just
+    # prefix + missing in original order, ending in EOS when enabled.
+    assert torch.equal(labels[:-1], ids[1:])
+    expected_tail = window[split : split + gap].tolist() + ([SEQ_EOS_ID] if use_eos else [])
+    assert labels[-len(expected_tail):].tolist() == expected_tail
+    assert len(ids) == frame_hi + ds._fim_overhead()
+
+
 def test_full_loss_scope_supervises_the_reordered_sequence(tmp_path):
     ds, _ = _dataset(tmp_path, fim_loss_scope="full", use_eos=True)
     item = ds[0]
@@ -238,7 +268,10 @@ def test_use_eos_appends_terminator_to_window_ar(tmp_path):
 def test_fim_overhead_matches_the_realized_sample_length(tmp_path):
     # Pins the arithmetic _fim_candidates budgets against. If these disagree, the
     # budget check is wrong and oversized samples get truncated from the right.
-    for fmt, eos in [("psm", False), ("psm", True), ("bridge", False), ("bridge", True)]:
+    for fmt, eos in [
+        ("psm", False), ("psm", True), ("spm", False), ("spm", True),
+        ("bridge", False), ("bridge", True),
+    ]:
         ds, _ = _dataset(tmp_path, fim_format=fmt, use_eos=eos)
         item = ds[0]
         assert len(item["input_ids"]) == _meta(item)["frame_hi"] + ds._fim_overhead()

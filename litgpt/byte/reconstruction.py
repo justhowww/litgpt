@@ -151,7 +151,8 @@ def build_window_fim_sample(
     ``ByteStreamWindowDataset._build_fim_item``), which is scope-independent.
     """
     use_eos = bool(getattr(base_dataset, "use_eos", False))
-    is_psm = base_dataset.fim_format == "psm"
+    # psm and spm both insert exactly two markers before the first missing byte.
+    is_psm = base_dataset.fim_format in ("psm", "spm")
     frame_lo, frame_hi, split, gap = hole_spec
     if gap <= 0 or gap > max_target_bytes:
         return None

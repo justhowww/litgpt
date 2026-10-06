@@ -63,8 +63,8 @@ TASKS = ("ar", "fim")
 TaskName = Literal["ar", "fim"]
 REFERENCE_MODES = ("normal", "no_ref", "zero_ref", "shuffled_ref")
 ReferenceMode = Literal["normal", "no_ref", "zero_ref", "shuffled_ref"]
-FIM_FORMATS = ("bridge", "psm")
-FIMFormat = Literal["bridge", "psm"]
+FIM_FORMATS = ("bridge", "psm", "spm")
+FIMFormat = Literal["bridge", "psm", "spm"]
 FIM_LOSS_SCOPES = ("span", "full")
 FIMLossScope = Literal["span", "full"]
 DATASET_MODES = ("slice", "window")
@@ -80,7 +80,7 @@ def vocab_size_for_fim_format(fim_format: FIMFormat, use_eos: bool = False) -> i
     # bridge and PSM vocabularies to the same size.
     if use_eos:
         return EOS_VOCAB_SIZE
-    return PSM_VOCAB_SIZE if fim_format == "psm" else VOCAB_SIZE
+    return PSM_VOCAB_SIZE if fim_format in ("psm", "spm") else VOCAB_SIZE
 
 
 @dataclass
@@ -514,6 +514,8 @@ class ByteSliceDataset(Dataset):
             raise ValueError("p_fim must be in [0, 1]")
         if fim_format not in FIM_FORMATS:
             raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
+        if fim_format == "spm":
+            raise ValueError("fim_format='spm' is implemented only for window datasets")
         if fim_loss_scope not in FIM_LOSS_SCOPES:
             raise ValueError(f"fim_loss_scope must be one of {FIM_LOSS_SCOPES}")
         if max_seq_length < 4:
@@ -1379,10 +1381,12 @@ class ByteStreamWindowDataset(Dataset):
 
         PSM inserts three markers (FIM_BEGIN, FIM_HOLE, FIM_END) but middle_in is
         [FIM_END, missing_tail[:-1]], so the teacher-forcing shift gives one byte
-        back: net +2, not +3. Bridge inserts one marker and gives the same byte back:
-        net 0. Matches ByteSliceDataset's `format_overhead = 2 if psm else 0`.
+        back: net +2, not +3. SPM inserts two markers (FIM_HOLE, FIM_BEGIN) and its
+        middle continues straight from the prefix with no marker to give back: net
+        +2. Bridge inserts one marker and gives the same byte back: net 0. Matches
+        ByteSliceDataset's `format_overhead = 2 if psm else 0`.
         """
-        markers = 2 if self.fim_format == "psm" else 0
+        markers = 2 if self.fim_format in ("psm", "spm") else 0
         return markers + (1 if self.use_eos else 0)
 
     def _assert_fim_reachable(self) -> None:
@@ -1785,7 +1789,34 @@ class ByteStreamWindowDataset(Dataset):
         orphan = window[split + gap : frame_hi]
         missing_tail = self._with_eos(missing)
 
-        if self.fim_format == "psm":
+        if self.fim_format == "spm":
+            # Suffix first, then prefix, then the middle continues the prefix
+            # directly: [context, FIM_HOLE, orphan, FIM_BEGIN, prefix, missing...].
+            # The first missing byte is the next byte of the original stream, with
+            # no jump back from a trailing marker as in PSM.
+            hole_marker = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
+            head = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
+            middle_in = missing_tail[:-1]
+            pieces = [context, hole_marker, orphan, head, prefix, middle_in]
+            regions = [
+                raw_region[:frame_lo],
+                torch.full((1,), REGION_ORPHAN, dtype=torch.long),
+                torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
+                torch.full((1,), REGION_PREFIX, dtype=torch.long),
+                torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
+                torch.full((middle_in.numel(),), REGION_BRIDGE, dtype=torch.long),
+            ]
+            offset_ids = torch.cat(
+                (
+                    raw_offset[:frame_lo],
+                    torch.zeros(1, dtype=torch.long),
+                    raw_offset[split + gap : frame_hi],
+                    torch.zeros(1, dtype=torch.long),
+                    raw_offset[frame_lo:split],
+                    torch.arange(1, middle_in.numel() + 1, dtype=torch.long),
+                )
+            )
+        elif self.fim_format == "psm":
             head = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
             hole = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
             middle_in = torch.cat(
@@ -1821,16 +1852,17 @@ class ByteStreamWindowDataset(Dataset):
         # are DISABLED -- which is why scripts/byte/train.py rejects window FIM
         # without --no-offset-id. Turning them back on needs a real design (260703
         # found encodings help, so someone will want to).
-        offset_ids = torch.cat(
-            (
-                raw_offset[:frame_lo],
-                torch.zeros(1, dtype=torch.long),
-                raw_offset[frame_lo:split],
-                torch.zeros(1, dtype=torch.long),
-                raw_offset[split + gap : frame_hi],
-                torch.arange(middle_in.numel(), dtype=torch.long),
+        if self.fim_format != "spm":
+            offset_ids = torch.cat(
+                (
+                    raw_offset[:frame_lo],
+                    torch.zeros(1, dtype=torch.long),
+                    raw_offset[frame_lo:split],
+                    torch.zeros(1, dtype=torch.long),
+                    raw_offset[split + gap : frame_hi],
+                    torch.arange(middle_in.numel(), dtype=torch.long),
+                )
             )
-        )
         labels = _fim_training_labels(
             input_ids,
             missing_tail,
@@ -1839,6 +1871,8 @@ class ByteStreamWindowDataset(Dataset):
         )
         syntax_masks = None
         if self.syntax_mask_dir is not None:
+            if self.fim_format == "spm":
+                raise NotImplementedError("syntax masks are not implemented for spm FIM")
             syntax_masks = self._syntax_label_masks(
                 sample,
                 window.numel(),
