@@ -121,8 +121,6 @@ def load_config(path: Path) -> dict[str, str]:
         holes or float(values["FIM_SPAN_LOSS_WEIGHT"]) or float(values["EOS_AUX_LOSS_WEIGHT"])
     ):
         raise ValueError("p_fim: 0 (pure AR) requires zero fixed holes and zero FIM loss weights")
-    if p_fim > 0 and holes == 0:
-        raise ValueError("An overfit FIM run needs fim.fixed_holes_per_window > 0")
     if int(values["N_EMBD"]) % int(values["N_HEAD"]):
         raise ValueError("n_embd must be divisible by n_head")
     if values["MODEL_ARCHITECTURE"] == "qwen3" and int(values["N_HEAD"]) % 4:

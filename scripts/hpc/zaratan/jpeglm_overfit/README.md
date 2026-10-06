@@ -13,6 +13,12 @@ full-sequence loss, plain next-byte CE (no span/EOS weighting), one A100.
 |---|---|---|
 | `o0_ar.yaml` | pure AR, `p_fim: 0` | prompt = BOS + the GOP's first frame; generate the rest + EOS |
 | `o1_fim_k1.yaml` | pure FIM, one fixed hole per window | replay each trained hole (hash-verified); generate the middle + EOS |
+| `o2_fim_changing.yaml` | pure FIM, hole redrawn every access | 4 new deterministic holes per training window |
+
+Every FIM run also gets `train_newholes`: 4 deterministic holes per training window, disjoint
+from any cached training hole (known content, unseen cut). Rerunning O1 with
+`OVERFIT_EVAL_ONLY=1` adds it without redoing the existing evaluations, which gives a
+fixed-hole vs changing-hole comparison on nearly the same cuts.
 
 Both train on the first 9 manifest videos (8 train, 1 held out as a reference).
 
@@ -28,7 +34,7 @@ python scripts/hpc/zaratan/jpeglm_overfit/submit.py scripts/hpc/zaratan/jpeglm_o
 
 Outputs:
 - O0: `RUN/eval_overfit_ar/final/{train,val}/{summary.json,windows.jsonl}`
-- O1: `RUN/eval_overfit_fim/final/{train,val}/` (`eval_fim_avclm.py`; see `byte_exact_*` and
+- FIM runs: `RUN/eval_overfit_fim/final/{train,train_newholes,val}/` (`eval_fim_avclm.py`; see `byte_exact_*` and
   `first_divergence_*` in the summary and per-sample rows)
 
 To re-evaluate a saved checkpoint without training, resubmit the same YAML with

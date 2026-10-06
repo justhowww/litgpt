@@ -41,8 +41,11 @@ if [[ "${P_FIM}" == "0" || "${P_FIM}" == "0.0" ]]; then
     exit 0
 fi
 
-# O1+: FIM. Train split replays the cached training holes (verified by hash);
-# val samples holes in the held-out video as a reference only.
+# O1+: FIM. Three evaluations, each skipped if its summary already exists:
+#   train          replays the cached training holes (fixed-hole runs only; hash-verified)
+#   train_newholes 4 deterministic new holes per training window, disjoint from any
+#                  cached training hole: known content, unseen cut
+#   val            sampled holes in the held-out video (reference only)
 fim_common=(
     "${MANIFEST}"
     --nal-index-path "${NAL_INDEX}"
@@ -69,9 +72,18 @@ fim_common=(
     --ffmpeg-binary "${FFMPEG_BINARY}"
     --ffprobe-binary "${FFPROBE_BINARY}"
 )
-python -u scripts/byte/eval/eval_fim_avclm.py "${fim_common[@]}" \
-    --eval-split train --hole-set trained --num-clips 1000 \
-    --out-dir "${OUT_DIR}/eval_overfit_fim/${EVAL_CHECKPOINT}/train"
-python -u scripts/byte/eval/eval_fim_avclm.py "${fim_common[@]}" \
-    --eval-split val --hole-set sampled --num-clips 20 \
-    --out-dir "${OUT_DIR}/eval_overfit_fim/${EVAL_CHECKPOINT}/val"
+run_fim_eval() {
+    local name=$1; shift
+    local out="${OUT_DIR}/eval_overfit_fim/${EVAL_CHECKPOINT}/${name}"
+    if [[ -e "${out}/summary.csv" ]]; then
+        echo "[overfit] ${name}: ${out}/summary.csv exists; skipping"
+        return
+    fi
+    python -u scripts/byte/eval/eval_fim_avclm.py "${fim_common[@]}" "$@" --out-dir "${out}"
+}
+if [[ "${FIXED_FIM_HOLES_PER_WINDOW}" != "0" ]]; then
+    run_fim_eval train --eval-split train --hole-set trained --num-clips 1000
+fi
+run_fim_eval train_newholes --eval-split train --hole-set heldout \
+    --heldout-holes-per-window 4 --num-clips 1000
+run_fim_eval val --eval-split val --hole-set sampled --num-clips 20
