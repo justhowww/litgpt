@@ -59,7 +59,11 @@ FIELDS = {
     "eval": {"ffmpeg_binary": "FFMPEG_BINARY", "ffprobe_binary": "FFPROBE_BINARY"},
 }
 # Optional keys, with the default used when a YAML omits them (older configs).
-OPTIONAL_FIELDS = {"fim": {"format": ("FIM_FORMAT", "psm")}}
+OPTIONAL_FIELDS = {
+    "fim": {"format": ("FIM_FORMAT", "psm")},
+    # Space-separated eval_fim_avclm stop modes: learned_eos and/or parser_reconnect.
+    "eval": {"stop_modes": ("EVAL_STOP_MODES", "learned_eos")},
+}
 BOOLEAN_KEYS = {"ACTIVATION_CHECKPOINTING", "COMPILE"}
 
 # Fixed by design: the simplest setup. Not configurable from YAML.
@@ -116,6 +120,9 @@ def load_config(path: Path) -> dict[str, str]:
             else:
                 values[env_name] = str(value)
 
+    stop_modes = values["EVAL_STOP_MODES"].split()
+    if not stop_modes or set(stop_modes) - {"learned_eos", "parser_reconnect"}:
+        raise ValueError("eval.stop_modes must list learned_eos and/or parser_reconnect")
     if values["FIM_FORMAT"] not in {"psm", "spm"}:
         raise ValueError("fim.format must be psm or spm")
     p_fim = float(values["P_FIM"])

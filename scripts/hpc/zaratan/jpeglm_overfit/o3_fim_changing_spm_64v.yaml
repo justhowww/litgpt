@@ -1,0 +1,56 @@
+schema_version: 1
+
+# O3: O2-SPM on 64 training videos (8 held out) instead of 8 (1 held out).
+# First step from memorization toward generalization: fills will start to differ
+# from GT, so evaluate both learned EOS and parser-reconnection stopping and
+# check whether non-GT fills still stop at exactly the hole length.
+# Simplest setup: plain Qwen3 byte transformer (patch 1), one GOP per window,
+# plain next-byte CE over the whole sequence, one A100.
+run:
+  staged_corpus: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm
+  model_tag: byte-jpeglm-overfit-o3-fim-changing-spm-12x768-bytes-ctx16k-72v
+  out_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-overfit-o3-fim-changing-spm-12x768-bytes-ctx16k-72v
+
+model:
+  architecture: qwen3
+  n_layer: 12
+  n_embd: 768
+  n_head: 12
+  raw_context_bytes: 16384    # run F's context: 99.9% of GOPs fit whole
+
+data:
+  max_rows: 72                # first 72 manifest videos
+  val_fraction: 0.12          # -> 8 held-out videos, 64 trained
+  num_workers: 8
+  window_min_frames: 2
+
+fim:
+  p_fim: 1.0
+  format: spm
+  fixed_holes_per_window: 0   # 0 = new hole every access
+  span_loss_weight: 0         # no extra weighting: plain CE
+  eos_aux_loss_weight: 0
+  min_gap: 64
+  max_gap: 600
+
+training:
+  steps: 40000                # ~16 x 40k / ~320 windows = ~2k visits/window (O2: ~8k)
+  warmup_steps: 200
+  global_batch_size: 16
+  micro_batch_size: 4
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 1000
+  save_interval: 5000
+  activation_checkpointing: true
+  compile: true
+
+slurm:
+  account: metzler-prj-cmsc
+  mem: 96G
+  time: "16:00:00"
+
+eval:
+  ffmpeg_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffmpeg
+  ffprobe_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffprobe
+  stop_modes: learned_eos parser_reconnect

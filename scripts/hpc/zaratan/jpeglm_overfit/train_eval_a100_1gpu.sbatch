@@ -45,7 +45,7 @@ fi
 #   train          replays the cached training holes (fixed-hole runs only; hash-verified)
 #   train_newholes 4 deterministic new holes per training window, disjoint from any
 #                  cached training hole: known content, unseen cut
-#   val            sampled holes in the held-out video (reference only)
+#   val            4 deterministic holes per held-out window (new content, new cut)
 fim_common=(
     "${MANIFEST}"
     --nal-index-path "${NAL_INDEX}"
@@ -64,7 +64,7 @@ fim_common=(
     --fim-min-gap "${FIM_MIN_GAP}"
     --fim-max-gap "${FIM_MAX_GAP}"
     --slice-header-guard-bytes 0
-    --stop-modes learned_eos
+    --stop-modes ${EVAL_STOP_MODES:-learned_eos}
     --slice-layout frame
     --temperature 0
     --max-gen-bytes 4096
@@ -86,4 +86,5 @@ if [[ "${FIXED_FIM_HOLES_PER_WINDOW}" != "0" ]]; then
 fi
 run_fim_eval train_newholes --eval-split train --hole-set heldout \
     --heldout-holes-per-window 4 --num-clips 1000
-run_fim_eval val --eval-split val --hole-set sampled --num-clips 20
+run_fim_eval val --eval-split val --hole-set heldout \
+    --heldout-holes-per-window 4 --num-clips 1000
