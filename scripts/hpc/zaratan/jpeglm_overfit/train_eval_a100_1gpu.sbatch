@@ -18,6 +18,11 @@ REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 export REPO_ROOT
 export DEVICES=1 NUM_NODES=1
 EVAL_CHECKPOINT=${OVERFIT_EVAL_CHECKPOINT:-final}
+# Eval-only variants (set at submission; not part of the frozen YAML):
+#   OVERFIT_EVAL_TAG=name      write FIM evals to <eval>_<name>/ instead of <eval>/
+#   OVERFIT_EVAL_MASK=1        constrain generation with the full H.264 mask
+#   OVERFIT_EVAL_STOP_MODES=.. override the YAML's eval.stop_modes
+EVAL_SUFFIX=${OVERFIT_EVAL_TAG:+_${OVERFIT_EVAL_TAG}}
 
 if [[ "${OVERFIT_EVAL_ONLY:-0}" != "1" ]]; then
     source "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_pretrain/train.sh"
@@ -64,7 +69,7 @@ fim_common=(
     --fim-min-gap "${FIM_MIN_GAP}"
     --fim-max-gap "${FIM_MAX_GAP}"
     --slice-header-guard-bytes 0
-    --stop-modes ${EVAL_STOP_MODES:-learned_eos}
+    --stop-modes ${OVERFIT_EVAL_STOP_MODES:-${EVAL_STOP_MODES:-learned_eos}}
     --slice-layout frame
     --temperature 0
     --max-gen-bytes 4096
@@ -72,8 +77,11 @@ fim_common=(
     --ffmpeg-binary "${FFMPEG_BINARY}"
     --ffprobe-binary "${FFPROBE_BINARY}"
 )
+if [[ "${OVERFIT_EVAL_MASK:-0}" == "1" ]]; then
+    fim_common+=(--mask-illegal-bytes)
+fi
 run_fim_eval() {
-    local name=$1; shift
+    local name=$1${EVAL_SUFFIX}; shift
     local out="${OUT_DIR}/eval_overfit_fim/${EVAL_CHECKPOINT}/${name}"
     if [[ -e "${out}/summary.csv" ]]; then
         echo "[overfit] ${name}: ${out}/summary.csv exists; skipping"
