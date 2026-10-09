@@ -1505,6 +1505,8 @@ def _seed_parser_state(
     for byte in sample.bytes_before_hole:
         HM.advance(state, byte)
     state.generation_started = True
+    # The hole lies inside one picture: the fill must not start another one.
+    HM.restrict_fill_to_current_picture(state)
     return state
 
 

@@ -335,6 +335,8 @@ class SPS:
     pic_width_in_mbs: int
     pic_height_in_mbs: int
     chroma_format_idc: int = 1  # 4:2:0 for baseline
+    # DPB size for the sliding window: at most this many short-term references.
+    max_num_ref_frames: int = 16
 
 
 @dataclass
@@ -393,7 +395,7 @@ def parse_sps(reader: BitReader, record: "_Recorder") -> SPS:
         )
         for _ in range(num_ref_frames_in_poc_cycle):
             record.se("offset_for_ref_frame", reader, Category.SPS)
-    record.ue("max_num_ref_frames", reader, Category.SPS)
+    max_num_ref_frames = record.ue("max_num_ref_frames", reader, Category.SPS)
     record.u("gaps_in_frame_num_value_allowed_flag", reader, 1, Category.SPS)
     pic_width_in_mbs = record.ue("pic_width_in_mbs_minus1", reader, Category.SPS) + 1
     pic_height_in_map_units = (
@@ -429,6 +431,7 @@ def parse_sps(reader: BitReader, record: "_Recorder") -> SPS:
         pic_width_in_mbs=pic_width_in_mbs,
         pic_height_in_mbs=pic_height_in_mbs,
         chroma_format_idc=chroma_format_idc,
+        max_num_ref_frames=max_num_ref_frames,
     )
 
 

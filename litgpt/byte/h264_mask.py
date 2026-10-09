@@ -139,6 +139,9 @@ class PictureState:
         picture_mbs = sps.pic_width_in_mbs * sps.pic_height_in_mbs
         new_picture = not self.active or self.picture_complete
         if new_picture:
+            if nal_type == HS.NAL_SLICE_IDR:
+                # An IDR marks every earlier reference picture unused.
+                self.reference_pictures = 0
             self.active = True
             self.picture_complete = False
             self.picture_mbs = picture_mbs
@@ -168,7 +171,11 @@ class PictureState:
         if self.next_first_mb >= picture_mbs:
             self.picture_complete = True
             if nal_ref_idc != 0:
-                self.reference_pictures = min(16, self.reference_pictures + 1)
+                # Sliding-window DPB: only the last max_num_ref_frames short-term
+                # references remain available for prediction.
+                self.reference_pictures = min(
+                    max(1, sps.max_num_ref_frames), self.reference_pictures + 1
+                )
 
 
 @dataclass
@@ -184,6 +191,10 @@ class MaskState:
     picture: PictureState = field(default_factory=PictureState)
     expect_nal_header: bool = False
     generation_started: bool = False
+    # FIM fill inside one picture: how many more start codes may begin a new
+    # picture. None = unlimited (stream generation). Set by
+    # restrict_fill_to_current_picture().
+    new_picture_budget: int | None = None
     # Generation normally restricts a new NAL to the VCL header implied by the
     # tracked picture sequence. Whole-corpus preprocessing instead uses the
     # syntax-only policy because valid streams may insert SPS/PPS/SEI/AUD NALs
@@ -362,6 +373,14 @@ def get_valid_byte_mask(state: MaskState, *, byte_mask_compiler=None) -> list[bo
     )
     if not full_boundary:
         _apply_annexb_mask(state, mask, at_nal_boundary=boundary)
+    if (
+        state.new_picture_budget is not None
+        and state.new_picture_budget <= 0
+        and state.last_two_raw() == (0x00, 0x00)
+        and _next_nal_starts_picture(state)
+    ):
+        # Completing 00 00 01 here would open a new picture inside the hole.
+        mask[0x01] = False
     if state.debug and state.mask_calls % state.debug_every_masks == 0:
         _debug(
             state,
@@ -372,6 +391,40 @@ def get_valid_byte_mask(state: MaskState, *, byte_mask_compiler=None) -> list[bo
             strict=strict,
         )
     return mask
+
+
+def _next_nal_starts_picture(state: MaskState) -> bool:
+    """Whether a start code emitted now would begin a new picture.
+
+    With one slice per picture the current picture is complete as soon as its
+    slice header is parsed, so any later start code begins a new picture. With
+    fixed-MB slices, start codes inside an unfinished picture open its next slice.
+    """
+    return not state.picture.active or state.picture.picture_complete
+
+
+def restrict_fill_to_current_picture(state: MaskState) -> None:
+    """Forbid a FIM fill from starting any picture other than the target one.
+
+    ``state`` must be seeded with the bytes before the hole. The hole lies inside
+    one picture, so the fill may begin a picture only when the hole removed that
+    picture's own start: the prefix ends at (or inside the zero bytes of) the start
+    code after the previous, finished NAL. Once the target picture's start code is
+    behind the prefix, no start code may begin a new picture.
+    """
+    # The prefix ends at a NAL boundary: after a finished slice, or after a
+    # parameter set / SEI (a hole at the start of the first picture).
+    previous_nal_finished = not state.expect_nal_header and (
+        (
+            state.cur_is_vcl
+            and state.automaton is not None
+            and state.automaton.stage == "done"
+        )
+        or (not state.cur_is_vcl and bool(state.cur_nal_bytes))
+    )
+    state.new_picture_budget = (
+        1 if previous_nal_finished and _next_nal_starts_picture(state) else 0
+    )
 
 
 def can_append_bytes(
@@ -438,6 +491,8 @@ def advance(state: MaskState, byte: int) -> None:
 
     tail = state.cur_nal_bytes
     if len(tail) >= 3 and tuple(tail[-3:]) == START_CODE:
+        if state.new_picture_budget is not None and _next_nal_starts_picture(state):
+            state.new_picture_budget -= 1
         sc_len = 4 if len(tail) >= 4 and tuple(tail[-4:]) == (0, 0, 0, 1) else 3
         _close_nal(state, bytes(tail[:-sc_len]))
         state.cur_nal_bytes = bytearray()
