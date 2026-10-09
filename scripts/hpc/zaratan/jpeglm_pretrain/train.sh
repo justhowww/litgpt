@@ -57,6 +57,10 @@ P_FIM=${P_FIM:-0.5}
 FIM_IDR_SAMPLING_PROBABILITY=${FIM_IDR_SAMPLING_PROBABILITY:-}
 # Overfit/debug only: K cached holes per training window (0 = holes change every access).
 FIXED_FIM_HOLES_PER_WINDOW=${FIXED_FIM_HOLES_PER_WINDOW:-0}
+# clip (legacy) or source: keep all clips of one source video in the same split.
+SPLIT_GROUP=${SPLIT_GROUP:-clip}
+# 1 = keep OUT_DIR/best at the lowest validation loss so far.
+SAVE_BEST_VAL=${SAVE_BEST_VAL:-0}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -188,6 +192,7 @@ cmd=(
     --no-region-id
     --no-offset-id
     --split-by-video
+    --split-group "${SPLIT_GROUP}"
     --block-size "${BLOCK_SIZE}"
     --byte-patch-size "${BYTE_PATCH_SIZE}"
     --megabyte-local-layers "${MEGABYTE_LOCAL_LAYERS}"
@@ -232,6 +237,10 @@ if [[ "${ENABLE_LENGTH_BUCKETING}" == "1" ]]; then
         --length-bucketing
         --length-bucket-pool-size "${LENGTH_BUCKET_POOL_SIZE}"
     )
+fi
+
+if [[ "${SAVE_BEST_VAL}" == "1" ]]; then
+    cmd+=(--save-best-val)
 fi
 
 if [[ "${SAVE_FINAL}" == "0" ]]; then

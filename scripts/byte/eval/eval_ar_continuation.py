@@ -1818,7 +1818,14 @@ def decode_h264(
         stderr=result.stderr,
         returncode=result.returncode,
     )
-    if strict and result.returncode != 0:
+    # FFmpeg can report macroblock errors (e.g. an intra mode whose neighbour is
+    # unavailable) and still exit 0 even with -err_detect explode. Strict mode runs
+    # at -loglevel error, so any stderr output is a decoder error.
+    strict_failed = strict and (result.returncode != 0 or bool(result.stderr.strip()))
+    if strict_failed:
+        info["strict_error_reason"] = (
+            "nonzero_exit" if result.returncode != 0 else "stderr_errors"
+        )
         info["status"] = "decoder_error"
         frames = (
             parse_ppm_sequence(result.stdout)

@@ -14,6 +14,8 @@ class TrainArgs:
     """Number of optimizer steps between updates to the single rolling ``latest`` checkpoint"""
     save_final: bool = True
     """Whether to save a final training-state checkpoint after successful completion"""
+    save_best_val: bool = False
+    """Keep ``out_dir/best`` at the checkpoint with the lowest validation loss so far"""
     log_interval: int = 1
     """Number of iterations between logging calls"""
     global_batch_size: int = 64

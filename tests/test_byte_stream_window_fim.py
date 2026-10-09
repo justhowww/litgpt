@@ -713,3 +713,14 @@ def test_hole_spans_many_nals_on_a_per_mb_corpus(tmp_path):
     ds, _ = _dataset(tmp_path, fim_min_gap=60, fim_max_gap=64)
     gap = _meta(ds[0])["fim_gap"]
     assert gap // MB_NAL_BYTES >= 5
+
+
+def test_source_video_id_groups_clips_of_one_source():
+    from litgpt.byte.data import source_video_id
+
+    a = "/data/h264/part1/mixkit_beach_mixkit-aerial-shot-44365_009.h264"
+    b = "/data/h264/part2/mixkit_beach_mixkit-aerial-shot-44365_010.h264"
+    c = "/data/h264/part1/mixkit_beach_mixkit-aerial-shot-44366_009.h264"
+    assert source_video_id(a) == source_video_id(b) == "mixkit_beach_mixkit-aerial-shot-44365"
+    assert source_video_id(c) != source_video_id(a)
+    assert source_video_id("/x/clip.h264") == "clip"

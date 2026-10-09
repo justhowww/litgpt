@@ -17,6 +17,7 @@ from litgpt.byte.mrt import MRTConfig, MRT_RISK_MODES
 from litgpt.byte.data import (
     DATASET_MODES,
     FIM_FORMATS,
+    SPLIT_GROUPS,
     FIM_LOSS_SCOPES,
     REFERENCE_MODES,
     WINDOW_UNITS,
@@ -115,6 +116,11 @@ def parse_args() -> argparse.Namespace:
             "Update one rolling latest checkpoint at this optimizer-step interval; "
             "0 disables it. This is independent of permanent --save-interval milestones."
         ),
+    )
+    parser.add_argument(
+        "--save-best-val",
+        action="store_true",
+        help="Keep OUT_DIR/best at the lowest-validation-loss checkpoint so far.",
     )
     parser.add_argument(
         "--save-final",
@@ -376,6 +382,15 @@ def parse_args() -> argparse.Namespace:
             "Split train/val by source video (h264_path), not by slice. "
             "Eliminates within-video leakage and produces a genuinely held-out "
             "video evaluation set."
+        ),
+    )
+    parser.add_argument(
+        "--split-group",
+        choices=SPLIT_GROUPS,
+        default="clip",
+        help=(
+            "With --split-by-video: clip groups by h264_path; source groups all "
+            "clips cut from one source video (name without the _NNN suffix)."
         ),
     )
     parser.add_argument("--no-region-id", action="store_true")
@@ -733,6 +748,7 @@ def main() -> None:
         default_max_seq_length=args.block_size,
         val_fraction=args.val_fraction,
         split_by_video=args.split_by_video,
+        split_group=args.split_group,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
         window_unit=args.window_unit,
@@ -756,6 +772,7 @@ def main() -> None:
         save_interval=args.save_interval,
         latest_save_interval=args.latest_save_interval or None,
         save_final=args.save_final,
+        save_best_val=args.save_best_val,
         log_interval=1,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,

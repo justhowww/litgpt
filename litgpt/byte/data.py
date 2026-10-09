@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sqlite3
 import time
 from collections import OrderedDict
@@ -67,6 +68,20 @@ FIM_FORMATS = ("bridge", "psm", "spm")
 FIMFormat = Literal["bridge", "psm", "spm"]
 FIM_LOSS_SCOPES = ("span", "full")
 FIMLossScope = Literal["span", "full"]
+SPLIT_GROUPS = ("clip", "source")
+SplitGroup = Literal["clip", "source"]
+_CLIP_SEGMENT_SUFFIX = re.compile(r"_\d+$")
+
+
+def source_video_id(h264_path: str | Path) -> str:
+    """Source video a clip was cut from: its file stem without the ``_NNN`` segment suffix.
+
+    OpenVid cuts one source into several clips (``...-44365_009.h264``,
+    ``..._010.h264``); splitting by clip alone lets one source reach both splits.
+    """
+    return _CLIP_SEGMENT_SUFFIX.sub("", Path(h264_path).stem)
+
+
 DATASET_MODES = ("slice", "window")
 DatasetMode = Literal["slice", "window"]
 WINDOW_UNITS = ("byte_budget", "gop")
@@ -131,6 +146,9 @@ class ByteDataConfig:
     # rather than over individual slice samples, eliminating within-video
     # leakage. val_fraction then denotes the fraction of *videos* held out.
     split_by_video: bool = False
+    # With split_by_video: "clip" groups by h264_path (legacy); "source" groups all
+    # clips cut from one source video so no source reaches both splits.
+    split_group: SplitGroup = "clip"
     seed: int = 42  # Seed for train/val split and deterministic span sampling.
     num_workers: int = 4  # DataLoader workers.
     fim_min_gap: int = 64  # Minimum FIM missing-span length in bytes.
@@ -2392,9 +2410,16 @@ class ByteDataModule(DataModule):
             # no video contributes slices to both partitions. This produces a
             # genuinely held-out video evaluation set, eliminating within-video
             # leakage that slice-level random_split allows.
+            if self.config.split_group not in SPLIT_GROUPS:
+                raise ValueError(f"split_group must be one of {SPLIT_GROUPS}")
+            group_of = (
+                (lambda row: source_video_id(row["h264_path"]))
+                if self.config.split_group == "source"
+                else (lambda row: row["h264_path"])
+            )
             video_to_rows: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
-                video_to_rows.setdefault(row["h264_path"], []).append(row)
+                video_to_rows.setdefault(group_of(row), []).append(row)
             video_ids = sorted(video_to_rows.keys())
             generator = torch.Generator().manual_seed(self.config.seed)
             perm = torch.randperm(len(video_ids), generator=generator).tolist()
@@ -2404,8 +2429,8 @@ class ByteDataModule(DataModule):
                     "Need at least two source videos for video-level split"
                 )
             val_video_ids = {video_ids[i] for i in perm[:n_val]}
-            train_rows = [r for r in rows if r["h264_path"] not in val_video_ids]
-            val_rows = [r for r in rows if r["h264_path"] in val_video_ids]
+            train_rows = [r for r in rows if group_of(r) not in val_video_ids]
+            val_rows = [r for r in rows if group_of(r) in val_video_ids]
             self.train_dataset = _build_dataset(train_rows, training=True)
             self.val_dataset = _build_dataset(val_rows)
             # Separate instances here, so train resamples and val simply does not.
@@ -2506,6 +2531,7 @@ class ByteDataModule(DataModule):
                 else self.max_seq_length * self.config.byte_patch_size - 1
             ),
             "split_by_video": self.config.split_by_video,
+            "split_group": self.config.split_group,
             "val_fraction": self.config.val_fraction,
             "seed": self.config.seed,
             "dataset_mode": self.config.dataset_mode,

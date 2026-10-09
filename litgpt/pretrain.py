@@ -656,6 +656,7 @@ def fit(
     step_ce_count = 0
     fabric.barrier()
     total_t0 = time.perf_counter()
+    best_val_loss = _read_best_val_loss(out_dir) if train.save_best_val else math.inf
 
     last_reconstruction_step = -1
 
@@ -960,6 +961,16 @@ def fit(
             metrics.update(eos_metrics)
             fabric.log_dict(metrics, step=state["step_count"])
             fabric.barrier()
+            if train.save_best_val and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_best_checkpoint(
+                    fabric,
+                    state,
+                    tokenizer_dir,
+                    out_dir,
+                    val_loss,
+                    checkpoint_hparams=checkpoint_hparams,
+                )
 
         milestone_due = (
             train.save_interval is not None
@@ -1197,6 +1208,54 @@ def point_latest_checkpoint_at(fabric, out_dir: Path, checkpoint_dir: Path) -> N
         for candidate in out_dir.glob(".latest-step-*"):
             if candidate != checkpoint_dir:
                 _remove_checkpoint_path(candidate)
+    fabric.barrier()
+
+
+def _read_best_val_loss(out_dir: Path) -> float:
+    """Best validation loss recorded by a previous (resumed) run, or +inf."""
+    record = out_dir / "best" / "best_val.json"
+    if not record.is_file():
+        return math.inf
+    import json
+
+    return float(json.loads(record.read_text())["val_loss"])
+
+
+def save_best_checkpoint(
+    fabric,
+    state,
+    tokenizer_dir,
+    out_dir: Path,
+    val_loss: float,
+    checkpoint_hparams=None,
+) -> None:
+    """Write the new lowest-validation-loss checkpoint, then swap it into ``best``."""
+    import json
+
+    staging = out_dir / ".best-next"
+    if fabric.global_rank == 0:
+        _remove_checkpoint_path(staging)
+    fabric.barrier()
+    save_checkpoint(
+        fabric,
+        state,
+        tokenizer_dir,
+        staging / "lit_model.pth",
+        checkpoint_hparams=checkpoint_hparams,
+    )
+    fabric.barrier()
+    if fabric.global_rank == 0:
+        (staging / "best_val.json").write_text(
+            json.dumps({"step": state["step_count"], "iter": state["iter_num"], "val_loss": val_loss})
+        )
+        best = out_dir / "best"
+        previous = out_dir / ".best-previous"
+        _remove_checkpoint_path(previous)
+        if best.exists():
+            os.replace(best, previous)
+        os.replace(staging, best)
+        _remove_checkpoint_path(previous)
+        fabric.print(f"New best val loss {val_loss:.4f} at step {state['step_count']}: saved {best}")
     fabric.barrier()
 
 

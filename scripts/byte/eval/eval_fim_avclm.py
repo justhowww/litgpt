@@ -70,6 +70,7 @@ from litgpt.byte.data import (  # noqa: E402
     WINDOW_UNITS,
     default_nal_index_path,
     load_manifest_rows,
+    source_video_id,
     load_nal_index,
 )
 from litgpt.byte.megabyte_inference import (  # noqa: E402
@@ -249,12 +250,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-split-file", type=Path, default=None)
     parser.add_argument(
         "--eval-split",
-        choices=("train", "val", "all"),
+        choices=("train", "val", "all", "test"),
         default="train",
         help=(
             "Subset to evaluate. With --train-split-file, train replays the dumped "
             "training windows, val selects the recorded held-out complement, and "
-            "all uses every rebuilt window."
+            "all uses every rebuilt window. test uses the fixed --test-rows range, "
+            "independent of any run's training split."
+        ),
+    )
+    parser.add_argument(
+        "--test-rows",
+        type=int,
+        nargs=2,
+        metavar=("START", "END"),
+        default=None,
+        help=(
+            "With --eval-split test: usable manifest rows [START, END). Clips whose "
+            "source video also appears in rows [0, START) are dropped, so the set is "
+            "source-disjoint from any run trained on the first <= START rows and "
+            "identical for every model."
         ),
     )
     parser.add_argument("--num-clips", type=int, default=20)
@@ -467,6 +482,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.max_gen_bytes <= 0:
         parser.error("--max-gen-bytes must be positive")
+    if (args.eval_split == "test") != (args.test_rows is not None):
+        parser.error("--eval-split test and --test-rows START END go together")
+    if args.test_rows is not None and not 0 <= args.test_rows[0] < args.test_rows[1]:
+        parser.error("--test-rows needs 0 <= START < END")
     if args.heldout_holes_per_window <= 0:
         parser.error("--heldout-holes-per-window must be positive")
     if not 0.0 <= args.corr_pos <= 1.0:
@@ -858,11 +877,27 @@ def _load_eval_dataset(
 ) -> ByteStreamWindowDataset:
     """Load the manifest/index and rebuild the training-time window dataset."""
 
-    rows = load_manifest_rows(
-        args.manifest,
-        max_rows=args.max_manifest_rows or None,
-        report_progress=True,
-    )
+    if args.eval_split == "test":
+        start, end = args.test_rows
+        all_rows = load_manifest_rows(args.manifest, max_rows=end, report_progress=True)
+        earlier_sources = {source_video_id(r["h264_path"]) for r in all_rows[:start]}
+        candidates = all_rows[start:end]
+        rows = [
+            r for r in candidates if source_video_id(r["h264_path"]) not in earlier_sources
+        ]
+        print(
+            f"test rows [{start}, {end}): {len(rows)}/{len(candidates)} clips kept "
+            f"after dropping sources seen in rows [0, {start})",
+            flush=True,
+        )
+        if not rows:
+            raise RuntimeError("--test-rows selected no source-disjoint clips")
+    else:
+        rows = load_manifest_rows(
+            args.manifest,
+            max_rows=args.max_manifest_rows or None,
+            report_progress=True,
+        )
     index_path = args.nal_index_path or default_nal_index_path(args.manifest)
     nal_index = (
         load_nal_index(index_path, args.manifest, rows)
@@ -898,6 +933,11 @@ def _select_eval_windows(
     """Select dataset windows using the recorded split or deterministic split logic."""
 
     fixed_holes: FixedHoleMap = {}
+    if args.eval_split == "test":
+        # The dataset was built from the fixed test rows only; use every window.
+        indices = list(range(len(dataset.samples)))
+        print(f"test split: {len(indices)} windows", flush=True)
+        return indices, fixed_holes
     if args.train_split_file is not None:
         split_metadata = json.loads(
             args.train_split_file.read_text(encoding="utf-8")
@@ -1891,6 +1931,14 @@ def teacher_forced_span_metrics(
 _INDEX_RE = re.compile(r"\[\d+\]")
 
 
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
 def byte_exact_diagnostics(sample: WindowFimSample, generated: bytes) -> dict[str, Any]:
     """Compare the generated middle with the removed GT bytes, byte for byte.
 
@@ -2266,6 +2314,24 @@ def summarize(
         "end_to_end_success_rate": end_to_end_success_rate,
         "termination_success_rate": termination_success_rate,
         "repair_decode_success_rate": repair_decode_success_rate,
+        "baseline_kind_hist": dict(
+            Counter(r.get("baseline_kind") or "none" for r in details).most_common()
+        ),
+        "repair_psnr_lift_vs_baseline_db_mean": AR.mean(
+            [float(r["repair_psnr_lift_vs_baseline_db"]) for r in details
+             if r.get("repair_psnr_lift_vs_baseline_db") is not None]
+        ),
+        "repair_psnr_lift_vs_baseline_db_median": _median(
+            [float(r["repair_psnr_lift_vs_baseline_db"]) for r in details
+             if r.get("repair_psnr_lift_vs_baseline_db") is not None]
+        ),
+        "repair_beats_baseline_rate": AR.mean(
+            [1.0 if float(r["repair_psnr_lift_vs_baseline_db"]) > 0 else 0.0
+             for r in details if r.get("repair_psnr_lift_vs_baseline_db") is not None]
+        ),
+        "repair_vs_baseline_count": sum(
+            1 for r in details if r.get("repair_psnr_lift_vs_baseline_db") is not None
+        ),
         "byte_exact_rate": AR.mean(
             [1.0 if r.get("byte_exact") else 0.0 for r in details]
         ),
@@ -2928,6 +2994,31 @@ def decode_and_score_repair(
             gt_frames[target_index], corrupted_concealed_frames[target_index]
         )
 
+    # Baseline for every fill: FFmpeg's concealed target frame when it outputs one.
+    # When the hole removes the frame's start code or slice header, FFmpeg never sees
+    # the frame and outputs nothing for it; a player then keeps showing the last
+    # decoded frame, so that frame is the baseline.
+    baseline_frame = None
+    if corrupted_target_available:
+        baseline_frame = corrupted_concealed_frames[target_index]
+        row["baseline_kind"] = "ffmpeg_concealment"
+    elif (
+        target_index > 0
+        and len(corrupted_concealed_frames) == target_index
+        and corrupted_concealed_frames[target_index - 1].shape
+        == gt_frames[target_index].shape
+    ):
+        baseline_frame = corrupted_concealed_frames[target_index - 1]
+        row["baseline_kind"] = "previous_frame"
+    else:
+        row["baseline_kind"] = None
+    if baseline_frame is not None:
+        baseline_psnr = AR.image_psnr(gt_frames[target_index], baseline_frame)
+        row["baseline_psnr"] = (
+            AR.PSNR_PERFECT_CAP if baseline_psnr == float("inf") else baseline_psnr
+        )
+        row["baseline_ssim"] = AR.image_ssim(gt_frames[target_index], baseline_frame)
+
     row["real_appearance_features"] = AR.appearance_features(gt_frames[target_index])
     if target_index > 0:
         row["real_motion_features"] = AR.motion_features(
@@ -2953,6 +3044,13 @@ def decode_and_score_repair(
     if row.get("corrupted_concealed_ssim") is not None:
         row["repair_ssim_lift"] = (
             row["cont_ssim_mean"] - row["corrupted_concealed_ssim"]
+        )
+    if row.get("baseline_psnr") is not None:
+        row["repair_psnr_lift_vs_baseline_db"] = (
+            row["cont_psnr_mean"] - row["baseline_psnr"]
+        )
+        row["repair_ssim_lift_vs_baseline"] = (
+            row["cont_ssim_mean"] - row["baseline_ssim"]
         )
     row["gen_appearance_features"] = AR.appearance_features(model_frames[target_index])
     if target_index > 0:

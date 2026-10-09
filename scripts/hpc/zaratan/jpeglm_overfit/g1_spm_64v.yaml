@@ -1,0 +1,61 @@
+schema_version: 1
+
+# Generalization ladder (G1): ~64 training videos (O3's data), ~320 windows; 3k steps (~150 epochs).
+# Same model and objective as the overfit ladder's O3 (plain byte transformer,
+# SPM, changing holes, plain CE). Differences: split by source video, keep the
+# best-validation checkpoint, and evaluate it on one fixed test set shared by
+# every G run (usable manifest rows 70000-70400, sources seen in
+# earlier rows dropped), learned EOS, unmasked (masked eval added later).
+run:
+  staged_corpus: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm
+  model_tag: byte-jpeglm-gen-g1-spm-64v-12x768-bytes-ctx16k
+  out_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-gen-g1-spm-64v-12x768-bytes-ctx16k
+
+model:
+  architecture: qwen3
+  n_layer: 12
+  n_embd: 768
+  n_head: 12
+  raw_context_bytes: 16384
+
+data:
+  max_rows: 72
+  val_fraction: 0.112          # held-out sources, used only to pick the best checkpoint
+  split_group: source
+  num_workers: 8
+  window_min_frames: 2
+
+fim:
+  p_fim: 1.0
+  format: spm
+  fixed_holes_per_window: 0   # new hole every access
+  span_loss_weight: 0
+  eos_aux_loss_weight: 0
+  min_gap: 64
+  max_gap: 600
+
+training:
+  steps: 3000
+  warmup_steps: 200
+  global_batch_size: 16
+  micro_batch_size: 4
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 100
+  save_interval: 3000
+  save_best_val: true
+  activation_checkpointing: true
+  compile: true
+
+slurm:
+  account: metzler-prj-cmsc
+  mem: 96G
+  time: "06:00:00"
+
+eval:
+  ffmpeg_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffmpeg
+  ffprobe_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffprobe
+  stop_modes: learned_eos
+  checkpoint: best
+  test_rows: "70000 70400"
+  mask_modes: "off"            # masked eval later, eval-only, once the mask handles intra availability

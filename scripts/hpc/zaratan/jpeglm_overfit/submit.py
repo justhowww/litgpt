@@ -61,8 +61,21 @@ FIELDS = {
 # Optional keys, with the default used when a YAML omits them (older configs).
 OPTIONAL_FIELDS = {
     "fim": {"format": ("FIM_FORMAT", "psm")},
-    # Space-separated eval_fim_avclm stop modes: learned_eos and/or parser_reconnect.
-    "eval": {"stop_modes": ("EVAL_STOP_MODES", "learned_eos")},
+    # clip (legacy) or source: keep every clip of one source video in one split.
+    "data": {"split_group": ("SPLIT_GROUP", "clip")},
+    # Keep OUT_DIR/best at the lowest validation loss.
+    "training": {"save_best_val": ("SAVE_BEST_VAL", False)},
+    "eval": {
+        # Space-separated eval_fim_avclm stop modes: learned_eos and/or parser_reconnect.
+        "stop_modes": ("EVAL_STOP_MODES", "learned_eos"),
+        # Checkpoint evaluated after training: final, best, or step-XXXXXXXX.
+        "checkpoint": ("EVAL_DEFAULT_CHECKPOINT", "final"),
+        # "START END" usable manifest rows of a fixed, source-disjoint test set.
+        # When set, only the test set is evaluated.
+        "test_rows": ("EVAL_TEST_ROWS", ""),
+        # Space-separated: off and/or on (generation with the H.264 mask).
+        "mask_modes": ("EVAL_MASK_MODES", "off"),
+    },
 }
 BOOLEAN_KEYS = {"ACTIVATION_CHECKPOINTING", "COMPILE"}
 
@@ -108,7 +121,16 @@ def load_config(path: Path) -> dict[str, str]:
                 f"unknown {sorted(got - set(names) - set(optional))}"
             )
         for key, (env_name, default) in optional.items():
-            values[env_name] = str(section.get(key, default))
+            value = section.get(key, default)
+            if isinstance(default, bool):
+                if not isinstance(value, bool):
+                    raise ValueError(f"{group}.{key} must be true or false")
+                values[env_name] = "1" if value else "0"
+            elif isinstance(value, bool):
+                # YAML reads bare off/on/yes/no as booleans.
+                raise ValueError(f'{group}.{key}: quote the value, e.g. "off"')
+            else:
+                values[env_name] = str(value)
         for key, env_name in names.items():
             value = section[key]
             if env_name in BOOLEAN_KEYS:
@@ -123,6 +145,21 @@ def load_config(path: Path) -> dict[str, str]:
     stop_modes = values["EVAL_STOP_MODES"].split()
     if not stop_modes or set(stop_modes) - {"learned_eos", "parser_reconnect"}:
         raise ValueError("eval.stop_modes must list learned_eos and/or parser_reconnect")
+    if values["SPLIT_GROUP"] not in {"clip", "source"}:
+        raise ValueError("data.split_group must be clip or source")
+    if not re.fullmatch(r"final|best|step-\d{8}", values["EVAL_DEFAULT_CHECKPOINT"]):
+        raise ValueError("eval.checkpoint must be final, best or step-XXXXXXXX")
+    if values["EVAL_DEFAULT_CHECKPOINT"] == "best" and values["SAVE_BEST_VAL"] != "1":
+        raise ValueError("eval.checkpoint: best requires training.save_best_val: true")
+    if values["EVAL_TEST_ROWS"]:
+        bounds = values["EVAL_TEST_ROWS"].split()
+        if len(bounds) != 2 or not all(b.isdigit() for b in bounds) or int(bounds[0]) >= int(bounds[1]):
+            raise ValueError('eval.test_rows must be "START END" with START < END')
+        if int(bounds[0]) < int(values["MAX_ROWS"]):
+            raise ValueError("eval.test_rows must start at or after data.max_rows")
+    mask_modes = values["EVAL_MASK_MODES"].split()
+    if not mask_modes or set(mask_modes) - {"off", "on"}:
+        raise ValueError("eval.mask_modes must list off and/or on")
     if values["FIM_FORMAT"] not in {"psm", "spm"}:
         raise ValueError("fim.format must be psm or spm")
     p_fim = float(values["P_FIM"])

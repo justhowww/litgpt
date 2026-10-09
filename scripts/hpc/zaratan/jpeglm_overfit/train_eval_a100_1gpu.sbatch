@@ -17,7 +17,7 @@ set -euo pipefail
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 export REPO_ROOT
 export DEVICES=1 NUM_NODES=1
-EVAL_CHECKPOINT=${OVERFIT_EVAL_CHECKPOINT:-final}
+EVAL_CHECKPOINT=${OVERFIT_EVAL_CHECKPOINT:-${EVAL_DEFAULT_CHECKPOINT:-final}}
 # Eval-only variants (set at submission; not part of the frozen YAML):
 #   OVERFIT_EVAL_TAG=name      write FIM evals to <eval>_<name>/ instead of <eval>/
 #   OVERFIT_EVAL_MASK=1        constrain generation with the full H.264 mask
@@ -77,18 +77,35 @@ fim_common=(
     --ffmpeg-binary "${FFMPEG_BINARY}"
     --ffprobe-binary "${FFPROBE_BINARY}"
 )
-if [[ "${OVERFIT_EVAL_MASK:-0}" == "1" ]]; then
-    fim_common+=(--mask-illegal-bytes)
-fi
+# Mask modes: OVERFIT_EVAL_MASK=1 (legacy override) means "on" only; otherwise the
+# YAML's eval.mask_modes. Masked evals write to <name>_masked.
+MASK_MODES=${EVAL_MASK_MODES:-off}
+if [[ "${OVERFIT_EVAL_MASK:-0}" == "1" ]]; then MASK_MODES=on; fi
 run_fim_eval() {
-    local name=$1${EVAL_SUFFIX}; shift
-    local out="${OUT_DIR}/eval_overfit_fim/${EVAL_CHECKPOINT}/${name}"
-    if [[ -e "${out}/summary.csv" ]]; then
-        echo "[overfit] ${name}: ${out}/summary.csv exists; skipping"
-        return
-    fi
-    python -u scripts/byte/eval/eval_fim_avclm.py "${fim_common[@]}" "$@" --out-dir "${out}"
+    local base=$1; shift
+    local mode name out
+    for mode in ${MASK_MODES}; do
+        name=${base}${EVAL_SUFFIX}
+        local extra=()
+        if [[ "${mode}" == "on" ]]; then
+            if [[ -z "${OVERFIT_EVAL_TAG:-}" ]]; then name=${base}_masked; fi
+            extra=(--mask-illegal-bytes)
+        fi
+        out="${OUT_DIR}/eval_overfit_fim/${EVAL_CHECKPOINT}/${name}"
+        if [[ -e "${out}/summary.csv" ]]; then
+            echo "[overfit] ${name}: ${out}/summary.csv exists; skipping"
+            continue
+        fi
+        python -u scripts/byte/eval/eval_fim_avclm.py "${fim_common[@]}" ${extra[@]+"${extra[@]}"} "$@" --out-dir "${out}"
+    done
 }
+if [[ -n "${EVAL_TEST_ROWS:-}" ]]; then
+    # Fixed source-disjoint test set, identical for every model.
+    read -r test_start test_end <<< "${EVAL_TEST_ROWS}"
+    run_fim_eval test --eval-split test --test-rows "${test_start}" "${test_end}" \
+        --hole-set heldout --heldout-holes-per-window 4 --num-clips 1000
+    exit 0
+fi
 if [[ "${FIXED_FIM_HOLES_PER_WINDOW}" != "0" ]]; then
     run_fim_eval train --eval-split train --hole-set trained --num-clips 1000
 fi
