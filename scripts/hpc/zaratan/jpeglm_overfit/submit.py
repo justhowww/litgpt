@@ -228,6 +228,12 @@ def main() -> None:
     for key in ("AFTER_JOBID", "FIM_IDR_SAMPLING_PROBABILITY", "SYNTAX_MASK_DIR", "SYNTAX_LOSS_WEIGHT"):
         environment.pop(key, None)
     environment.update(values)
+    # Eval-only reruns may need more wall-clock than training did; the YAML stays frozen.
+    time_override = os.environ.get("OVERFIT_SBATCH_TIME")
+    if time_override:
+        if not re.fullmatch(r"(\d+-)?\d{1,2}:\d{2}:\d{2}", time_override):
+            raise ValueError("OVERFIT_SBATCH_TIME must look like 12:00:00 or 1-00:00:00")
+        environment["SBATCH_TIME"] = time_override
     subprocess.run(["bash", str(submit)], env=environment, check=True)
 
 
