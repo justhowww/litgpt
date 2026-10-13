@@ -1506,7 +1506,7 @@ def _seed_parser_state(
         HM.advance(state, byte)
     state.generation_started = True
     # The hole lies inside one picture: the fill must not start another one.
-    HM.restrict_fill_to_current_picture(state)
+    HM.restrict_fill_to_current_picture(state, suffix=sample.bytes_after_hole)
     return state
 
 
@@ -1521,6 +1521,49 @@ def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int | None) 
         if state.automaton_unknown:
             return False
     return HM.can_append_bytes(state, sample.bytes_after_hole, require_complete=True)
+
+
+def fill_reconnection(
+    sample: WindowFimSample, fill: bytes, *, slice_max_mbs: int | None
+) -> str:
+    """How a fill relates to the received suffix, judged by our H.264 parser.
+
+    reconnects          the suffix parses after the fill to the end of the picture:
+                        a repair that keeps the received data
+    completes_picture   the fill itself finishes the picture although received slice
+                        data follows; a decoder then drops the suffix
+    suffix_rejected     the fill is legal but the suffix does not continue it
+    fill_illegal        the parser rejects the fill itself
+    FFmpeg can decode the last three cleanly, so only ``reconnects`` is a repair.
+    """
+    state = _seed_parser_state(sample, slice_max_mbs=slice_max_mbs)
+    state.forbid_slice_end = None  # classify; do not constrain
+    for byte in fill:
+        if not HM.get_valid_byte_mask(state)[byte]:
+            return "fill_illegal"
+        HM.advance(state, byte)
+        if state.automaton_unknown:
+            return "fill_illegal"
+    suffix = sample.bytes_after_hole
+    if (
+        state.cur_is_vcl
+        and state.automaton is not None
+        and state.automaton.stage == "done"
+        and bytes(suffix).rstrip(b"\x00")
+        and not bytes(suffix).startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01"))
+    ):
+        return "completes_picture"
+    if HM.can_append_bytes(state, suffix, require_complete=True):
+        return "reconnects"
+    return "suffix_rejected"
+
+
+def _slice_max_mbs(args: argparse.Namespace) -> int | None:
+    return (
+        HM.slice_max_mbs_for_layout(args.slice_layout)
+        if args.slice_layout == HM.SLICE_LAYOUT_FRAME
+        else args.slice_max_mbs
+    )
 
 
 def _termination_succeeded(stop_mode: str, stop_reason: str) -> bool | None:
@@ -2316,6 +2359,27 @@ def summarize(
         "end_to_end_success_rate": end_to_end_success_rate,
         "termination_success_rate": termination_success_rate,
         "repair_decode_success_rate": repair_decode_success_rate,
+        "fill_reconnection_hist": dict(
+            Counter(r.get("fill_reconnection") or "none" for r in details).most_common()
+        ),
+        "reconnect_rate": AR.mean(
+            [1.0 if r.get("fill_reconnects") else 0.0 for r in details]
+        ),
+        # A repair: the fill reconnects to the received suffix AND decodes strictly.
+        "repair_rate": AR.mean(
+            [1.0 if r.get("fill_reconnects") and r.get("strict_valid") else 0.0
+             for r in details]
+        ),
+        "repair_lift_vs_baseline_db_median": _median(
+            [float(r["repair_psnr_lift_vs_baseline_db"]) for r in details
+             if r.get("fill_reconnects") and r.get("strict_valid")
+             and r.get("repair_psnr_lift_vs_baseline_db") is not None]
+        ),
+        "repair_beats_baseline_count": sum(
+            1 for r in details
+            if r.get("fill_reconnects") and r.get("strict_valid")
+            and (r.get("repair_psnr_lift_vs_baseline_db") or 0.0) > 0
+        ),
         "baseline_kind_hist": dict(
             Counter(r.get("baseline_kind") or "none" for r in details).most_common()
         ),
@@ -2904,6 +2968,10 @@ def build_repair_result_row(
         "corrupted_concealed_ffmpeg_decode": corrupted_concealed_decode,
     }
     row.update(byte_exact_diagnostics(sample, result.data))
+    row["fill_reconnection"] = fill_reconnection(
+        sample, result.data, slice_max_mbs=_slice_max_mbs(args)
+    )
+    row["fill_reconnects"] = row["fill_reconnection"] == "reconnects"
     if teacher_forced_metrics is not None:
         row.update(teacher_forced_metrics)
     return row, model_stream

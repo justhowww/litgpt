@@ -195,6 +195,10 @@ class MaskState:
     # picture. None = unlimited (stream generation). Set by
     # restrict_fill_to_current_picture().
     new_picture_budget: int | None = None
+    # FIM fill followed by received slice data: None, "trailing" (the suffix holds
+    # macroblock data, so the fill may not consume the last macroblock) or "done"
+    # (the suffix may be just the stop-bit byte, so the fill may not end the NAL).
+    forbid_slice_end: str | None = None
     # Generation normally restricts a new NAL to the VCL header implied by the
     # tracked picture sequence. Whole-corpus preprocessing instead uses the
     # syntax-only policy because valid streams may insert SPS/PPS/SEI/AUD NALs
@@ -328,8 +332,12 @@ def get_valid_byte_mask(state: MaskState, *, byte_mask_compiler=None) -> list[bo
         not state.residual_only or auto.ae_tag in _RESIDUAL_TAGS
     )
     if should_compile:
-        if byte_mask_compiler is None:
-            mask = HA.compile_byte_mask(auto, residual_only=state.residual_only)
+        if byte_mask_compiler is None or state.forbid_slice_end is not None:
+            mask = HA.compile_byte_mask(
+                auto,
+                residual_only=state.residual_only,
+                forbid_end=state.forbid_slice_end,
+            )
         else:
             mask = byte_mask_compiler.compile_byte_mask(
                 auto, residual_only=state.residual_only
@@ -403,7 +411,9 @@ def _next_nal_starts_picture(state: MaskState) -> bool:
     return not state.picture.active or state.picture.picture_complete
 
 
-def restrict_fill_to_current_picture(state: MaskState) -> None:
+def restrict_fill_to_current_picture(
+    state: MaskState, suffix: bytes | bytearray | None = None
+) -> None:
     """Forbid a FIM fill from starting any picture other than the target one.
 
     ``state`` must be seeded with the bytes before the hole. The hole lies inside
@@ -425,6 +435,19 @@ def restrict_fill_to_current_picture(state: MaskState) -> None:
     state.new_picture_budget = (
         1 if previous_nal_finished and _next_nal_starts_picture(state) else 0
     )
+    # Received slice data after the hole: the fill must hand over to it instead of
+    # finishing the picture itself. Trailing bits are one byte (stop bit + zero
+    # alignment) plus optional zero bytes, so more than one non-zero suffix byte
+    # means the suffix still carries macroblock data. Only the target picture's
+    # own slice is restricted; a suffix that begins with a start code is untouched.
+    payload = bytes(suffix or b"")
+    state.forbid_slice_end = None
+    if payload and not payload.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
+        nonzero = len(payload.rstrip(b"\x00"))
+        if nonzero > 1:
+            state.forbid_slice_end = "trailing"
+        elif nonzero == 1:
+            state.forbid_slice_end = "done"
 
 
 def can_append_bytes(
@@ -445,6 +468,8 @@ def can_append_bytes(
     the end of the repaired frame.
     """
     probe = deepcopy(state)
+    # The received suffix itself ends the slice; the fill-only rule does not apply.
+    probe.forbid_slice_end = None
     for byte in data:
         allowed = get_valid_byte_mask(probe)
         if not allowed[byte]:

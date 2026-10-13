@@ -45,12 +45,12 @@ def _vcl_starts(stream: bytes) -> list[int]:
     return starts
 
 
-def _seed(prefix: bytes) -> HM.MaskState:
+def _seed(prefix: bytes, suffix: bytes | None = None) -> HM.MaskState:
     state = HM.MaskState(slice_max_mbs=None, fail_closed=True)
     for byte in prefix:
         HM.advance(state, byte)
     state.generation_started = True
-    HM.restrict_fill_to_current_picture(state)
+    HM.restrict_fill_to_current_picture(state, suffix=suffix)
     return state
 
 
@@ -67,7 +67,7 @@ def test_hole_inside_a_frame_accepts_gt_and_forbids_a_new_picture():
     frames = _vcl_starts(stream)
     lo, hi = frames[3], frames[4]
     split = lo + (hi - lo) // 2  # inside frame 3's slice data
-    state = _seed(stream[:split])
+    state = _seed(stream[:split], suffix=b"")  # hole runs to the frame end
     assert state.new_picture_budget == 0
 
     # The ground-truth rest of the frame is accepted and completes the picture.
@@ -100,6 +100,23 @@ def test_hole_at_the_idr_start_after_parameter_sets(offset):
     state = _seed(stream[: lo + offset])
     assert state.new_picture_budget == 1
     assert HM.can_append_bytes(state, stream[lo + offset : hi], require_complete=True)
+
+
+def test_fill_may_not_finish_the_frame_when_received_data_follows():
+    stream = _encode()
+    frames = _vcl_starts(stream)
+    lo, hi = frames[3], frames[4]
+    split = lo + (hi - lo) // 3
+    gap = max(1, (hi - split) // 2)
+    suffix = stream[split + gap : hi]
+    state = _seed(stream[:split], suffix=suffix)
+    assert state.forbid_slice_end == "trailing"
+    # The true middle is a legal fill and the received suffix reconnects after it.
+    probe = _seed(stream[:split], suffix=suffix)
+    assert _feed(probe, stream[split : split + gap]) is None
+    assert HM.can_append_bytes(probe, suffix, require_complete=True)
+    # Writing the whole rest of the frame as the fill is rejected before it ends.
+    assert _feed(state, stream[split:hi]) is not None
 
 
 def test_reference_count_is_bounded_by_max_num_ref_frames():

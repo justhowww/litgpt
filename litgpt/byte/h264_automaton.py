@@ -1274,13 +1274,25 @@ def _se(k: int) -> int:
 
 
 # --- byte-mask compilation --------------------------------------------------
+_FORBIDDEN_END_STAGES = {None: (), "trailing": ("trailing", DONE), "done": (DONE,)}
+
+
 def compile_byte_mask(
-    auto, *, residual_only: bool = False, transition_counter=None
+    auto,
+    *,
+    residual_only: bool = False,
+    transition_counter=None,
+    forbid_end: str | None = None,
 ) -> list:
     """bool[256]: which next emitted byte keeps the RBSP grammar legal, checked by
     chaining through element boundaries within the byte (strict). Caller ANDs Layer-1
     Annex-B on top. Uses a fresh overlay so lookahead nnz writes don't touch the grid.
+
+    ``forbid_end`` prunes bit paths that finish the slice: "trailing" forbids
+    consuming the last macroblock (and anything after), "done" forbids completing
+    rbsp_trailing_bits. A FIM fill uses it when received slice data follows the hole.
     """
+    forbidden = _FORBIDDEN_END_STAGES[forbid_end]
     mask = [False] * 256
     root = auto.clone()
     if hasattr(root, "prepare_lookahead"):
@@ -1295,6 +1307,8 @@ def compile_byte_mask(
                 transition_counter()
             st = child.consume_bit(bit)
             if st == INVALID:
+                continue
+            if forbidden and (st == DONE or child.stage in forbidden):
                 continue
             nxt = (prefix << 1) | bit
             if depth + 1 == 8:
