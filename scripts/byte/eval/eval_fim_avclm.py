@@ -421,6 +421,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=1,
+        help=(
+            "Best-of-N repair search. Candidate 0 uses --temperature/--top-k/--top-p "
+            "(greedy by default); if it does not reconnect to the received suffix, up "
+            "to N-1 sampled candidates (--sample-temperature, --sample-top-p) are "
+            "tried and the first that reconnects is kept. The check uses only the "
+            "received suffix, never the ground truth. 1 = no search."
+        ),
+    )
+    parser.add_argument("--sample-temperature", type=float, default=1.0)
+    parser.add_argument("--sample-top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
@@ -1523,6 +1537,49 @@ def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int | None) 
     return HM.can_append_bytes(state, sample.bytes_after_hole, require_complete=True)
 
 
+def _generate_with_search(
+    args: argparse.Namespace,
+    model: nn.Module,
+    sample: WindowFimSample,
+    device: torch.device,
+    *,
+    sample_id: int,
+    stop_mode: str,
+    slice_max_mbs: int | None,
+) -> tuple["GenerationResult | None", dict[str, Any]]:
+    """Greedy candidate first; with --num-samples > 1, sample until one reconnects."""
+    common = dict(
+        stop_mode=stop_mode,
+        max_gen_bytes=args.max_gen_bytes,
+        mask_illegal_bytes=args.mask_illegal_bytes,
+        slice_max_mbs=slice_max_mbs,
+    )
+    first = generate_span(
+        model, sample, device,
+        temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, **common,
+    )
+    info: dict[str, Any] = {"search_candidates_tried": 1, "search_selected": None}
+    if first is None:
+        return None, info
+    if fill_reconnection(sample, first.data, slice_max_mbs=slice_max_mbs) == "reconnects":
+        info["search_selected"] = 0
+        return first, info
+    for k in range(1, max(1, int(args.num_samples))):
+        torch.manual_seed(int(args.seed) * 1_000_003 + sample_id * 1_009 + k)
+        candidate = generate_span(
+            model, sample, device,
+            temperature=args.sample_temperature, top_k=0, top_p=args.sample_top_p,
+            **common,
+        )
+        info["search_candidates_tried"] = k + 1
+        if candidate is None:
+            continue
+        if fill_reconnection(sample, candidate.data, slice_max_mbs=slice_max_mbs) == "reconnects":
+            info["search_selected"] = k
+            return candidate, info
+    return first, info
+
+
 def fill_reconnection(
     sample: WindowFimSample, fill: bytes, *, slice_max_mbs: int | None
 ) -> str:
@@ -2359,6 +2416,15 @@ def summarize(
         "end_to_end_success_rate": end_to_end_success_rate,
         "termination_success_rate": termination_success_rate,
         "repair_decode_success_rate": repair_decode_success_rate,
+        "search_selected_hist": dict(
+            Counter(
+                str(r.get("search_selected")) for r in details if "search_selected" in r
+            ).most_common()
+        ),
+        "search_candidates_tried_mean": AR.mean(
+            [float(r["search_candidates_tried"]) for r in details
+             if r.get("search_candidates_tried") is not None]
+        ),
         "fill_reconnection_hist": dict(
             Counter(r.get("fill_reconnection") or "none" for r in details).most_common()
         ),
@@ -3273,16 +3339,13 @@ def evaluate_stop_mode(
                 }
             )
             continue
-        result = generate_span(
+        result, search_info = _generate_with_search(
+            args,
             model,
             sample,
             device,
+            sample_id=sample_id,
             stop_mode=stop_mode,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            max_gen_bytes=args.max_gen_bytes,
-            mask_illegal_bytes=args.mask_illegal_bytes,
             slice_max_mbs=slice_max_mbs,
         )
         if result is None:
@@ -3309,6 +3372,7 @@ def evaluate_stop_mode(
             corrupted_concealed_status=corrupted_concealed_status,
             corrupted_concealed_decode=corrupted_concealed_decode,
         )
+        row.update(search_info)
         if args.save_streams:
             row.update(
                 save_repair_streams(

@@ -22,6 +22,8 @@ EVAL_CHECKPOINT=${OVERFIT_EVAL_CHECKPOINT:-${EVAL_DEFAULT_CHECKPOINT:-final}}
 #   OVERFIT_EVAL_TAG=name      write FIM evals to <eval>_<name>/ instead of <eval>/
 #   OVERFIT_EVAL_MASK=1        constrain generation with the full H.264 mask
 #   OVERFIT_EVAL_STOP_MODES=.. override the YAML's eval.stop_modes
+#   OVERFIT_EVAL_NUM_SAMPLES=N best-of-N repair search (1 = greedy only)
+#   OVERFIT_EVAL_NUM_CLIPS=N   cap on evaluated cuts (default 1000)
 EVAL_SUFFIX=${OVERFIT_EVAL_TAG:+_${OVERFIT_EVAL_TAG}}
 
 if [[ "${OVERFIT_EVAL_ONLY:-0}" != "1" ]]; then
@@ -73,6 +75,7 @@ fim_common=(
     --slice-layout frame
     --temperature 0
     --max-gen-bytes 4096
+    --num-samples "${OVERFIT_EVAL_NUM_SAMPLES:-1}"
     --num-visualizations 4
     --ffmpeg-binary "${FFMPEG_BINARY}"
     --ffprobe-binary "${FFPROBE_BINARY}"
@@ -103,7 +106,7 @@ if [[ -n "${EVAL_TEST_ROWS:-}" ]]; then
     # Fixed source-disjoint test set, identical for every model.
     read -r test_start test_end <<< "${EVAL_TEST_ROWS}"
     run_fim_eval test --eval-split test --test-rows "${test_start}" "${test_end}" \
-        --hole-set heldout --heldout-holes-per-window 4 --num-clips 1000
+        --hole-set heldout --heldout-holes-per-window 4 --num-clips "${OVERFIT_EVAL_NUM_CLIPS:-1000}"
     exit 0
 fi
 if [[ "${FIXED_FIM_HOLES_PER_WINDOW}" != "0" ]]; then
