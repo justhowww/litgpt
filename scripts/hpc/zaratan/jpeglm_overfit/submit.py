@@ -60,7 +60,14 @@ FIELDS = {
 }
 # Optional keys, with the default used when a YAML omits them (older configs).
 OPTIONAL_FIELDS = {
-    "fim": {"format": ("FIM_FORMAT", "psm")},
+    "fim": {
+        "format": ("FIM_FORMAT", "psm"),
+        # middle: reconnect to the received suffix; to_frame_end: regenerate the
+        # hole and the suffix to the end of the frame (SPM only).
+        "target": ("FIM_TARGET", "middle"),
+        # false: hide the received suffix from the input (ablation).
+        "suffix_context": ("FIM_SUFFIX_CONTEXT", True),
+    },
     # clip (legacy) or source: keep every clip of one source video in one split.
     "data": {"split_group": ("SPLIT_GROUP", "clip")},
     # Keep OUT_DIR/best at the lowest validation loss.
@@ -145,6 +152,10 @@ def load_config(path: Path) -> dict[str, str]:
     stop_modes = values["EVAL_STOP_MODES"].split()
     if not stop_modes or set(stop_modes) - {"learned_eos", "parser_reconnect"}:
         raise ValueError("eval.stop_modes must list learned_eos and/or parser_reconnect")
+    if values["FIM_TARGET"] not in {"middle", "to_frame_end"}:
+        raise ValueError("fim.target must be middle or to_frame_end")
+    if (values["FIM_TARGET"] != "middle" or values["FIM_SUFFIX_CONTEXT"] != "1") and values["FIM_FORMAT"] != "spm":
+        raise ValueError("fim.target / fim.suffix_context variants require fim.format: spm")
     if values["SPLIT_GROUP"] not in {"clip", "source"}:
         raise ValueError("data.split_group must be clip or source")
     if not re.fullmatch(r"final|best|step-\d{8}", values["EVAL_DEFAULT_CHECKPOINT"]):

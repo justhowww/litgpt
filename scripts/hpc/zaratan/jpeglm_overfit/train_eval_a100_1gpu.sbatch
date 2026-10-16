@@ -66,6 +66,7 @@ fim_common=(
     --split-by-video
     --seed 42
     --fim-format "${FIM_FORMAT}"
+    --fim-target "${FIM_TARGET:-middle}"
     --fim-loss-scope full
     --use-eos
     --fim-min-gap "${FIM_MIN_GAP}"
@@ -84,6 +85,9 @@ fim_common=(
 # YAML's eval.mask_modes. Masked evals write to <name>_masked.
 MASK_MODES=${EVAL_MASK_MODES:-off}
 if [[ "${OVERFIT_EVAL_MASK:-0}" == "1" ]]; then MASK_MODES=on; fi
+if [[ "${FIM_SUFFIX_CONTEXT:-1}" == "0" ]]; then
+    fim_common+=(--fim-no-suffix-context)
+fi
 run_fim_eval() {
     local base=$1; shift
     local mode name out

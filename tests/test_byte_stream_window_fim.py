@@ -724,3 +724,33 @@ def test_source_video_id_groups_clips_of_one_source():
     assert source_video_id(a) == source_video_id(b) == "mixkit_beach_mixkit-aerial-shot-44365"
     assert source_video_id(c) != source_video_id(a)
     assert source_video_id("/x/clip.h264") == "clip"
+
+
+@pytest.mark.parametrize("suffix_context", [True, False])
+def test_spm_to_frame_end_regenerates_hole_and_suffix(tmp_path, suffix_context):
+    ds, data = _dataset(
+        tmp_path, fim_format="spm", fim_loss_scope="full", use_eos=True,
+        fim_target="to_frame_end", fim_suffix_context=suffix_context,
+    )
+    item = ds[0]
+    meta = _meta(item)
+    ids, labels = item["input_ids"], item["labels"]
+    frame_lo, frame_hi = meta["frame_lo"], meta["frame_hi"]
+    split, gap = meta["fim_split"], meta["fim_gap"]
+    window = torch.tensor(list(data))
+    assert meta["fim_target_end"] == frame_hi
+
+    h = (ids == FIM_HOLE_ID).nonzero().item()
+    b = (ids == FIM_BEGIN_ID).nonzero().item()
+    received = window[split + gap : frame_hi] if suffix_context else window[:0]
+    assert torch.equal(ids[h + 1 : b], received)
+    # After FIM_BEGIN: prefix, then the hole AND the suffix, in stream order.
+    assert torch.equal(ids[b + 1 :], window[frame_lo:frame_hi])
+    expected_tail = window[split:frame_hi].tolist() + [SEQ_EOS_ID]
+    assert labels[-len(expected_tail):].tolist() == expected_tail
+    assert torch.equal(labels[:-1], ids[1:])
+
+
+def test_to_frame_end_requires_spm(tmp_path):
+    with pytest.raises(ValueError, match="spm"):
+        _dataset(tmp_path, fim_target="to_frame_end")

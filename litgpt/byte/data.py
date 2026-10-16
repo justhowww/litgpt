@@ -68,6 +68,10 @@ FIM_FORMATS = ("bridge", "psm", "spm")
 FIMFormat = Literal["bridge", "psm", "spm"]
 FIM_LOSS_SCOPES = ("span", "full")
 FIMLossScope = Literal["span", "full"]
+# FIM generation target: "middle" = only the missing bytes (reconnect to the received
+# suffix); "to_frame_end" = the missing bytes AND the received suffix, i.e. regenerate
+# from the hole to the end of the frame (SPM only).
+FIM_TARGETS = ("middle", "to_frame_end")
 SPLIT_GROUPS = ("clip", "source")
 SplitGroup = Literal["clip", "source"]
 _CLIP_SEGMENT_SUFFIX = re.compile(r"_\d+$")
@@ -119,6 +123,10 @@ class ByteDataConfig:
     # None preserves uniform sampling over frames; on B-free JPEG-LM data,
     # non-IDR VCL frames are P frames.
     fim_idr_sampling_probability: float | None = None
+    # See FIM_TARGETS. fim_suffix_context=False hides the received suffix from the
+    # input (ablation for "to_frame_end": does the model use the received data?).
+    fim_target: str = "middle"
+    fim_suffix_context: bool = True
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -1146,9 +1154,15 @@ class ByteStreamWindowDataset(Dataset):
         seed: int = 42,
         ignore_index: int = IGNORE_INDEX,
         syntax_mask_dir: str | Path | None = None,
+        fim_target: str = "middle",
+        fim_suffix_context: bool = True,
     ) -> None:
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
+        if fim_target not in FIM_TARGETS:
+            raise ValueError(f"fim_target must be one of {FIM_TARGETS}")
+        if (fim_target != "middle" or not fim_suffix_context) and fim_format != "spm":
+            raise ValueError("fim_target / fim_suffix_context variants require fim_format='spm'")
         if syntax_mask_dir is not None and not Path(syntax_mask_dir).is_dir():
             raise FileNotFoundError(f"syntax mask directory not found: {syntax_mask_dir}")
         if min_frames < 1:
@@ -1186,6 +1200,8 @@ class ByteStreamWindowDataset(Dataset):
         self.resample_fim = resample_fim
         self.fixed_fim_holes_per_window = fixed_fim_holes_per_window
         self.fim_idr_sampling_probability = fim_idr_sampling_probability
+        self.fim_target = fim_target
+        self.fim_suffix_context = fim_suffix_context
         self._fixed_hole_cache: dict[
             int, tuple[tuple[int, int, int, int], ...]
         ] = {}
@@ -1369,9 +1385,12 @@ class ByteStreamWindowDataset(Dataset):
         missing_tail and with it every supervised label in the sample.
         """
         overhead = self._fim_overhead()
+        # Regenerating to the frame end with the suffix also in context repeats up to
+        # one frame of bytes; budget for the worst case (suffix == whole frame).
+        duplicated = self.fim_target == "to_frame_end" and self.fim_suffix_context
         candidates = []
         for lo, hi in self._frame_bounds(sample, data):
-            if hi + overhead > self.max_seq_length:
+            if hi + overhead + ((hi - lo) if duplicated else 0) > self.max_seq_length:
                 continue
             if hi - (lo + self.frame_guard_bytes) - 1 >= self.fim_min_gap:
                 candidates.append((lo, hi))
@@ -1807,11 +1826,19 @@ class ByteStreamWindowDataset(Dataset):
         orphan = window[split + gap : frame_hi]
         missing_tail = self._with_eos(missing)
 
+        target_end = split + gap
         if self.fim_format == "spm":
             # Suffix first, then prefix, then the middle continues the prefix
             # directly: [context, FIM_HOLE, orphan, FIM_BEGIN, prefix, missing...].
             # The first missing byte is the next byte of the original stream, with
             # no jump back from a trailing marker as in PSM.
+            if self.fim_target == "to_frame_end":
+                # Regenerate the hole AND the received suffix, up to the frame end.
+                target_end = frame_hi
+                missing = window[split:frame_hi]
+                missing_tail = self._with_eos(missing)
+            suffix_lo = split + gap if self.fim_suffix_context else frame_hi
+            orphan = window[suffix_lo:frame_hi]
             hole_marker = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
             head = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
             middle_in = missing_tail[:-1]
@@ -1828,7 +1855,7 @@ class ByteStreamWindowDataset(Dataset):
                 (
                     raw_offset[:frame_lo],
                     torch.zeros(1, dtype=torch.long),
-                    raw_offset[split + gap : frame_hi],
+                    raw_offset[suffix_lo:frame_hi],
                     torch.zeros(1, dtype=torch.long),
                     raw_offset[frame_lo:split],
                     torch.arange(1, middle_in.numel() + 1, dtype=torch.long),
@@ -1912,6 +1939,7 @@ class ByteStreamWindowDataset(Dataset):
             fim_split=split,
             frame_lo=frame_lo,
             frame_hi=frame_hi,
+            fim_target_end=target_end,
             **(
                 {"fim_frame_nal_type": nal_types[frame_lo]}
                 if nal_types is not None else {}
@@ -2381,6 +2409,8 @@ class ByteDataModule(DataModule):
                     fim_idr_sampling_probability=(
                         self.config.fim_idr_sampling_probability if training else None
                     ),
+                    fim_target=self.config.fim_target,
+                    fim_suffix_context=self.config.fim_suffix_context,
                     nal_index=nal_index,
                     seed=self.config.seed,
                     syntax_mask_dir=self.config.syntax_mask_dir,
@@ -2543,6 +2573,8 @@ class ByteDataModule(DataModule):
             "fim_loss_scope": self.config.fim_loss_scope,
             "use_eos": self.config.use_eos,
             "fixed_fim_holes_enabled": self.config.fixed_fim_holes,
+            "fim_target": self.config.fim_target,
+            "fim_suffix_context": self.config.fim_suffix_context,
             "fixed_fim_holes_per_window": (
                 self.config.fixed_fim_holes_per_window
             ),

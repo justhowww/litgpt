@@ -17,6 +17,7 @@ from litgpt.byte.mrt import MRTConfig, MRT_RISK_MODES
 from litgpt.byte.data import (
     DATASET_MODES,
     FIM_FORMATS,
+    FIM_TARGETS,
     SPLIT_GROUPS,
     FIM_LOSS_SCOPES,
     REFERENCE_MODES,
@@ -116,6 +117,21 @@ def parse_args() -> argparse.Namespace:
             "Update one rolling latest checkpoint at this optimizer-step interval; "
             "0 disables it. This is independent of permanent --save-interval milestones."
         ),
+    )
+    parser.add_argument(
+        "--fim-target",
+        choices=FIM_TARGETS,
+        default="middle",
+        help=(
+            "middle: generate only the missing bytes (reconnect to the received "
+            "suffix). to_frame_end: generate the missing bytes and the received "
+            "suffix, up to the end of the frame (SPM only)."
+        ),
+    )
+    parser.add_argument(
+        "--fim-no-suffix-context",
+        action="store_true",
+        help="Hide the received suffix from the input (SPM only; ablation).",
     )
     parser.add_argument(
         "--save-best-val",
@@ -749,6 +765,8 @@ def main() -> None:
         val_fraction=args.val_fraction,
         split_by_video=args.split_by_video,
         split_group=args.split_group,
+        fim_target=args.fim_target,
+        fim_suffix_context=not args.fim_no_suffix_context,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
         window_unit=args.window_unit,

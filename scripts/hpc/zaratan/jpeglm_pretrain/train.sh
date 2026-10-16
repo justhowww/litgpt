@@ -61,6 +61,10 @@ FIXED_FIM_HOLES_PER_WINDOW=${FIXED_FIM_HOLES_PER_WINDOW:-0}
 SPLIT_GROUP=${SPLIT_GROUP:-clip}
 # 1 = keep OUT_DIR/best at the lowest validation loss so far.
 SAVE_BEST_VAL=${SAVE_BEST_VAL:-0}
+# FIM target: middle (reconnect) or to_frame_end (regenerate hole + suffix).
+FIM_TARGET=${FIM_TARGET:-middle}
+# 0 = hide the received suffix from the input (ablation).
+FIM_SUFFIX_CONTEXT=${FIM_SUFFIX_CONTEXT:-1}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -237,6 +241,11 @@ if [[ "${ENABLE_LENGTH_BUCKETING}" == "1" ]]; then
         --length-bucketing
         --length-bucket-pool-size "${LENGTH_BUCKET_POOL_SIZE}"
     )
+fi
+
+cmd+=(--fim-target "${FIM_TARGET}")
+if [[ "${FIM_SUFFIX_CONTEXT}" == "0" ]]; then
+    cmd+=(--fim-no-suffix-context)
 fi
 
 if [[ "${SAVE_BEST_VAL}" == "1" ]]; then

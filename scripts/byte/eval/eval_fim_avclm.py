@@ -62,6 +62,7 @@ from litgpt.byte.data import (  # noqa: E402
     BYTE_VOCAB_SIZE,
     FIM_FORMATS,
     FIM_LOSS_SCOPES,
+    FIM_TARGETS,
     IGNORE_INDEX,
     REGION_BRIDGE,
     SEQ_EOS_ID,
@@ -111,10 +112,22 @@ class WindowFimSample:
     window_bytes: bytes
     hole_id: int | None = None
     corruption_frame_type: str | None = None
+    # End of the generation target: split + gap for "middle", frame_hi for
+    # "to_frame_end" (regenerate the hole and the received suffix).
+    target_end: int | None = None
 
     @property
     def target_length(self) -> int:
         return len(self.target_bytes)
+
+    @property
+    def end_of_target(self) -> int:
+        return self.split + self.gap if self.target_end is None else self.target_end
+
+    @property
+    def join_suffix(self) -> bytes:
+        """Received bytes the fill must connect to (empty when regenerating them)."""
+        return self.window_bytes[self.end_of_target : self.frame_hi]
 
     @property
     def bytes_before_hole(self) -> bytes:
@@ -144,7 +157,7 @@ class WindowFimSample:
         return (
             self.window_bytes[: self.split]
             + generated
-            + self.window_bytes[self.split + self.gap : self.frame_hi]
+            + self.window_bytes[self.end_of_target : self.frame_hi]
         )
 
     def repaired_full_stream(self, generated: bytes) -> bytes:
@@ -152,7 +165,7 @@ class WindowFimSample:
         return (
             self.window_bytes[: self.split]
             + generated
-            + self.window_bytes[self.split + self.gap :]
+            + self.window_bytes[self.end_of_target :]
         )
 
 
@@ -314,6 +327,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--split-by-video", action="store_true")
     parser.add_argument("--fim-format", choices=FIM_FORMATS, default="psm")
+    parser.add_argument(
+        "--fim-target",
+        choices=FIM_TARGETS,
+        default="middle",
+        help=(
+            "middle: generate the missing bytes and reconnect to the received suffix. "
+            "to_frame_end: regenerate the missing bytes and the suffix up to the end "
+            "of the frame (must match training)."
+        ),
+    )
+    parser.add_argument("--fim-no-suffix-context", action="store_true")
     parser.add_argument(
         "--fim-loss-scope",
         choices=("auto", *FIM_LOSS_SCOPES),
@@ -936,6 +960,8 @@ def _load_eval_dataset(
         resample_fim=False,
         nal_index=nal_index,
         seed=args.seed,
+        fim_target=args.fim_target,
+        fim_suffix_context=not args.fim_no_suffix_context,
     )
 
 
@@ -1288,15 +1314,16 @@ def _materialize_fim_sample(
             raise RuntimeError("window AR item is missing its configured SEQ_EOS")
         ar_labels = ar_labels[:-1]
     window_bytes = bytes(ar_labels.tolist())
-    target_ids = list(window_bytes[split : split + gap])
-    if len(target_ids) != gap or any(
+    target_end = int(meta.get("fim_target_end", split + gap))
+    target_ids = list(window_bytes[split:target_end])
+    if len(target_ids) != target_end - split or any(
         token < 0 or token >= BYTE_VOCAB_SIZE for token in target_ids
     ):
         return None, False, "missing_span_is_truncated_or_not_byte_tokens"
 
     # Generation starts immediately after FIM_END. Full-sequence supervision
     # starts earlier, so the prompt boundary must be derived from the known tail.
-    target_token_count = gap + int(args.use_eos)
+    target_token_count = len(target_ids) + int(args.use_eos)
     prompt_end = item["input_ids"].numel() - target_token_count + 1
     if prompt_end <= 0:
         raise RuntimeError("invalid FIM prompt/target boundary")
@@ -1346,6 +1373,7 @@ def _materialize_fim_sample(
             if policy.hole_placement == "corrupt_gen_frame"
             else None
         ),
+        target_end=target_end,
     )
     return sample, replay_verified, None
 
@@ -1520,7 +1548,7 @@ def _seed_parser_state(
         HM.advance(state, byte)
     state.generation_started = True
     # The hole lies inside one picture: the fill must not start another one.
-    HM.restrict_fill_to_current_picture(state, suffix=sample.bytes_after_hole)
+    HM.restrict_fill_to_current_picture(state, suffix=sample.join_suffix)
     return state
 
 
@@ -1534,7 +1562,7 @@ def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int | None) 
         HM.advance(state, byte)
         if state.automaton_unknown:
             return False
-    return HM.can_append_bytes(state, sample.bytes_after_hole, require_complete=True)
+    return HM.can_append_bytes(state, sample.join_suffix, require_complete=True)
 
 
 def _generate_with_search(
@@ -1561,7 +1589,7 @@ def _generate_with_search(
     info: dict[str, Any] = {"search_candidates_tried": 1, "search_selected": None}
     if first is None:
         return None, info
-    if fill_reconnection(sample, first.data, slice_max_mbs=slice_max_mbs) == "reconnects":
+    if _suffix_parses(sample, first.data, slice_max_mbs=slice_max_mbs):
         info["search_selected"] = 0
         return first, info
     for k in range(1, max(1, int(args.num_samples))):
@@ -1574,10 +1602,20 @@ def _generate_with_search(
         info["search_candidates_tried"] = k + 1
         if candidate is None:
             continue
-        if fill_reconnection(sample, candidate.data, slice_max_mbs=slice_max_mbs) == "reconnects":
+        if _suffix_parses(sample, candidate.data, slice_max_mbs=slice_max_mbs):
             info["search_selected"] = k
             return candidate, info
     return first, info
+
+
+def _suffix_parses(
+    sample: WindowFimSample, fill: bytes, *, slice_max_mbs: int | None
+) -> bool:
+    """Deployable search check: uses only received data, never the ground truth."""
+    return fill_reconnection(sample, fill, slice_max_mbs=slice_max_mbs) in (
+        "reconnects",
+        "false_join",
+    )
 
 
 def fill_reconnection(
@@ -1585,8 +1623,11 @@ def fill_reconnection(
 ) -> str:
     """How a fill relates to the received suffix, judged by our H.264 parser.
 
-    reconnects          the suffix parses after the fill to the end of the picture:
-                        a repair that keeps the received data
+    reconnects          the fill ends at the true join (same parser state as after the
+                        true middle) and the suffix parses from there to the end of
+                        the picture: a repair that keeps the received data
+    false_join          the suffix parses after the fill, but from a different parser
+                        state (it self-synchronizes): its first part is misread
     completes_picture   the fill itself finishes the picture although received slice
                         data follows; a decoder then drops the suffix
     suffix_rejected     the fill is legal but the suffix does not continue it
@@ -1601,7 +1642,7 @@ def fill_reconnection(
         HM.advance(state, byte)
         if state.automaton_unknown:
             return "fill_illegal"
-    suffix = sample.bytes_after_hole
+    suffix = sample.join_suffix
     if (
         state.cur_is_vcl
         and state.automaton is not None
@@ -1610,9 +1651,26 @@ def fill_reconnection(
         and not bytes(suffix).startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01"))
     ):
         return "completes_picture"
-    if HM.can_append_bytes(state, suffix, require_complete=True):
-        return "reconnects"
-    return "suffix_rejected"
+    if not HM.can_append_bytes(state, suffix, require_complete=True):
+        return "suffix_rejected"
+    truth = _seed_parser_state(sample, slice_max_mbs=slice_max_mbs)
+    truth.forbid_slice_end = None
+    for byte in sample.target_bytes:
+        HM.advance(truth, byte)
+    if _join_state(state) != _join_state(truth):
+        return "false_join"
+    return "reconnects"
+
+
+def _join_state(state: HM.MaskState) -> tuple:
+    """Parser position at a join: macroblock index, stage, syntax element, bits into it."""
+    auto = state.automaton
+    if auto is None:
+        return ("no_automaton", state.expect_nal_header, len(state.cur_nal_bytes))
+    mb = getattr(auto, "_mb", auto)
+    if mb is None:
+        return ("header", auto.stage)
+    return (mb.mbs_done, mb.stage, getattr(mb, "ae_tag", None), len(getattr(mb, "ae_bits", "") or ""))
 
 
 def _slice_max_mbs(args: argparse.Namespace) -> int | None:
@@ -1797,7 +1855,7 @@ def generate_span(
                         mask_eos_checks += 1
                         eos_allowed = HM.can_append_bytes(
                             parser_state,
-                            sample.bytes_after_hole,
+                            sample.join_suffix,
                             require_complete=True,
                         )
                         if not eos_allowed:
@@ -1832,7 +1890,7 @@ def generate_span(
                 parser_reconnect_checks += 1
                 if HM.can_append_bytes(
                     parser_state,
-                    sample.bytes_after_hole,
+                    sample.join_suffix,
                     require_complete=True,
                 ):
                     parser_reconnect_found = True
