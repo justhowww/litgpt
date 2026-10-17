@@ -23,8 +23,14 @@ ScanResult = tuple[str, int, int, list[tuple[int, int, int, int]]]
 
 def scan_file(path_string: str) -> ScanResult:
     path = Path(path_string)
-    data = path.read_bytes()
-    stat = path.stat()
+    with path.open("rb") as handle:
+        data = handle.read()
+        stat = os.fstat(handle.fileno())
+        # Each file is read once. Drop it from the page cache: Slurm charges cached
+        # file pages to the job's memory limit, and a full-corpus scan reads tens
+        # of GB (an earlier run was OOM-killed after ~33 GB at --mem=32G).
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
     nals = [
         (nal.start, nal.end, nal.start_code_len, nal.nal_type)
         for nal in parse_annexb_nals(data)
