@@ -1,0 +1,68 @@
+schema_version: 1
+
+# L1 (oracle length): G4 plus the hole length L. Offset ids carry a countdown of
+# the bytes still to emit (L+1 on FIM_BEGIN and the last prefix byte, L-i on
+# middle byte i, so 1 before EOS; 0 everywhere else). Real in the storage case,
+# where the hole's byte length is known. Same data, model, steps and test set as
+# G4. Question: with L given, does the fill end at the true join more often than
+# G4 (17.1% repaired masked) and than G4 decoded with oracle_len (decode-only)?
+#
+# Vulcan copy (1x RTX A6000, 48 GB). Same run as l1_lencond_65k.yaml; only the
+# paths and the allocation differ. TODO: fill in the paths marked TODO.
+# micro_batch 2 (x8 accumulation, same global batch 16) to fit 48 GB.
+
+run:
+  staged_corpus: TODO_VULCAN_CORPUS
+  model_tag: byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
+  out_dir: TODO_VULCAN_CORPUS/runs/byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
+
+model:
+  architecture: qwen3
+  n_layer: 12
+  n_embd: 768
+  n_head: 12
+  raw_context_bytes: 16384
+
+data:
+  max_rows: 69632
+  val_fraction: 0.06          # held-out sources, used only to pick the best checkpoint
+  split_group: source
+  num_workers: 3
+  window_min_frames: 2
+
+fim:
+  p_fim: 1.0
+  format: spm
+  length_cond: true
+  fixed_holes_per_window: 0   # new hole every access
+  span_loss_weight: 0
+  eos_aux_loss_weight: 0
+  min_gap: 64
+  max_gap: 600
+
+training:
+  steps: 25000
+  warmup_steps: 200
+  global_batch_size: 16
+  micro_batch_size: 2
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 1000
+  save_interval: 25000
+  save_best_val: true
+  activation_checkpointing: true
+  compile: true
+
+slurm:
+  cluster: vulcan
+  account: vulcan-metzler
+  mem: 48G
+  time: "72:00:00"
+
+eval:
+  ffmpeg_binary: TODO_VULCAN_FFMPEG
+  ffprobe_binary: TODO_VULCAN_FFPROBE
+  stop_modes: learned_eos
+  checkpoint: best
+  test_rows: "70000 70400"
+  mask_modes: "off on"

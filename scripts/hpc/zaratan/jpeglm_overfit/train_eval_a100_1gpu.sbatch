@@ -88,6 +88,9 @@ if [[ "${OVERFIT_EVAL_MASK:-0}" == "1" ]]; then MASK_MODES=on; fi
 if [[ "${FIM_SUFFIX_CONTEXT:-1}" == "0" ]]; then
     fim_common+=(--fim-no-suffix-context)
 fi
+if [[ "${FIM_LENGTH_COND:-0}" == "1" ]]; then
+    fim_common+=(--fim-length-cond)
+fi
 run_fim_eval() {
     local base=$1; shift
     local mode name out

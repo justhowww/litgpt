@@ -67,11 +67,15 @@ OPTIONAL_FIELDS = {
         "target": ("FIM_TARGET", "middle"),
         # false: hide the received suffix from the input (ablation).
         "suffix_context": ("FIM_SUFFIX_CONTEXT", True),
+        # true: oracle-length countdown in offset ids (SPM only).
+        "length_cond": ("FIM_LENGTH_COND", False),
     },
     # clip (legacy) or source: keep every clip of one source video in one split.
     "data": {"split_group": ("SPLIT_GROUP", "clip")},
     # Keep OUT_DIR/best at the lowest validation loss.
     "training": {"save_best_val": ("SAVE_BEST_VAL", False)},
+    # zaratan (1x A100) or vulcan (1x RTX A6000); picks the job script in JOB_SCRIPTS.
+    "slurm": {"cluster": ("CLUSTER", "zaratan")},
     "eval": {
         # Space-separated eval_fim_avclm stop modes: learned_eos and/or parser_reconnect.
         "stop_modes": ("EVAL_STOP_MODES", "learned_eos"),
@@ -83,6 +87,10 @@ OPTIONAL_FIELDS = {
         # Space-separated: off and/or on (generation with the H.264 mask).
         "mask_modes": ("EVAL_MASK_MODES", "off"),
     },
+}
+JOB_SCRIPTS = {
+    "zaratan": HERE / "train_eval_a100_1gpu.sbatch",
+    "vulcan": HERE.parents[1] / "vulcan" / "jpeglm_overfit" / "train_eval_a6000_1gpu.sbatch",
 }
 BOOLEAN_KEYS = {"ACTIVATION_CHECKPOINTING", "COMPILE"}
 
@@ -156,6 +164,10 @@ def load_config(path: Path) -> dict[str, str]:
         raise ValueError("fim.target must be middle or to_frame_end")
     if (values["FIM_TARGET"] != "middle" or values["FIM_SUFFIX_CONTEXT"] != "1") and values["FIM_FORMAT"] != "spm":
         raise ValueError("fim.target / fim.suffix_context variants require fim.format: spm")
+    if values["FIM_LENGTH_COND"] == "1" and values["FIM_FORMAT"] != "spm":
+        raise ValueError("fim.length_cond requires fim.format: spm")
+    if values["CLUSTER"] not in JOB_SCRIPTS:
+        raise ValueError(f"slurm.cluster must be one of {sorted(JOB_SCRIPTS)}")
     if values["SPLIT_GROUP"] not in {"clip", "source"}:
         raise ValueError("data.split_group must be clip or source")
     if not re.fullmatch(r"final|best|step-\d{8}", values["EVAL_DEFAULT_CHECKPOINT"]):
@@ -199,12 +211,17 @@ def load_config(path: Path) -> dict[str, str]:
 
     corpus = Path(values["STAGED_CORPUS"])
     values.update(CONSTANTS)
+    if values["CLUSTER"] == "vulcan":
+        # vulcan-ampere caps each GPU at 4 CPUs and 48 GB.
+        values["TRAIN_CPUS_PER_TASK"] = "4"
+        if int(values["NUM_WORKERS"]) > 3:
+            raise ValueError("vulcan: data.num_workers must be <= 3 (4 CPUs per GPU)")
     values.update({
         "MANIFEST": str(corpus / "manifest.jsonl"),
         "NAL_INDEX": str(corpus / "nal_index.sqlite"),
         "BLOCK_SIZE": values["RAW_CONTEXT_BYTES"],
         "LATEST_SAVE_INTERVAL": values["SAVE_INTERVAL"],
-        "JOB_SCRIPT": str(HERE / "train_eval_a100_1gpu.sbatch"),
+        "JOB_SCRIPT": str(JOB_SCRIPTS[values["CLUSTER"]]),
     })
     return values
 

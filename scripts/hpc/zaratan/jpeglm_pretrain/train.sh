@@ -5,7 +5,8 @@ set -euo pipefail
 export SLURM_EXPORT_ENV=ALL
 
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
-source "${REPO_ROOT}/scripts/hpc/zaratan/env.sh"
+# Cluster environment (conda, caches). Vulcan jobs point this at vulcan/env.sh.
+source "${CLUSTER_ENV_SH:-${REPO_ROOT}/scripts/hpc/zaratan/env.sh}"
 
 : "${MANIFEST:?Set MANIFEST to the JPEG-LM manifest.jsonl}"
 : "${NAL_INDEX:?Set NAL_INDEX to the matching persistent NAL index}"
@@ -65,6 +66,8 @@ SAVE_BEST_VAL=${SAVE_BEST_VAL:-0}
 FIM_TARGET=${FIM_TARGET:-middle}
 # 0 = hide the received suffix from the input (ablation).
 FIM_SUFFIX_CONTEXT=${FIM_SUFFIX_CONTEXT:-1}
+# 1 = oracle-length countdown in offset ids (SPM; turns offset ids on).
+FIM_LENGTH_COND=${FIM_LENGTH_COND:-0}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -246,6 +249,9 @@ fi
 cmd+=(--fim-target "${FIM_TARGET}")
 if [[ "${FIM_SUFFIX_CONTEXT}" == "0" ]]; then
     cmd+=(--fim-no-suffix-context)
+fi
+if [[ "${FIM_LENGTH_COND}" == "1" ]]; then
+    cmd+=(--fim-length-cond)
 fi
 
 if [[ "${SAVE_BEST_VAL}" == "1" ]]; then

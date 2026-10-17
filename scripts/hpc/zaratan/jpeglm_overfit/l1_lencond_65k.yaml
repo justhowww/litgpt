@@ -1,0 +1,62 @@
+schema_version: 1
+
+# L1 (oracle length): G4 plus the hole length L. Offset ids carry a countdown of
+# the bytes still to emit (L+1 on FIM_BEGIN and the last prefix byte, L-i on
+# middle byte i, so 1 before EOS; 0 everywhere else). Real in the storage case,
+# where the hole's byte length is known. Same data, model, steps and test set as
+# G4. Question: with L given, does the fill end at the true join more often than
+# G4 (17.1% repaired masked) and than G4 decoded with oracle_len (decode-only)?
+run:
+  staged_corpus: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm
+  model_tag: byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
+  out_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
+
+model:
+  architecture: qwen3
+  n_layer: 12
+  n_embd: 768
+  n_head: 12
+  raw_context_bytes: 16384
+
+data:
+  max_rows: 69632
+  val_fraction: 0.06          # held-out sources, used only to pick the best checkpoint
+  split_group: source
+  num_workers: 8
+  window_min_frames: 2
+
+fim:
+  p_fim: 1.0
+  format: spm
+  length_cond: true
+  fixed_holes_per_window: 0   # new hole every access
+  span_loss_weight: 0
+  eos_aux_loss_weight: 0
+  min_gap: 64
+  max_gap: 600
+
+training:
+  steps: 25000
+  warmup_steps: 200
+  global_batch_size: 16
+  micro_batch_size: 4
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 1000
+  save_interval: 25000
+  save_best_val: true
+  activation_checkpointing: true
+  compile: true
+
+slurm:
+  account: metzler-prj-cmsc
+  mem: 96G
+  time: "16:00:00"
+
+eval:
+  ffmpeg_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffmpeg
+  ffprobe_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffprobe
+  stop_modes: learned_eos
+  checkpoint: best
+  test_rows: "70000 70400"
+  mask_modes: "off on"
