@@ -754,3 +754,35 @@ def test_spm_to_frame_end_regenerates_hole_and_suffix(tmp_path, suffix_context):
 def test_to_frame_end_requires_spm(tmp_path):
     with pytest.raises(ValueError, match="spm"):
         _dataset(tmp_path, fim_target="to_frame_end")
+
+
+@pytest.mark.parametrize("use_eos", [True, False])
+def test_spm_length_cond_offsets_count_down_to_eos(tmp_path, use_eos):
+    ds, _ = _dataset(
+        tmp_path, fim_format="spm", fim_loss_scope="full", use_eos=use_eos,
+        fim_length_cond=True,
+    )
+    item = ds[0]
+    meta = _meta(item)
+    ids, labels, offsets = item["input_ids"], item["labels"], item["offset_ids"]
+    L = meta["fim_gap"]
+    b = (ids == FIM_BEGIN_ID).nonzero().item()
+    prefix_len = meta["fim_split"] - meta["frame_lo"]
+    last_prefix = b + prefix_len
+    assert offsets.shape == ids.shape
+    assert offsets[b] == L + 1 and offsets[last_prefix] == L + 1
+    # Each input before a target byte j (or EOS, j = L) carries L - j + 1.
+    middle = offsets[last_prefix + 1 :]
+    assert middle.tolist() == list(range(L, L - middle.numel(), -1))
+    if use_eos:
+        assert labels[-1] == SEQ_EOS_ID and offsets[-1] == 1
+    others = torch.ones_like(offsets, dtype=torch.bool)
+    others[b] = others[last_prefix] = False
+    others[last_prefix + 1 :] = False
+    assert not offsets[others].any()
+    assert not ds.ar_item(0)["offset_ids"].any()
+
+
+def test_length_cond_requires_spm(tmp_path):
+    with pytest.raises(ValueError, match="spm"):
+        _dataset(tmp_path, fim_length_cond=True)

@@ -134,6 +134,15 @@ def parse_args() -> argparse.Namespace:
         help="Hide the received suffix from the input (SPM only; ablation).",
     )
     parser.add_argument(
+        "--fim-length-cond",
+        action="store_true",
+        help=(
+            "Oracle-length conditioning (SPM, patch 1): offset ids carry a countdown "
+            "of the target bytes still to emit and are 0 elsewhere. Turns offset ids "
+            "on even with --no-offset-id."
+        ),
+    )
+    parser.add_argument(
         "--save-best-val",
         action="store_true",
         help="Keep OUT_DIR/best at the lowest-validation-loss checkpoint so far.",
@@ -699,7 +708,14 @@ def main() -> None:
     # each NAL, reset at every boundary -- has no coherent value across the generated
     # span. The dataset emits a placeholder that is only meaningful with offset ids
     # off; refuse the combination rather than train on quietly wrong positions.
-    if args.dataset_mode == "window" and args.p_fim > 0 and not args.no_offset_id:
+    if args.fim_length_cond and (args.fim_format != "spm" or args.byte_patch_size != 1):
+        raise ValueError("--fim-length-cond requires --fim-format spm and patch size 1")
+    if (
+        args.dataset_mode == "window"
+        and args.p_fim > 0
+        and not args.no_offset_id
+        and not args.fim_length_cond
+    ):
         raise ValueError(
             "window FIM requires --no-offset-id: a multi-NAL hole has no single "
             "within-NAL offset. Phase 1 already runs --no-region-id --no-offset-id "
@@ -720,7 +736,9 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
 
     use_region_id = not args.no_region_id
-    use_offset_id = not args.no_offset_id
+    # Length conditioning reuses the offset embedding for its countdown; the
+    # default offset vocabulary (block_size) covers any hole that fits the window.
+    use_offset_id = args.fim_length_cond or not args.no_offset_id
     max_tokens = args.steps * args.global_batch_size * args.block_size
 
     model_config = build_byte_model_config(
@@ -767,6 +785,7 @@ def main() -> None:
         split_group=args.split_group,
         fim_target=args.fim_target,
         fim_suffix_context=not args.fim_no_suffix_context,
+        fim_length_cond=args.fim_length_cond,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
         window_unit=args.window_unit,

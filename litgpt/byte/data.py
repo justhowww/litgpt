@@ -127,6 +127,9 @@ class ByteDataConfig:
     # input (ablation for "to_frame_end": does the model use the received data?).
     fim_target: str = "middle"
     fim_suffix_context: bool = True
+    # Oracle-length conditioning (spm only): offset ids carry a countdown of the
+    # target bytes still to emit and are 0 everywhere else. See _length_countdown.
+    fim_length_cond: bool = False
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -470,6 +473,30 @@ def pad_and_truncate(tensors: list[Tensor], max_seq_length: int, value: int) -> 
     return torch.nn.utils.rnn.pad_sequence(
         truncated, batch_first=True, padding_value=value
     )
+
+
+def _length_countdown(
+    context_len: int, suffix_len: int, prefix_len: int, target_len: int, middle_len: int
+) -> Tensor:
+    """SPM offset ids for oracle-length conditioning.
+
+    Layout [context, FIM_HOLE, suffix, FIM_BEGIN, prefix, middle_in]. Every input
+    whose next-token target is target byte j (j < L) or EOS (j = L) carries
+    L - j + 1, i.e. 1 + bytes still to emit before EOS: the last prefix byte
+    carries L + 1, middle_in[i] carries L - i, so the input before EOS carries 1.
+    FIM_BEGIN also carries L + 1 so the length is known while reading the
+    prefix. 0 means "no length information" (context, suffix, prefix, AR items).
+    """
+    L = target_len
+    out = torch.zeros(
+        context_len + 1 + suffix_len + 1 + prefix_len + middle_len, dtype=torch.long
+    )
+    begin = context_len + 1 + suffix_len
+    out[begin] = L + 1
+    if prefix_len:
+        out[begin + prefix_len] = L + 1
+    out[begin + 1 + prefix_len :] = torch.arange(L, L - middle_len, -1, dtype=torch.long)
+    return out
 
 
 def _fim_training_labels(
@@ -1156,6 +1183,7 @@ class ByteStreamWindowDataset(Dataset):
         syntax_mask_dir: str | Path | None = None,
         fim_target: str = "middle",
         fim_suffix_context: bool = True,
+        fim_length_cond: bool = False,
     ) -> None:
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
@@ -1163,6 +1191,8 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError(f"fim_target must be one of {FIM_TARGETS}")
         if (fim_target != "middle" or not fim_suffix_context) and fim_format != "spm":
             raise ValueError("fim_target / fim_suffix_context variants require fim_format='spm'")
+        if fim_length_cond and fim_format != "spm":
+            raise ValueError("fim_length_cond requires fim_format='spm'")
         if syntax_mask_dir is not None and not Path(syntax_mask_dir).is_dir():
             raise FileNotFoundError(f"syntax mask directory not found: {syntax_mask_dir}")
         if min_frames < 1:
@@ -1202,6 +1232,7 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_idr_sampling_probability = fim_idr_sampling_probability
         self.fim_target = fim_target
         self.fim_suffix_context = fim_suffix_context
+        self.fim_length_cond = fim_length_cond
         self._fixed_hole_cache: dict[
             int, tuple[tuple[int, int, int, int], ...]
         ] = {}
@@ -1781,6 +1812,8 @@ class ByteStreamWindowDataset(Dataset):
                 raw_offset if self.use_eos else raw_offset[:-1],
             )
         )
+        if self.fim_length_cond:
+            offset_ids = torch.zeros_like(offset_ids)
         syntax_masks = None
         if self.syntax_mask_dir is not None:
             # labels = window (+ EOS): label k is window byte k; EOS is unconstrained.
@@ -1861,6 +1894,11 @@ class ByteStreamWindowDataset(Dataset):
                     torch.arange(1, middle_in.numel() + 1, dtype=torch.long),
                 )
             )
+            if self.fim_length_cond:
+                offset_ids = _length_countdown(
+                    frame_lo, orphan.numel(), prefix.numel(), missing.numel(),
+                    middle_in.numel(),
+                )
         elif self.fim_format == "psm":
             head = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
             hole = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
@@ -2411,6 +2449,7 @@ class ByteDataModule(DataModule):
                     ),
                     fim_target=self.config.fim_target,
                     fim_suffix_context=self.config.fim_suffix_context,
+                    fim_length_cond=self.config.fim_length_cond,
                     nal_index=nal_index,
                     seed=self.config.seed,
                     syntax_mask_dir=self.config.syntax_mask_dir,
@@ -2575,6 +2614,7 @@ class ByteDataModule(DataModule):
             "fixed_fim_holes_enabled": self.config.fixed_fim_holes,
             "fim_target": self.config.fim_target,
             "fim_suffix_context": self.config.fim_suffix_context,
+            "fim_length_cond": self.config.fim_length_cond,
             "fixed_fim_holes_per_window": (
                 self.config.fixed_fim_holes_per_window
             ),
