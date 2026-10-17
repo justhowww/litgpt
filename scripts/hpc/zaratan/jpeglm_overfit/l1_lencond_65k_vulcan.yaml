@@ -8,13 +8,13 @@ schema_version: 1
 # G4 (17.1% repaired masked) and than G4 decoded with oracle_len (decode-only)?
 #
 # Vulcan copy (1x RTX A6000, 48 GB). Same run as l1_lencond_65k.yaml; only the
-# paths and the allocation differ. TODO: fill in the paths marked TODO.
+# paths and the allocation differ.
 # micro_batch 2 (x8 accumulation, same global batch 16) to fit 48 GB.
 
 run:
-  staged_corpus: TODO_VULCAN_CORPUS
+  staged_corpus: /fs/nexus-projects/time-control-videogen/data-jpeglm
   model_tag: byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
-  out_dir: TODO_VULCAN_CORPUS/runs/byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
+  out_dir: /fs/nexus-projects/time-control-videogen/data-jpeglm/runs/byte-jpeglm-gen-l1-lencond-65k-12x768-bytes-ctx16k
 
 model:
   architecture: qwen3
@@ -27,6 +27,8 @@ data:
   max_rows: 69632
   val_fraction: 0.06          # held-out sources, used only to pick the best checkpoint
   split_group: source
+  # Pilot index of the first 70,400 usable rows (training rows + test rows 70000-70400).
+  nal_index: /fs/nexus-projects/time-control-videogen/data-jpeglm/nal_index_70k.sqlite
   num_workers: 3
   window_min_frames: 2
 
@@ -60,8 +62,8 @@ slurm:
   time: "72:00:00"
 
 eval:
-  ffmpeg_binary: TODO_VULCAN_FFMPEG
-  ffprobe_binary: TODO_VULCAN_FFPROBE
+  ffmpeg_binary: /opt/local/stow/ffmpeg-7.1/bin/ffmpeg
+  ffprobe_binary: /opt/local/stow/ffmpeg-7.1/bin/ffprobe
   stop_modes: learned_eos
   checkpoint: best
   test_rows: "70000 70400"

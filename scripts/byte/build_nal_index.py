@@ -147,9 +147,13 @@ def build_index(
     workers: int,
     rebuild: bool,
     max_pending: int | None = None,
+    max_rows: int | None = None,
 ) -> None:
     manifest_stat_before_read = manifest_path.stat()
-    rows = load_manifest_rows(manifest_path, report_progress=True)
+    # max_rows indexes only the first N usable rows (what a run with
+    # --max-manifest-rows N, or a test set inside those rows, reads). Loaders only
+    # require the rows they use, and a later run without it resumes from here.
+    rows = load_manifest_rows(manifest_path, max_rows=max_rows, report_progress=True)
     manifest_stat = manifest_path.stat()
     if (
         manifest_stat.st_size != manifest_stat_before_read.st_size
@@ -250,6 +254,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum parallel file scans in flight; 0 uses 4x --workers.",
     )
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="Index only the first N usable manifest rows; 0 indexes all.",
+    )
     return parser.parse_args()
 
 
@@ -259,6 +269,8 @@ def main() -> None:
         raise ValueError("--workers must be at least 1")
     if args.max_pending < 0:
         raise ValueError("--max-pending must be non-negative")
+    if args.max_rows < 0:
+        raise ValueError("--max-rows must be non-negative")
     if args.max_pending and args.max_pending < args.workers:
         raise ValueError("--max-pending must be at least --workers")
     output = args.output or default_nal_index_path(args.manifest)
@@ -268,6 +280,7 @@ def main() -> None:
         args.workers,
         args.rebuild,
         max_pending=args.max_pending or None,
+        max_rows=args.max_rows or None,
     )
 
 

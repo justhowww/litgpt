@@ -71,7 +71,13 @@ OPTIONAL_FIELDS = {
         "length_cond": ("FIM_LENGTH_COND", False),
     },
     # clip (legacy) or source: keep every clip of one source video in one split.
-    "data": {"split_group": ("SPLIT_GROUP", "clip")},
+    "data": {
+        "split_group": ("SPLIT_GROUP", "clip"),
+        # Absolute path of the NAL index; empty = <staged_corpus>/nal_index.sqlite.
+        # A partial index (build_nal_index.py --max-rows) works if it covers every
+        # row the run reads: training rows and eval.test_rows.
+        "nal_index": ("NAL_INDEX_OVERRIDE", ""),
+    },
     # Keep OUT_DIR/best at the lowest validation loss.
     "training": {"save_best_val": ("SAVE_BEST_VAL", False)},
     # zaratan (1x A100) or vulcan (1x RTX A6000); picks the job script in JOB_SCRIPTS.
@@ -205,6 +211,8 @@ def load_config(path: Path) -> dict[str, str]:
         raise ValueError("warmup_steps must be less than steps")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", values["MODEL_TAG"]):
         raise ValueError("run.model_tag must be a directory-safe name")
+    if values["NAL_INDEX_OVERRIDE"] and not Path(values["NAL_INDEX_OVERRIDE"]).is_absolute():
+        raise ValueError("data.nal_index must be an absolute path")
     for key in ("STAGED_CORPUS", "OUT_DIR", "FFMPEG_BINARY", "FFPROBE_BINARY"):
         if not Path(values[key]).is_absolute():
             raise ValueError(f"{key} must be an absolute path")
@@ -218,7 +226,7 @@ def load_config(path: Path) -> dict[str, str]:
             raise ValueError("vulcan: data.num_workers must be <= 3 (4 CPUs per GPU)")
     values.update({
         "MANIFEST": str(corpus / "manifest.jsonl"),
-        "NAL_INDEX": str(corpus / "nal_index.sqlite"),
+        "NAL_INDEX": values.pop("NAL_INDEX_OVERRIDE") or str(corpus / "nal_index.sqlite"),
         "BLOCK_SIZE": values["RAW_CONTEXT_BYTES"],
         "LATEST_SAVE_INTERVAL": values["SAVE_INTERVAL"],
         "JOB_SCRIPT": str(JOB_SCRIPTS[values["CLUSTER"]]),

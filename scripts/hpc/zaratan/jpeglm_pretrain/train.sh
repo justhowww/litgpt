@@ -122,6 +122,10 @@ preflight=(
 if [[ "${ALLOW_LOW_FIM_ELIGIBILITY}" == "1" ]]; then
     preflight+=(--allow-low-fim-eligibility)
 fi
+# Partial NAL index (build_nal_index.py --max-rows): check only the rows this run reads.
+if [[ "${MAX_ROWS:-0}" != "0" ]]; then
+    preflight+=(--max-manifest-rows "${MAX_ROWS}")
+fi
 "${preflight[@]}"
 
 if (( N_EMBD % N_HEAD != 0 )); then

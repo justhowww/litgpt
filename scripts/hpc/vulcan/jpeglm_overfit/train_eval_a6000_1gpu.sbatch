@@ -31,6 +31,17 @@ export REPO_ROOT
 # so activate it here as well.
 export CLUSTER_ENV_SH="${REPO_ROOT}/scripts/hpc/vulcan/env.sh"
 source "${CLUSTER_ENV_SH}"
+# FFmpeg comes from the module system on Vulcan (strict decode check + concealment
+# baseline). Match the version used on Zaratan so baselines stay comparable.
+set +u
+if ! type module >/dev/null 2>&1; then
+    for init in /etc/profile.d/modules.sh /etc/profile.d/lmod.sh; do
+        [[ -f "${init}" ]] && source "${init}"
+    done
+fi
+module load "${VULCAN_FFMPEG_MODULE:-ffmpeg/7.1}"
+set -u
+echo "[ffmpeg] $(command -v ffmpeg): $(ffmpeg -version | head -1)"
 echo "[gpu-check] host=$(hostname) $(nvidia-smi -L | wc -l) GPU(s): $(nvidia-smi -L | head -1)"
 
 source "${REPO_ROOT}/scripts/hpc/zaratan/jpeglm_overfit/train_eval_a100_1gpu.sbatch"

@@ -24,11 +24,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-guard-bytes", type=int, default=64)
     parser.add_argument("--min-p-frame-eligibility", type=float, default=0.5)
     parser.add_argument("--min-manifest-rows", type=int, default=1)
+    parser.add_argument(
+        "--max-manifest-rows",
+        type=int,
+        default=0,
+        help="Check only the first N usable rows (what a run with --max-manifest-rows N reads); 0 = all.",
+    )
     parser.add_argument("--allow-low-fim-eligibility", action="store_true")
     return parser.parse_args()
 
 
-def count_manifest_rows(path: Path) -> tuple[int, int, int]:
+def count_manifest_rows(path: Path, max_usable: int = 0) -> tuple[int, int, int]:
     total = 0
     usable = 0
     usable_paths: set[str] = set()
@@ -41,6 +47,8 @@ def count_manifest_rows(path: Path) -> tuple[int, int, int]:
             if row.get("status") == "ok" and row.get("h264_path"):
                 usable += 1
                 usable_paths.add(str(row["h264_path"]))
+                if max_usable and usable >= max_usable:
+                    break
     return total, usable, len(usable_paths)
 
 
@@ -59,7 +67,9 @@ def main() -> None:
 
     print("JPEG-LM pretraining corpus preflight", flush=True)
     print(f"  scanning manifest: {args.manifest}", flush=True)
-    total_rows, usable_rows, unique_usable_paths = count_manifest_rows(args.manifest)
+    total_rows, usable_rows, unique_usable_paths = count_manifest_rows(
+        args.manifest, args.max_manifest_rows
+    )
     print(f"  manifest rows: {total_rows:,} total, {usable_rows:,} usable", flush=True)
     print(f"  unique usable paths: {unique_usable_paths:,}", flush=True)
     if usable_rows < args.min_manifest_rows:
