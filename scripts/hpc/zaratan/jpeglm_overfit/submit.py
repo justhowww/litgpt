@@ -69,6 +69,8 @@ OPTIONAL_FIELDS = {
         "suffix_context": ("FIM_SUFFIX_CONTEXT", True),
         # true: oracle-length countdown in offset ids (SPM only).
         "length_cond": ("FIM_LENGTH_COND", False),
+        # off / input / predict: oracle join-state token block (SPM, target middle).
+        "state_tokens": ("FIM_STATE_TOKENS", "off"),
     },
     # clip (legacy) or source: keep every clip of one source video in one split.
     "data": {
@@ -172,6 +174,13 @@ def load_config(path: Path) -> dict[str, str]:
         raise ValueError("fim.target / fim.suffix_context variants require fim.format: spm")
     if values["FIM_LENGTH_COND"] == "1" and values["FIM_FORMAT"] != "spm":
         raise ValueError("fim.length_cond requires fim.format: spm")
+    if values["FIM_STATE_TOKENS"] not in {"off", "input", "predict"}:
+        raise ValueError("fim.state_tokens must be off, input or predict")
+    if values["FIM_STATE_TOKENS"] != "off" and (
+        values["FIM_FORMAT"] != "spm" or values["FIM_TARGET"] != "middle"
+        or values["FIM_SUFFIX_CONTEXT"] != "1" or values["FIM_LENGTH_COND"] == "1"
+    ):
+        raise ValueError("fim.state_tokens requires spm, target middle, suffix context, no length_cond")
     if values["CLUSTER"] not in JOB_SCRIPTS:
         raise ValueError(f"slurm.cluster must be one of {sorted(JOB_SCRIPTS)}")
     if values["SPLIT_GROUP"] not in {"clip", "source"}:

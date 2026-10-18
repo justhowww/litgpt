@@ -66,6 +66,9 @@ from litgpt.byte.data import (  # noqa: E402
     IGNORE_INDEX,
     REGION_BRIDGE,
     SEQ_EOS_ID,
+    STATE_FIELD_RANGES,
+    STATE_ID,
+    STATE_VOCAB_SIZE,
     VCL_NAL_TYPES,
     ByteStreamWindowDataset,
     WINDOW_UNITS,
@@ -345,6 +348,22 @@ def parse_args() -> argparse.Namespace:
         "--fim-length-cond",
         action="store_true",
         help="Oracle-length countdown in offset ids (must match training).",
+    )
+    parser.add_argument(
+        "--fim-state-tokens",
+        choices=("off", "input", "predict"),
+        default="off",
+        help="Join-state token block after the suffix (must match training).",
+    )
+    parser.add_argument(
+        "--state-block-source",
+        choices=("oracle", "model"),
+        default="oracle",
+        help=(
+            "oracle: the prompt holds the true join-state block. model: the model "
+            "writes the block itself (greedy, each field restricted to its token "
+            "range), as a deployable system would."
+        ),
     )
     parser.add_argument(
         "--fim-loss-scope",
@@ -971,6 +990,7 @@ def _load_eval_dataset(
         fim_target=args.fim_target,
         fim_suffix_context=not args.fim_no_suffix_context,
         fim_length_cond=args.fim_length_cond,
+        fim_state_tokens=args.fim_state_tokens,
     )
 
 
@@ -1575,6 +1595,53 @@ def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int | None) 
     return HM.can_append_bytes(state, sample.join_suffix, require_complete=True)
 
 
+@torch.inference_mode()
+def _join_state_block(
+    args: argparse.Namespace,
+    model: nn.Module,
+    sample: WindowFimSample,
+    device: torch.device,
+) -> tuple[WindowFimSample, dict[str, Any]]:
+    """Return the sample with the join-state block the evaluation should use.
+
+    oracle: the prompt already holds the true block (built by the dataset).
+    model: the model writes the four field tokens after STATE, greedily, each
+    restricted to its own token range; the rest of the prompt is unchanged.
+    """
+    ids = sample.prompt_ids
+    at = (ids == STATE_ID).nonzero(as_tuple=False).flatten()
+    if at.numel() != 1:
+        raise RuntimeError("expected exactly one STATE marker in the FIM prompt")
+    at = int(at[0])
+    true = [int(ids[at + 1 + f]) - base for f, (base, _) in enumerate(STATE_FIELD_RANGES)]
+    info: dict[str, Any] = {"state_source": args.state_block_source, "state_true": true}
+    if args.state_block_source == "oracle":
+        return sample, info
+    raw = _unwrap_model(model)
+    raw.eval()
+    x = ids.clone().to(device)
+    regions = sample.prompt_region_ids.to(device)
+    offsets = sample.prompt_offset_ids.to(device)
+    for f, (base, size) in enumerate(STATE_FIELD_RANGES):
+        end = at + 1 + f
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            logits = raw(
+                x[:end].unsqueeze(0),
+                region_ids=regions[:end].unsqueeze(0),
+                offset_ids=offsets[:end].unsqueeze(0),
+            )
+        x[end] = base + int(logits[0, -1, base : base + size].argmax())
+    pred = [int(x[at + 1 + f]) - base for f, (base, _) in enumerate(STATE_FIELD_RANGES)]
+    info.update(
+        state_pred=pred,
+        state_field_correct=[p == t for p, t in zip(pred, true)],
+        state_all_correct=pred == true,
+    )
+    return replace(sample, prompt_ids=x.cpu()), info
+
+
 def _generate_with_search(
     args: argparse.Namespace,
     model: nn.Module,
@@ -1680,6 +1747,11 @@ def _join_state(state: HM.MaskState) -> tuple:
     mb = getattr(auto, "_mb", auto)
     if mb is None:
         return ("header", auto.stage)
+    if mb.stage == "done":
+        # A finished picture has no element position: ae_tag / ae_bits keep stale
+        # values from the last element and must not split equal end states
+        # (to_frame_end targets end here).
+        return (mb.mbs_done, "done")
     return (mb.mbs_done, mb.stage, getattr(mb, "ae_tag", None), len(getattr(mb, "ae_bits", "") or ""))
 
 
@@ -2504,6 +2576,17 @@ def summarize(
         ),
         "reconnect_rate": AR.mean(
             [1.0 if r.get("fill_reconnects") else 0.0 for r in details]
+        ),
+        # Model-written join-state block: share of cuts with every field right, and
+        # per field (mb_x, mb_y, element, bits). None when the oracle block is used.
+        "state_all_correct_rate": AR.mean(
+            [1.0 if r["state_all_correct"] else 0.0 for r in details
+             if "state_all_correct" in r]
+        ),
+        "state_field_accuracy": (
+            [AR.mean([1.0 if r["state_field_correct"][f] else 0.0 for r in details
+                      if "state_field_correct" in r]) for f in range(4)]
+            if any("state_field_correct" in r for r in details) else None
         ),
         # A repair: the fill reconnects to the received suffix AND decodes strictly.
         "repair_rate": AR.mean(
@@ -3413,6 +3496,9 @@ def evaluate_stop_mode(
                 }
             )
             continue
+        state_info: dict[str, Any] = {}
+        if args.fim_state_tokens != "off":
+            sample, state_info = _join_state_block(args, model, sample, device)
         result, search_info = _generate_with_search(
             args,
             model,
@@ -3447,6 +3533,7 @@ def evaluate_stop_mode(
             corrupted_concealed_decode=corrupted_concealed_decode,
         )
         row.update(search_info)
+        row.update(state_info)
         if args.save_streams:
             row.update(
                 save_repair_streams(
@@ -3569,6 +3656,12 @@ def main() -> None:
             device,
             dtype=torch.bfloat16 if args.model_dtype == "bf16" else None,
         )
+        state_vocab = int(_unwrap_model(model).config.vocab_size) == STATE_VOCAB_SIZE
+        if state_vocab != (args.fim_state_tokens != "off"):
+            raise ValueError(
+                f"{checkpoint_dir}: vocab_size={_unwrap_model(model).config.vocab_size} "
+                f"but --fim-state-tokens={args.fim_state_tokens}; they must match"
+            )
         if bool(_unwrap_model(model).config.use_offset_id) != bool(args.fim_length_cond):
             raise ValueError(
                 f"{checkpoint_dir}: use_offset_id="

@@ -68,6 +68,8 @@ FIM_TARGET=${FIM_TARGET:-middle}
 FIM_SUFFIX_CONTEXT=${FIM_SUFFIX_CONTEXT:-1}
 # 1 = oracle-length countdown in offset ids (SPM; turns offset ids on).
 FIM_LENGTH_COND=${FIM_LENGTH_COND:-0}
+# off / input / predict: oracle join-state token block after the suffix (SPM).
+FIM_STATE_TOKENS=${FIM_STATE_TOKENS:-off}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -257,6 +259,7 @@ fi
 if [[ "${FIM_LENGTH_COND}" == "1" ]]; then
     cmd+=(--fim-length-cond)
 fi
+cmd+=(--fim-state-tokens "${FIM_STATE_TOKENS}")
 
 if [[ "${SAVE_BEST_VAL}" == "1" ]]; then
     cmd+=(--save-best-val)

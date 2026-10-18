@@ -24,6 +24,7 @@ EVAL_CHECKPOINT=${OVERFIT_EVAL_CHECKPOINT:-${EVAL_DEFAULT_CHECKPOINT:-final}}
 #   OVERFIT_EVAL_STOP_MODES=.. override the YAML's eval.stop_modes
 #   OVERFIT_EVAL_NUM_SAMPLES=N best-of-N repair search (1 = greedy only)
 #   OVERFIT_EVAL_NUM_CLIPS=N   cap on evaluated cuts (default 1000)
+#   OVERFIT_EVAL_STATE_SOURCE= oracle (default) or model: who writes the join-state block
 EVAL_SUFFIX=${OVERFIT_EVAL_TAG:+_${OVERFIT_EVAL_TAG}}
 
 if [[ "${OVERFIT_EVAL_ONLY:-0}" != "1" ]]; then
@@ -90,6 +91,12 @@ if [[ "${FIM_SUFFIX_CONTEXT:-1}" == "0" ]]; then
 fi
 if [[ "${FIM_LENGTH_COND:-0}" == "1" ]]; then
     fim_common+=(--fim-length-cond)
+fi
+if [[ "${FIM_STATE_TOKENS:-off}" != "off" ]]; then
+    # OVERFIT_EVAL_STATE_SOURCE=model lets the model write the block itself
+    # (deployable); default oracle writes the true block into the prompt.
+    fim_common+=(--fim-state-tokens "${FIM_STATE_TOKENS}"
+        --state-block-source "${OVERFIT_EVAL_STATE_SOURCE:-oracle}")
 fi
 run_fim_eval() {
     local base=$1; shift

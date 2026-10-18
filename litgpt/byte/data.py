@@ -47,6 +47,30 @@ VOCAB_SIZE = 259  # Bridge/AR vocab: bytes + PAD, SLICE_BOS, and SPAN_BOS.
 PSM_VOCAB_SIZE = 262  # PSM vocab additionally includes BEGIN, HOLE, and END.
 EOS_VOCAB_SIZE = 263  # Adds SEQ_EOS on top of the PSM markers; shared by both formats.
 IGNORE_INDEX = -100  # Cross-entropy ignore label for conditioning-only positions.
+# Join-state block (SPM FIM, fim_state_tokens != "off"): after the suffix,
+# [STATE, MBX_x, MBY_y, ELEM_c, BITS_b] gives the parser state where the suffix
+# starts: macroblock column/row, syntax-element class (probe_labels.CLASSES) and
+# bits already consumed of that element (capped). Ids follow SEQ_EOS.
+STATE_ID = 263
+STATE_MB_RANGE = 256
+STATE_MBX_BASE = 264
+STATE_MBY_BASE = STATE_MBX_BASE + STATE_MB_RANGE  # 520
+STATE_ELEM_BASE = STATE_MBY_BASE + STATE_MB_RANGE  # 776
+STATE_ELEM_COUNT = 19  # == len(probe_labels.CLASSES); checked in join_state_fields
+STATE_BITS_BASE = STATE_ELEM_BASE + STATE_ELEM_COUNT  # 795
+STATE_BITS_COUNT = 16  # bits-into-element 0..15 (probe_labels.MAX_BITS_INTO)
+STATE_VOCAB_SIZE = STATE_BITS_BASE + STATE_BITS_COUNT  # 811
+# (base, size) of the four field tokens, in block order.
+STATE_FIELD_RANGES = (
+    (STATE_MBX_BASE, STATE_MB_RANGE),
+    (STATE_MBY_BASE, STATE_MB_RANGE),
+    (STATE_ELEM_BASE, STATE_ELEM_COUNT),
+    (STATE_BITS_BASE, STATE_BITS_COUNT),
+)
+# "input": the block is conditioning only (no loss on its field tokens).
+# "predict": full-sequence loss also trains the model to predict the block from
+# the context and the suffix, so it can generate it itself at evaluation.
+FIM_STATE_TOKEN_MODES = ("off", "input", "predict")
 
 REGION_REF = 0  # Previous VCL slice bytes used as reference/context.
 REGION_TARGET = 1  # Target-slice bytes in AR mode.
@@ -92,9 +116,15 @@ WINDOW_UNITS = ("byte_budget", "gop")
 WindowUnit = Literal["byte_budget", "gop"]
 
 
-def vocab_size_for_fim_format(fim_format: FIMFormat, use_eos: bool = False) -> int:
+def vocab_size_for_fim_format(
+    fim_format: FIMFormat, use_eos: bool = False, state_tokens: bool = False
+) -> int:
     if fim_format not in FIM_FORMATS:
         raise ValueError(f"fim_format must be one of {FIM_FORMATS}")
+    if state_tokens:
+        if fim_format != "spm" or not use_eos:
+            raise ValueError("join-state tokens require fim_format='spm' and use_eos")
+        return STATE_VOCAB_SIZE
     # SEQ_EOS shares a single id across formats, so enabling it lifts both the
     # bridge and PSM vocabularies to the same size.
     if use_eos:
@@ -130,6 +160,8 @@ class ByteDataConfig:
     # Oracle-length conditioning (spm only): offset ids carry a countdown of the
     # target bytes still to emit and are 0 everywhere else. See _length_countdown.
     fim_length_cond: bool = False
+    # Oracle join-state block after the suffix (spm only). See FIM_STATE_TOKEN_MODES.
+    fim_state_tokens: str = "off"
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -473,6 +505,42 @@ def pad_and_truncate(tensors: list[Tensor], max_seq_length: int, value: int) -> 
     return torch.nn.utils.rnn.pad_sequence(
         truncated, batch_first=True, padding_value=value
     )
+
+
+def join_state_fields(stream: bytes, boundary: int) -> tuple[int, int, int, int]:
+    """(mb_x, mb_y, element class, bits into element) of the parser state before
+    byte ``boundary`` of ``stream`` (Annex-B bytes holding SPS/PPS and the frame).
+
+    Undefined parts (outside macroblock data, or an unparsable stream) map to 0 /
+    the "other" class, so every hole gets a block.
+    """
+    from litgpt.byte import probe_labels as PL
+
+    if len(PL.CLASSES) != STATE_ELEM_COUNT or PL.MAX_BITS_INTO + 1 != STATE_BITS_COUNT:
+        raise RuntimeError("join-state token ranges do not match probe_labels")
+    if boundary >= len(stream):
+        # The hole runs to the end of the frame: the next byte is the next frame's
+        # start code (what a whole-window parse reports there).
+        return 0, 0, PL.CLASS_ID["start_code"], 0
+    try:
+        labels = PL.parser_state_labels(stream)
+        element = labels.element[boundary]
+        bits = labels.bits_into[boundary]
+        mb_x, mb_y = labels.mb_x[boundary], labels.mb_y[boundary]
+    except Exception:  # unsupported/corrupt syntax: keep the sample, mark unknown
+        return 0, 0, PL.CLASS_ID["other"], 0
+    clamp = lambda v, hi: min(max(v, 0), hi - 1)  # noqa: E731
+    return (
+        clamp(mb_x, STATE_MB_RANGE),
+        clamp(mb_y, STATE_MB_RANGE),
+        clamp(element, STATE_ELEM_COUNT),
+        clamp(bits, STATE_BITS_COUNT),
+    )
+
+
+def state_block_ids(fields: tuple[int, int, int, int]) -> list[int]:
+    """[STATE, MBX, MBY, ELEM, BITS] token ids for join-state fields."""
+    return [STATE_ID] + [base + v for (base, _), v in zip(STATE_FIELD_RANGES, fields)]
 
 
 def _length_countdown(
@@ -1184,6 +1252,7 @@ class ByteStreamWindowDataset(Dataset):
         fim_target: str = "middle",
         fim_suffix_context: bool = True,
         fim_length_cond: bool = False,
+        fim_state_tokens: str = "off",
     ) -> None:
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
@@ -1193,6 +1262,18 @@ class ByteStreamWindowDataset(Dataset):
             raise ValueError("fim_target / fim_suffix_context variants require fim_format='spm'")
         if fim_length_cond and fim_format != "spm":
             raise ValueError("fim_length_cond requires fim_format='spm'")
+        if fim_state_tokens not in FIM_STATE_TOKEN_MODES:
+            raise ValueError(f"fim_state_tokens must be one of {FIM_STATE_TOKEN_MODES}")
+        if fim_state_tokens != "off":
+            if fim_format != "spm" or fim_target != "middle" or not fim_suffix_context:
+                raise ValueError(
+                    "fim_state_tokens requires fim_format='spm', fim_target='middle' "
+                    "and the suffix in the input"
+                )
+            if not use_eos:
+                raise ValueError("fim_state_tokens requires use_eos (token ids follow SEQ_EOS)")
+            if fim_length_cond:
+                raise NotImplementedError("fim_state_tokens with fim_length_cond")
         if syntax_mask_dir is not None and not Path(syntax_mask_dir).is_dir():
             raise FileNotFoundError(f"syntax mask directory not found: {syntax_mask_dir}")
         if min_frames < 1:
@@ -1233,6 +1314,7 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_target = fim_target
         self.fim_suffix_context = fim_suffix_context
         self.fim_length_cond = fim_length_cond
+        self.fim_state_tokens = fim_state_tokens
         self._fixed_hole_cache: dict[
             int, tuple[tuple[int, int, int, int], ...]
         ] = {}
@@ -1455,7 +1537,8 @@ class ByteStreamWindowDataset(Dataset):
         ByteSliceDataset's `format_overhead = 2 if psm else 0`.
         """
         markers = 2 if self.fim_format in ("psm", "spm") else 0
-        return markers + (1 if self.use_eos else 0)
+        state = len(STATE_FIELD_RANGES) + 1 if self.fim_state_tokens != "off" else 0
+        return markers + state + (1 if self.use_eos else 0)
 
     def _assert_fim_reachable(self) -> None:
         """Fail loudly when p_fim > 0 but no window can host a hole.
@@ -1875,11 +1958,18 @@ class ByteStreamWindowDataset(Dataset):
             hole_marker = torch.tensor([FIM_HOLE_ID], dtype=torch.long)
             head = torch.tensor([FIM_BEGIN_ID], dtype=torch.long)
             middle_in = missing_tail[:-1]
-            pieces = [context, hole_marker, orphan, head, prefix, middle_in]
+            state_block = torch.empty(0, dtype=torch.long)
+            if self.fim_state_tokens != "off":
+                state_fields = self._join_state_fields(
+                    sample, window, frame_lo, frame_hi, split + gap
+                )
+                state_block = torch.tensor(state_block_ids(state_fields), dtype=torch.long)
+            pieces = [context, hole_marker, orphan, state_block, head, prefix, middle_in]
             regions = [
                 raw_region[:frame_lo],
                 torch.full((1,), REGION_ORPHAN, dtype=torch.long),
                 torch.full((orphan.numel(),), REGION_ORPHAN, dtype=torch.long),
+                torch.full((state_block.numel(),), REGION_ORPHAN, dtype=torch.long),
                 torch.full((1,), REGION_PREFIX, dtype=torch.long),
                 torch.full((prefix.numel(),), REGION_PREFIX, dtype=torch.long),
                 torch.full((middle_in.numel(),), REGION_BRIDGE, dtype=torch.long),
@@ -1889,6 +1979,7 @@ class ByteStreamWindowDataset(Dataset):
                     raw_offset[:frame_lo],
                     torch.zeros(1, dtype=torch.long),
                     raw_offset[suffix_lo:frame_hi],
+                    torch.zeros(state_block.numel(), dtype=torch.long),
                     torch.zeros(1, dtype=torch.long),
                     raw_offset[frame_lo:split],
                     torch.arange(1, middle_in.numel() + 1, dtype=torch.long),
@@ -1952,6 +2043,21 @@ class ByteStreamWindowDataset(Dataset):
             loss_scope=self.fim_loss_scope,
             ignore_index=self.ignore_index,
         )
+        state_meta: dict[str, int] = {}
+        if self.fim_format == "spm" and self.fim_state_tokens != "off":
+            state_at = frame_lo + 1 + orphan.numel()  # index of the STATE marker
+            if int(input_ids[state_at]) != STATE_ID:
+                raise RuntimeError("join-state block is not where the layout puts it")
+            if self.fim_state_tokens == "input":
+                # Positions STATE..ELEM predict the four field tokens: conditioning only.
+                labels[state_at : state_at + len(STATE_FIELD_RANGES)] = self.ignore_index
+            state_meta = {
+                "fim_state_at": state_at,
+                "fim_state_mb_x": state_fields[0],
+                "fim_state_mb_y": state_fields[1],
+                "fim_state_element": state_fields[2],
+                "fim_state_bits": state_fields[3],
+            }
         syntax_masks = None
         if self.syntax_mask_dir is not None:
             if self.fim_format == "spm":
@@ -1978,12 +2084,40 @@ class ByteStreamWindowDataset(Dataset):
             frame_lo=frame_lo,
             frame_hi=frame_hi,
             fim_target_end=target_end,
+            **state_meta,
             **(
                 {"fim_frame_nal_type": nal_types[frame_lo]}
                 if nal_types is not None else {}
             ),
             fim_hole_id=hole_id if hole_id is not None else -1,
         )
+
+    def _join_state_fields(
+        self,
+        sample: WindowSample,
+        window: Tensor,
+        frame_lo: int,
+        frame_hi: int,
+        join: int,
+    ) -> tuple[int, int, int, int]:
+        """Parser state where the received suffix starts (byte ``join`` of the window).
+
+        Parses only the window's parameter sets plus the damaged frame, not the whole
+        GOP: slice-data syntax depends on SPS/PPS and the slice header, not on
+        earlier frames.
+        """
+        params = bytearray()
+        cursor = 0
+        nals = self.nal_index[str(sample.h264_path)][sample.start_nal : sample.end_nal]
+        for nal in nals:
+            size = nal.end - nal.start
+            if cursor >= frame_lo:
+                break
+            if nal.nal_type in PARAMETER_SET_NAL_TYPES:
+                params += bytes(window[cursor : cursor + size].tolist())
+            cursor += size
+        frame = bytes(window[frame_lo:frame_hi].tolist())
+        return join_state_fields(bytes(params) + frame, len(params) + join - frame_lo)
 
     def _with_eos(self, content: Tensor) -> Tensor:
         if not self.use_eos:
@@ -2450,6 +2584,7 @@ class ByteDataModule(DataModule):
                     fim_target=self.config.fim_target,
                     fim_suffix_context=self.config.fim_suffix_context,
                     fim_length_cond=self.config.fim_length_cond,
+                    fim_state_tokens=self.config.fim_state_tokens,
                     nal_index=nal_index,
                     seed=self.config.seed,
                     syntax_mask_dir=self.config.syntax_mask_dir,
@@ -2615,6 +2750,7 @@ class ByteDataModule(DataModule):
             "fim_target": self.config.fim_target,
             "fim_suffix_context": self.config.fim_suffix_context,
             "fim_length_cond": self.config.fim_length_cond,
+            "fim_state_tokens": self.config.fim_state_tokens,
             "fixed_fim_holes_per_window": (
                 self.config.fixed_fim_holes_per_window
             ),

@@ -786,3 +786,87 @@ def test_spm_length_cond_offsets_count_down_to_eos(tmp_path, use_eos):
 def test_length_cond_requires_spm(tmp_path):
     with pytest.raises(ValueError, match="spm"):
         _dataset(tmp_path, fim_length_cond=True)
+
+
+@pytest.mark.parametrize("mode", ["input", "predict"])
+def test_spm_state_tokens_layout_and_labels(tmp_path, mode):
+    from litgpt.byte.data import STATE_FIELD_RANGES, STATE_ID
+
+    ds, data = _dataset(
+        tmp_path, fim_format="spm", fim_loss_scope="full", use_eos=True,
+        fim_state_tokens=mode,
+    )
+    item = ds[0]
+    meta = _meta(item)
+    ids, labels = item["input_ids"], item["labels"]
+    at = meta["fim_state_at"]
+    h = (ids == FIM_HOLE_ID).nonzero().item()
+    b = (ids == FIM_BEGIN_ID).nonzero().item()
+    # [context, HOLE, suffix, STATE, MBX, MBY, ELEM, BITS, BEGIN, prefix, middle]
+    assert ids[at] == STATE_ID and b == at + 5
+    window = torch.tensor(list(data))
+    assert torch.equal(ids[h + 1 : at], window[meta["fim_split"] + meta["fim_gap"] : meta["frame_hi"]])
+    fields = [meta[k] for k in ("fim_state_mb_x", "fim_state_mb_y", "fim_state_element", "fim_state_bits")]
+    for f, (base, size) in enumerate(STATE_FIELD_RANGES):
+        assert ids[at + 1 + f] == base + fields[f] and 0 <= fields[f] < size
+    if mode == "input":
+        assert (labels[at : at + 4] == IGNORE_INDEX).all()
+    else:
+        assert torch.equal(labels[at : at + 4], ids[at + 1 : at + 5])
+    # The fill and its EOS are unchanged by the block.
+    expected_tail = window[meta["fim_split"] : meta["fim_split"] + meta["fim_gap"]].tolist() + [SEQ_EOS_ID]
+    assert labels[-len(expected_tail):].tolist() == expected_tail
+
+
+def test_state_tokens_require_spm_middle(tmp_path):
+    with pytest.raises(ValueError, match="spm"):
+        _dataset(tmp_path, use_eos=True, fim_state_tokens="predict")
+    with pytest.raises(ValueError, match="spm"):
+        _dataset(tmp_path, fim_format="spm", use_eos=True, fim_target="to_frame_end",
+                 fim_state_tokens="predict")
+
+
+def test_join_state_from_frame_matches_whole_window_parse(tmp_path):
+    """The dataset parses only SPS/PPS + the damaged frame; the state must equal the
+    state from parsing the whole window (real libx264 CAVLC clip)."""
+    import shutil
+    import subprocess
+
+    from litgpt.byte import probe_labels as PL
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=96x64:rate=10:duration=0.8",
+        "-c:v", "libx264", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+        "-g", "8", "-bf", "0", "-x264-params", "slices=1:sliced-threads=0",
+        "-f", "h264", "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0 or not result.stdout:
+        pytest.skip("libx264 encode failed")
+    data = result.stdout
+    path = tmp_path / "x264.h264"
+    path.write_bytes(data)
+    ds = ByteStreamWindowDataset(
+        [{"h264_path": str(path), "status": "ok"}],
+        max_seq_length=16384, min_frames=2, p_fim=1.0, fim_format="spm",
+        fim_loss_scope="full", use_eos=True, fim_min_gap=8, fim_max_gap=64,
+        frame_guard_bytes=0, window_unit="gop", resample_fim=True,
+        nal_index={str(path): parse_annexb_nals(data)}, fim_state_tokens="predict",
+    )
+    window = bytes(ds.ar_item(0)["labels"][:-1].tolist())
+    whole = PL.parser_state_labels(window)
+    checked = in_mb = 0
+    for _ in range(40):
+        meta = _meta(ds[0])
+        join = meta["fim_split"] + meta["fim_gap"]
+        got = (meta["fim_state_mb_x"], meta["fim_state_mb_y"],
+               meta["fim_state_element"], meta["fim_state_bits"])
+        ref = (max(whole.mb_x[join], 0), max(whole.mb_y[join], 0),
+               whole.element[join], max(whole.bits_into[join], 0))
+        assert got == ref, (join, got, ref)
+        checked += 1
+        in_mb += whole.in_mb_data(join)
+    assert checked == 40 and in_mb > 20

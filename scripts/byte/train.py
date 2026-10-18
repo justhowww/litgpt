@@ -134,6 +134,16 @@ def parse_args() -> argparse.Namespace:
         help="Hide the received suffix from the input (SPM only; ablation).",
     )
     parser.add_argument(
+        "--fim-state-tokens",
+        choices=("off", "input", "predict"),
+        default="off",
+        help=(
+            "Oracle join-state block [STATE, MBX, MBY, ELEM, BITS] after the suffix "
+            "(SPM, target middle, --use-eos). input: conditioning only; predict: the "
+            "model also learns to predict the block from the context and the suffix."
+        ),
+    )
+    parser.add_argument(
         "--fim-length-cond",
         action="store_true",
         help=(
@@ -748,7 +758,9 @@ def main() -> None:
         n_layer=args.n_layer,
         n_embd=args.n_embd,
         n_head=args.n_head,
-        vocab_size=vocab_size_for_fim_format(args.fim_format, args.use_eos),
+        vocab_size=vocab_size_for_fim_format(
+            args.fim_format, args.use_eos, state_tokens=args.fim_state_tokens != "off"
+        ),
         padding_multiple=8,
         use_region_id=use_region_id,
         use_offset_id=use_offset_id,
@@ -786,6 +798,7 @@ def main() -> None:
         fim_target=args.fim_target,
         fim_suffix_context=not args.fim_no_suffix_context,
         fim_length_cond=args.fim_length_cond,
+        fim_state_tokens=args.fim_state_tokens,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
         window_unit=args.window_unit,
