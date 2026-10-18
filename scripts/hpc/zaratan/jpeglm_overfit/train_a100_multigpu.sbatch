@@ -17,6 +17,8 @@
 #SBATCH --time=1-00:00:00
 
 set -euo pipefail
+# Zaratan A100s are 40 GB or 80 GB; reduce fragmentation so 40 GB cards fit.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 REPO_ROOT=${REPO_ROOT:-"${SLURM_SUBMIT_DIR}"}
 export REPO_ROOT

@@ -38,7 +38,7 @@ training:
   steps: 25000
   warmup_steps: 200
   global_batch_size: 16
-  micro_batch_size: 2           # G4 (12x768) peaked at 41.8 GB with 4
+  micro_batch_size: 1           # fits a 40 GB A100 (micro 2 OOM-ed on one); x16 accumulation
   learning_rate: 0.0003
   min_learning_rate: 0.00003
   eval_interval: 1000
