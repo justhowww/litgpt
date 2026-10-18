@@ -162,6 +162,10 @@ class ByteDataConfig:
     fim_length_cond: bool = False
     # Oracle join-state block after the suffix (spm only). See FIM_STATE_TOKEN_MODES.
     fim_state_tokens: str = "off"
+    # (start, end) usable manifest rows of the fixed test set. Training drops every
+    # row whose source video appears there, so a run over the full corpus (or past
+    # row `start`) stays source-disjoint from the test set. None: no exclusion.
+    exclude_test_rows: tuple[int, int] | None = None
     # "bridge" is the original layout with one SPAN_BOS marker. "psm" uses
     # explicit Prefix-Suffix-Middle markers following code-model FIM practice.
     fim_format: FIMFormat = "bridge"
@@ -2543,6 +2547,17 @@ class ByteDataModule(DataModule):
 
     def setup(self, stage: str = "") -> None:
         rows = load_manifest_rows(self.manifest_path, max_rows=self.max_manifest_rows)
+        if self.config.exclude_test_rows is not None:
+            start, end = self.config.exclude_test_rows
+            test_rows = load_manifest_rows(self.manifest_path, max_rows=end)[start:end]
+            test_sources = {source_video_id(r["h264_path"]) for r in test_rows}
+            before = len(rows)
+            rows = [r for r in rows if source_video_id(r["h264_path"]) not in test_sources]
+            print(
+                f"[split] excluded {before - len(rows):,} rows from {len(test_sources):,} "
+                f"test-set sources (usable rows [{start}, {end})); {len(rows):,} remain",
+                flush=True,
+            )
         index_path = self.nal_index_path or default_nal_index_path(self.manifest_path)
         nal_index = (
             load_nal_index(index_path, self.manifest_path, rows)
@@ -2751,6 +2766,7 @@ class ByteDataModule(DataModule):
             "fim_suffix_context": self.config.fim_suffix_context,
             "fim_length_cond": self.config.fim_length_cond,
             "fim_state_tokens": self.config.fim_state_tokens,
+            "exclude_test_rows": self.config.exclude_test_rows,
             "fixed_fim_holes_per_window": (
                 self.config.fixed_fim_holes_per_window
             ),

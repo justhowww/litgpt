@@ -70,6 +70,8 @@ FIM_SUFFIX_CONTEXT=${FIM_SUFFIX_CONTEXT:-1}
 FIM_LENGTH_COND=${FIM_LENGTH_COND:-0}
 # off / input / predict: oracle join-state token block after the suffix (SPM).
 FIM_STATE_TOKENS=${FIM_STATE_TOKENS:-off}
+# "START END": drop training rows whose source video is in the fixed test set.
+EXCLUDE_TEST_ROWS=${EXCLUDE_TEST_ROWS:-}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -260,6 +262,10 @@ if [[ "${FIM_LENGTH_COND}" == "1" ]]; then
     cmd+=(--fim-length-cond)
 fi
 cmd+=(--fim-state-tokens "${FIM_STATE_TOKENS}")
+if [[ -n "${EXCLUDE_TEST_ROWS}" ]]; then
+    read -r exclude_start exclude_end <<< "${EXCLUDE_TEST_ROWS}"
+    cmd+=(--exclude-test-rows "${exclude_start}" "${exclude_end}")
+fi
 
 if [[ "${SAVE_BEST_VAL}" == "1" ]]; then
     cmd+=(--save-best-val)

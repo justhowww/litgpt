@@ -134,6 +134,17 @@ def parse_args() -> argparse.Namespace:
         help="Hide the received suffix from the input (SPM only; ablation).",
     )
     parser.add_argument(
+        "--exclude-test-rows",
+        type=int,
+        nargs=2,
+        metavar=("START", "END"),
+        default=None,
+        help=(
+            "Drop every training/validation row whose source video appears in usable "
+            "manifest rows [START, END) (the fixed test set)."
+        ),
+    )
+    parser.add_argument(
         "--fim-state-tokens",
         choices=("off", "input", "predict"),
         default="off",
@@ -799,6 +810,7 @@ def main() -> None:
         fim_suffix_context=not args.fim_no_suffix_context,
         fim_length_cond=args.fim_length_cond,
         fim_state_tokens=args.fim_state_tokens,
+        exclude_test_rows=tuple(args.exclude_test_rows) if args.exclude_test_rows else None,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,
         window_unit=args.window_unit,

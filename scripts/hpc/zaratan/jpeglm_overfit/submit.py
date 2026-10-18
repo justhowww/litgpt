@@ -83,7 +83,13 @@ OPTIONAL_FIELDS = {
     # Keep OUT_DIR/best at the lowest validation loss.
     "training": {"save_best_val": ("SAVE_BEST_VAL", False)},
     # zaratan (1x A100) or vulcan (1x RTX A6000); picks the job script in JOB_SCRIPTS.
-    "slurm": {"cluster": ("CLUSTER", "zaratan")},
+    "slurm": {
+        "cluster": ("CLUSTER", "zaratan"),
+        # 1, or 4 (Zaratan only): train on one node with 4 A100s (FSDP), then a
+        # dependent 1-GPU eval job (eval_time wall clock) runs the evaluations.
+        "gpus": ("SLURM_GPUS", "1"),
+        "eval_time": ("EVAL_SBATCH_TIME", "1-00:00:00"),
+    },
     "eval": {
         # Space-separated eval_fim_avclm stop modes: learned_eos and/or parser_reconnect.
         "stop_modes": ("EVAL_STOP_MODES", "learned_eos"),
@@ -181,6 +187,10 @@ def load_config(path: Path) -> dict[str, str]:
         or values["FIM_SUFFIX_CONTEXT"] != "1" or values["FIM_LENGTH_COND"] == "1"
     ):
         raise ValueError("fim.state_tokens requires spm, target middle, suffix context, no length_cond")
+    if values["SLURM_GPUS"] not in {"1", "4"}:
+        raise ValueError("slurm.gpus must be 1 or 4")
+    if values["SLURM_GPUS"] == "4" and values["CLUSTER"] != "zaratan":
+        raise ValueError("slurm.gpus: 4 is implemented for zaratan only")
     if values["CLUSTER"] not in JOB_SCRIPTS:
         raise ValueError(f"slurm.cluster must be one of {sorted(JOB_SCRIPTS)}")
     if values["SPLIT_GROUP"] not in {"clip", "source"}:
@@ -193,8 +203,10 @@ def load_config(path: Path) -> dict[str, str]:
         bounds = values["EVAL_TEST_ROWS"].split()
         if len(bounds) != 2 or not all(b.isdigit() for b in bounds) or int(bounds[0]) >= int(bounds[1]):
             raise ValueError('eval.test_rows must be "START END" with START < END')
-        if int(bounds[0]) < int(values["MAX_ROWS"]):
-            raise ValueError("eval.test_rows must start at or after data.max_rows")
+        # Training rows that reach into (or past) the test rows: drop every training
+        # row whose source video is in the test set (full-corpus runs: max_rows 0).
+        if values["MAX_ROWS"] == "0" or int(bounds[0]) < int(values["MAX_ROWS"]):
+            values["EXCLUDE_TEST_ROWS"] = values["EVAL_TEST_ROWS"]
     mask_modes = values["EVAL_MASK_MODES"].split()
     if not mask_modes or set(mask_modes) - {"off", "on"}:
         raise ValueError("eval.mask_modes must list off and/or on")
@@ -214,8 +226,9 @@ def load_config(path: Path) -> dict[str, str]:
         raise ValueError("n_embd must be divisible by n_head")
     if values["MODEL_ARCHITECTURE"] == "qwen3" and int(values["N_HEAD"]) % 4:
         raise ValueError("Qwen3 n_head must be divisible by 4")
-    if int(values["GLOBAL_BATCH_SIZE"]) % int(values["MICRO_BATCH_SIZE"]):
-        raise ValueError("global_batch_size must be divisible by micro_batch_size (one GPU)")
+    gpus = int(values["SLURM_GPUS"])
+    if int(values["GLOBAL_BATCH_SIZE"]) % (int(values["MICRO_BATCH_SIZE"]) * gpus):
+        raise ValueError("global_batch_size must be divisible by micro_batch_size x slurm.gpus")
     if int(values["WARMUP_STEPS"]) >= int(values["STEPS"]):
         raise ValueError("warmup_steps must be less than steps")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", values["MODEL_TAG"]):
@@ -227,6 +240,7 @@ def load_config(path: Path) -> dict[str, str]:
             raise ValueError(f"{key} must be an absolute path")
 
     corpus = Path(values["STAGED_CORPUS"])
+    values.setdefault("EXCLUDE_TEST_ROWS", "")
     values.update(CONSTANTS)
     if values["CLUSTER"] == "vulcan":
         # vulcan-ampere caps each GPU at 4 CPUs and 48 GB.
@@ -240,6 +254,12 @@ def load_config(path: Path) -> dict[str, str]:
         "LATEST_SAVE_INTERVAL": values["SAVE_INTERVAL"],
         "JOB_SCRIPT": str(JOB_SCRIPTS[values["CLUSTER"]]),
     })
+    if values["SLURM_GPUS"] == "4":
+        values.update({
+            "DEVICES": "4",
+            "TRAIN_CPUS_PER_TASK": "8",
+            "JOB_SCRIPT": str(HERE / "train_a100_multigpu.sbatch"),
+        })
     return values
 
 
@@ -279,7 +299,35 @@ def main() -> None:
         if not re.fullmatch(r"(\d+-)?\d{1,2}:\d{2}:\d{2}", time_override):
             raise ValueError("OVERFIT_SBATCH_TIME must look like 12:00:00 or 1-00:00:00")
         environment["SBATCH_TIME"] = time_override
-    subprocess.run(["bash", str(submit)], env=environment, check=True)
+    if values["SLURM_GPUS"] == "1" or os.environ.get("OVERFIT_EVAL_ONLY") == "1":
+        if os.environ.get("OVERFIT_EVAL_ONLY") == "1":
+            # Eval-only reruns of a multi-GPU run use the 1-GPU job script.
+            environment.update(
+                JOB_SCRIPT=str(JOB_SCRIPTS[values["CLUSTER"]]), DEVICES="1",
+                TRAIN_CPUS_PER_TASK="16", SBATCH_MEM="96G",
+            )
+        subprocess.run(["bash", str(submit)], env=environment, check=True)
+        return
+    # Multi-GPU: training job, then a 1-GPU eval job that waits for it (afterok).
+    train = subprocess.run(
+        ["bash", str(submit)], env=environment, check=True, capture_output=True, text=True
+    )
+    print(train.stdout, end="")
+    match = re.search(r"Submitted JPEG-LM pretraining job (\d+)", train.stdout)
+    if not match:
+        raise RuntimeError("could not read the training job id from submit.sh output")
+    evaluation = dict(environment)
+    evaluation.update(
+        JOB_SCRIPT=str(JOB_SCRIPTS[values["CLUSTER"]]),
+        DEVICES="1",
+        TRAIN_CPUS_PER_TASK="16",
+        SBATCH_MEM="96G",
+        SBATCH_TIME=values["EVAL_SBATCH_TIME"],
+        OVERFIT_EVAL_ONLY="1",
+        AFTER_JOBID=match.group(1),
+        DEPENDENCY_TYPE="afterok",
+    )
+    subprocess.run(["bash", str(submit)], env=evaluation, check=True)
 
 
 if __name__ == "__main__":
