@@ -72,6 +72,8 @@ FIM_LENGTH_COND=${FIM_LENGTH_COND:-0}
 FIM_STATE_TOKENS=${FIM_STATE_TOKENS:-off}
 # "START END": drop training rows whose source video is in the fixed test set.
 EXCLUDE_TEST_ROWS=${EXCLUDE_TEST_ROWS:-}
+# 1 = S4 per-position parser-state conditioning (needs FIM_STATE_TOKENS != off).
+FIM_TRACK_STATE=${FIM_TRACK_STATE:-0}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -262,6 +264,9 @@ if [[ "${FIM_LENGTH_COND}" == "1" ]]; then
     cmd+=(--fim-length-cond)
 fi
 cmd+=(--fim-state-tokens "${FIM_STATE_TOKENS}")
+if [[ "${FIM_TRACK_STATE}" == "1" ]]; then
+    cmd+=(--fim-track-state)
+fi
 if [[ -n "${EXCLUDE_TEST_ROWS}" ]]; then
     read -r exclude_start exclude_end <<< "${EXCLUDE_TEST_ROWS}"
     cmd+=(--exclude-test-rows "${exclude_start}" "${exclude_end}")

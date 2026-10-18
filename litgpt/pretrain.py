@@ -552,6 +552,10 @@ def fit(
             else:
                 offsets = offsets.expand_as(x)
             model_kwargs["offset_ids"] = offsets
+        if getattr(meta_model.config, "cond_vocab_sizes", None):
+            model_kwargs["cond_ids"] = torch.zeros(
+                (*x.shape, len(meta_model.config.cond_vocab_sizes)), dtype=torch.long
+            )
         model_fwd = lambda: meta_model(x, **model_kwargs)  # noqa: F821
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)  # noqa: F821
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)

@@ -864,9 +864,131 @@ def test_join_state_from_frame_matches_whole_window_parse(tmp_path):
         join = meta["fim_split"] + meta["fim_gap"]
         got = (meta["fim_state_mb_x"], meta["fim_state_mb_y"],
                meta["fim_state_element"], meta["fim_state_bits"])
+        if join >= meta["frame_hi"]:
+            # Hole runs to the frame end: the frame-only parse reports the next start
+            # code by convention (a whole-window parse says start_code or other,
+            # depending on the start-code length). Training and eval share it.
+            assert got == (0, 0, PL.CLASS_ID["start_code"], 0)
+            checked += 1
+            continue
         ref = (max(whole.mb_x[join], 0), max(whole.mb_y[join], 0),
                whole.element[join], max(whole.bits_into[join], 0))
         assert got == ref, (join, got, ref)
         checked += 1
         in_mb += whole.in_mb_data(join)
     assert checked == 40 and in_mb > 20
+
+
+def _x264_clip(tmp_path, size="96x64", seconds="0.8"):
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", f"testsrc=size={size}:rate=10:duration={seconds}",
+        "-c:v", "libx264", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+        "-g", "8", "-bf", "0", "-x264-params", "slices=1:sliced-threads=0",
+        "-f", "h264", "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0 or not result.stdout:
+        pytest.skip("libx264 encode failed")
+    path = tmp_path / "x264.h264"
+    path.write_bytes(result.stdout)
+    return path, result.stdout
+
+
+def test_track_state_cond_ids_align_and_match_generation_updates(tmp_path):
+    """S4: cond ids sit on the last prefix byte and every fill input; the last one
+    (before EOS) says "0 macroblocks left"; replaying the fill byte by byte with a
+    fresh StateTracker (what the evaluator does) gives the same ids."""
+    from litgpt.byte.data import (
+        StateTracker,
+        TRACK_COND_VOCAB_SIZES,
+        parameter_set_bytes,
+        track_cond_ids,
+    )
+
+    path, data = _x264_clip(tmp_path)
+    ds = ByteStreamWindowDataset(
+        [{"h264_path": str(path), "status": "ok"}],
+        max_seq_length=16384, min_frames=2, p_fim=1.0, fim_format="spm",
+        fim_loss_scope="full", use_eos=True, fim_min_gap=8, fim_max_gap=64,
+        frame_guard_bytes=0, window_unit="gop", resample_fim=True,
+        nal_index={str(path): parse_annexb_nals(data)},
+        fim_state_tokens="predict", fim_track_state=True,
+    )
+    window = bytes(ds.ar_item(0)["labels"][:-1].tolist())
+    for _ in range(20):
+        item = ds[0]
+        meta = _meta(item)
+        cond, ids = item["cond_ids"], item["input_ids"]
+        assert cond.shape == (ids.numel(), len(TRACK_COND_VOCAB_SIZES))
+        lo, split, gap = meta["frame_lo"], meta["fim_split"], meta["fim_gap"]
+        start = ids.numel() - gap  # first fill input (middle_in has gap bytes with EOS)
+        assert not cond[: start - 1].any()  # nothing before the last prefix byte
+        assert cond[start - 1 :].all()      # every fill-predicting input is set
+        assert cond[-1, 0] == 2             # input before EOS: 0 macroblocks left
+        for f, size in enumerate(TRACK_COND_VOCAB_SIZES):
+            assert int(cond[:, f].max()) < size
+        # Generation-side replay: same tracker class, fed the true fill.
+        tracker = StateTracker(window[:lo], window[lo:split])
+        target = meta["fim_track_target_mbs"]
+        replay = [track_cond_ids(tracker.snapshot(), target)]
+        for byte in window[split : split + gap]:
+            tracker.advance(byte)
+            replay.append(track_cond_ids(tracker.snapshot(), target))
+        assert [tuple(r) for r in cond[start - 1 :].tolist()] == replay
+
+
+def test_state_tracker_frame_seed_matches_whole_window_seed(tmp_path):
+    """Seeding with SPS/PPS + the frame prefix gives the same parser state as
+    replaying the whole window from its start."""
+    from litgpt.byte import h264_mask as HM
+    from litgpt.byte.data import StateTracker, parameter_set_bytes
+
+    _, data = _x264_clip(tmp_path, seconds="1.6")  # 2 GOPs of 8 frames
+    starts = [n.start for n in parse_annexb_nals(data) if n.nal_type in (1, 5)] + [len(data)]
+    checked = 0
+    for lo, hi in zip(starts[:-1], starts[1:]):
+        frame_tracker = StateTracker(data[:lo], b"")
+        full = HM.MaskState(slice_max_mbs=None, fail_closed=True)
+        for byte in data[:lo]:
+            HM.advance(full, byte)
+        whole = StateTracker.__new__(StateTracker)
+        whole._hm, whole.state = HM, full
+        # Before the frame's start code is read, the whole-window parser still sits
+        # in the previous picture ("done") while the frame-only one is between NAL
+        # units. Training and evaluation both seed frame-only; compare from inside
+        # the frame's NAL onward.
+        inside = lo + (4 if data[lo : lo + 4] == b"\x00\x00\x00\x01" else 3)
+        for k in range(lo, hi):
+            if k >= inside:
+                assert frame_tracker.snapshot() == whole.snapshot(), (lo, k)
+                assert not frame_tracker.state.automaton_unknown, (lo, k)
+                checked += 1
+            frame_tracker.advance(data[k])
+            whole.advance(data[k])
+    assert checked > 500
+
+
+def test_model_cond_embeddings_require_and_use_cond_ids():
+    from litgpt.config import Config
+    from litgpt.model import GPT
+
+    config = Config(
+        block_size=32, n_layer=1, n_embd=32, n_head=4, vocab_size=300,
+        padding_multiple=8, cond_vocab_sizes=[5, 7],
+    )
+    model = GPT(config)
+    idx = torch.randint(0, 256, (2, 10))
+    cond = torch.zeros((2, 10, 2), dtype=torch.long)
+    base = model(idx, cond_ids=cond)
+    cond[:, -1, 0] = 3
+    changed = model(idx, cond_ids=cond)
+    assert torch.allclose(base[:, :-1], changed[:, :-1], atol=1e-5)  # causal: only the last position
+    assert not torch.allclose(base[:, -1], changed[:, -1])
+    with pytest.raises(ValueError, match="cond_ids"):
+        model(idx)

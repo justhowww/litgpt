@@ -39,6 +39,11 @@ class Config:
     region_vocab_size: int = 7
     use_offset_id: bool = False
     offset_vocab_size: int | None = None
+    # Byte-domain extension: per-position conditioning fields (e.g. the parser
+    # state during FIM generation). One learned embedding table per field, of the
+    # given size; inputs ``cond_ids`` have shape (B, T, len(cond_vocab_sizes)) and
+    # id 0 means "no information". None disables them.
+    cond_vocab_sizes: list[int] | None = None
     # Architecture family used by the byte-domain training launcher. This is
     # saved in model_config.yaml so byte checkpoints remain self-describing.
     byte_model_architecture: Literal["pythia", "qwen3"] = "pythia"

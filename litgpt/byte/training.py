@@ -1323,6 +1323,10 @@ def get_model_inputs_and_targets(
             model_inputs["offset_ids"] = (
                 batch["offset_ids"][:, :max_seq_length].contiguous().long()
             )
+        if "cond_ids" in batch:
+            model_inputs["cond_ids"] = (
+                batch["cond_ids"][:, :max_seq_length].contiguous().long()
+            )
         return model_inputs, targets
 
     input_ids = batch[:, 0:max_seq_length].contiguous().long()

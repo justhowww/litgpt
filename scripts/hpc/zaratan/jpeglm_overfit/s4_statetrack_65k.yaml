@@ -1,0 +1,67 @@
+schema_version: 1
+
+# S4 (oracle join state + current state): S3 plus, at every fill position, the
+# H.264 parser state after the bytes so far: macroblocks left until the join
+# macroblock, current syntax element, bits into it (learned embeddings; computed
+# by the same mask automaton in training and generation). No bytes-left signal.
+# Base S3: G4 plus a token block after the received suffix that
+# gives the parser state where the suffix starts: [STATE, MBX, MBY, ELEM, BITS]
+# (macroblock column/row, syntax-element class, bits into the element). Loss mode
+# "predict": the model also learns to write the block from the context and the
+# suffix. Eval: oracle block (default); OVERFIT_EVAL_STATE_SOURCE=model for the
+# model-written block. Same data, model, steps and test set as G4.
+run:
+  staged_corpus: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm
+  model_tag: byte-jpeglm-gen-s4-statetrack-65k-12x768-bytes-ctx16k
+  out_dir: /home/huangyh/scratch.metzler-prj/OpenVid-1M_Data/data-jpeglm/runs/byte-jpeglm-gen-s4-statetrack-65k-12x768-bytes-ctx16k
+
+model:
+  architecture: qwen3
+  n_layer: 12
+  n_embd: 768
+  n_head: 12
+  raw_context_bytes: 16384
+
+data:
+  max_rows: 69632
+  val_fraction: 0.06          # held-out sources, used only to pick the best checkpoint
+  split_group: source
+  num_workers: 8
+  window_min_frames: 2
+
+fim:
+  p_fim: 1.0
+  format: spm
+  state_tokens: "predict"
+  track_state: true
+  fixed_holes_per_window: 0   # new hole every access
+  span_loss_weight: 0
+  eos_aux_loss_weight: 0
+  min_gap: 64
+  max_gap: 600
+
+training:
+  steps: 25000
+  warmup_steps: 200
+  global_batch_size: 16
+  micro_batch_size: 4
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 1000
+  save_interval: 25000
+  save_best_val: true
+  activation_checkpointing: true
+  compile: true
+
+slurm:
+  account: metzler-prj-cmsc
+  mem: 96G
+  time: "16:00:00"
+
+eval:
+  ffmpeg_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffmpeg
+  ffprobe_binary: /home/huangyh/scratch.metzler-prj/miniforge3/bin/ffprobe
+  stop_modes: learned_eos
+  checkpoint: best
+  test_rows: "70000 70400"
+  mask_modes: "off on"

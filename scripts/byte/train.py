@@ -25,6 +25,7 @@ from litgpt.byte.data import (
     ByteDataConfig,
     ByteDataModule,
     vocab_size_for_fim_format,
+    TRACK_COND_VOCAB_SIZES,
 )
 from litgpt.byte.reconstruction import ReconstructionEvalConfig
 from litgpt.byte.free_run_eval import FreeRunEvalConfig
@@ -142,6 +143,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Drop every training/validation row whose source video appears in usable "
             "manifest rows [START, END) (the fixed test set)."
+        ),
+    )
+    parser.add_argument(
+        "--fim-track-state",
+        action="store_true",
+        help=(
+            "S4: per-position parser-state conditioning along the fill (macroblocks "
+            "left until the join, current element, bits into it); needs "
+            "--fim-state-tokens and patch size 1."
         ),
     )
     parser.add_argument(
@@ -784,6 +794,7 @@ def main() -> None:
         megabyte_local_n_layer=args.megabyte_local_layers,
         megabyte_local_n_embd=args.megabyte_local_embd,
         megabyte_local_n_head=args.megabyte_local_heads,
+        cond_vocab_sizes=list(TRACK_COND_VOCAB_SIZES) if args.fim_track_state else None,
     )
     data_config = ByteDataConfig(
         byte_patch_size=args.byte_patch_size,
@@ -810,6 +821,7 @@ def main() -> None:
         fim_suffix_context=not args.fim_no_suffix_context,
         fim_length_cond=args.fim_length_cond,
         fim_state_tokens=args.fim_state_tokens,
+        fim_track_state=args.fim_track_state,
         exclude_test_rows=tuple(args.exclude_test_rows) if args.exclude_test_rows else None,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,

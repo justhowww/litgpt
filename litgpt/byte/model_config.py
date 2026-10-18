@@ -37,6 +37,7 @@ def build_byte_model_config(
     megabyte_local_n_layer: int,
     megabyte_local_n_embd: int,
     megabyte_local_n_head: int,
+    cond_vocab_sizes: list[int] | None = None,
 ) -> Config:
     """Build a size-controlled Pythia- or Qwen3-style byte model.
 
@@ -67,6 +68,7 @@ def build_byte_model_config(
         megabyte_local_n_layer=megabyte_local_n_layer,
         megabyte_local_n_embd=megabyte_local_n_embd,
         megabyte_local_n_head=megabyte_local_n_head,
+        cond_vocab_sizes=cond_vocab_sizes,
     )
 
     if architecture == "pythia":

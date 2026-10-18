@@ -98,6 +98,9 @@ if [[ "${FIM_STATE_TOKENS:-off}" != "off" ]]; then
     fim_common+=(--fim-state-tokens "${FIM_STATE_TOKENS}"
         --state-block-source "${OVERFIT_EVAL_STATE_SOURCE:-oracle}")
 fi
+if [[ "${FIM_TRACK_STATE:-0}" == "1" ]]; then
+    fim_common+=(--fim-track-state)
+fi
 run_fim_eval() {
     local base=$1; shift
     local mode name out

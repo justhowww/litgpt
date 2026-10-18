@@ -71,6 +71,21 @@ STATE_FIELD_RANGES = (
 # "predict": full-sequence loss also trains the model to predict the block from
 # the context and the suffix, so it can generate it itself at evaluation.
 FIM_STATE_TOKEN_MODES = ("off", "input", "predict")
+# S4 per-position conditioning (fim_track_state): at every input position whose
+# next prediction is a fill byte (or EOS), three fields describe the H.264 mask
+# automaton after the bytes so far: macroblocks left until the join macroblock,
+# the current syntax element and the bits already read of it. Id 0 = no info.
+TRACK_ELEMENTS = (
+    "nal", "slice_header", "mb_skip_run", "mb_type", "sub_mb_type", "ref_idx", "mvd",
+    "prev_intra", "rem_intra", "intra_chroma", "cbp", "mb_qp_delta", "coeff_token",
+    "signs", "level_prefix", "level_suffix", "total_zeros", "run_before", "pcm",
+    "trailing", "done", "other",
+)
+TRACK_ELEMENT_ID = {name: i for i, name in enumerate(TRACK_ELEMENTS)}
+TRACK_MBS_VOCAB = 256  # 1 = past the join macroblock; 2 + d for d >= 0 left (capped)
+TRACK_ELEM_VOCAB = 1 + len(TRACK_ELEMENTS)
+TRACK_BITS_VOCAB = 17  # 1 + bits (0..15, capped)
+TRACK_COND_VOCAB_SIZES = [TRACK_MBS_VOCAB, TRACK_ELEM_VOCAB, TRACK_BITS_VOCAB]
 
 REGION_REF = 0  # Previous VCL slice bytes used as reference/context.
 REGION_TARGET = 1  # Target-slice bytes in AR mode.
@@ -162,6 +177,9 @@ class ByteDataConfig:
     fim_length_cond: bool = False
     # Oracle join-state block after the suffix (spm only). See FIM_STATE_TOKEN_MODES.
     fim_state_tokens: str = "off"
+    # S4: per-position parser-state conditioning along the fill (needs
+    # fim_state_tokens != "off"). See TRACK_ELEMENTS.
+    fim_track_state: bool = False
     # (start, end) usable manifest rows of the fixed test set. Training drops every
     # row whose source video appears there, so a run over the full corpus (or past
     # row `start`) stays source-disjoint from the test set. None: no exclusion.
@@ -540,6 +558,84 @@ def join_state_fields(stream: bytes, boundary: int) -> tuple[int, int, int, int]
         clamp(element, STATE_ELEM_COUNT),
         clamp(bits, STATE_BITS_COUNT),
     )
+
+
+def parameter_set_bytes(stream: bytes) -> bytes:
+    """Concatenated SPS/PPS NAL units (with start codes) found in ``stream``."""
+    return b"".join(
+        stream[nal.start : nal.end]
+        for nal in parse_annexb_nals(stream)
+        if nal.nal_type in PARAMETER_SET_NAL_TYPES
+    )
+
+
+class StateTracker:
+    """H.264 mask-automaton state of a fill, for the S4 conditioning fields.
+
+    Seeded with the window's parameter sets and the damaged frame up to the hole,
+    then fed the fill byte by byte. Earlier frames are not replayed (too slow in a
+    data loader); the one piece of cross-picture state the parser checks, the
+    number of available reference pictures, is set from their NAL headers. The
+    dataset (true fill) and the evaluator (generated fill) both use this class.
+    """
+
+    def __init__(self, before_frame: bytes, frame_prefix: bytes) -> None:
+        from litgpt.byte import h264_mask as HM
+
+        self._hm = HM
+        self.state = HM.MaskState(slice_max_mbs=None, fail_closed=True)
+        params = parameter_set_bytes(before_frame)
+        for byte in params:
+            HM.advance(self.state, byte)
+        self.state.picture.reference_pictures = _available_references(before_frame, params)
+        for byte in frame_prefix:
+            HM.advance(self.state, byte)
+
+    def advance(self, byte: int) -> None:
+        self._hm.advance(self.state, byte)
+
+    def snapshot(self) -> tuple[int, int, int]:
+        """(macroblocks done, element index in TRACK_ELEMENTS, bits into element)."""
+        s = self.state
+        auto = s.automaton
+        if s.automaton_unknown:
+            return 0, TRACK_ELEMENT_ID["other"], 0
+        if auto is None or not s.cur_is_vcl or s.expect_nal_header:
+            return 0, TRACK_ELEMENT_ID["nal"], 0
+        mb = getattr(auto, "_mb", None)
+        if mb is None:
+            bits = len(getattr(auto, "ae_bits", "") or "")
+            return 0, TRACK_ELEMENT_ID["slice_header"], bits
+        if mb.stage in ("trailing", "done"):
+            return mb.mbs_done, TRACK_ELEMENT_ID[mb.stage], 0
+        tag = getattr(mb, "ae_tag", None) or "other"
+        tag = "pcm" if tag.startswith("pcm") else tag
+        element = TRACK_ELEMENT_ID.get(tag, TRACK_ELEMENT_ID["other"])
+        return mb.mbs_done, element, len(getattr(mb, "ae_bits", "") or "")
+
+
+def _available_references(before_frame: bytes, params: bytes) -> int:
+    """Reference pictures since the last IDR (one slice per picture), capped by the
+    SPS's max_num_ref_frames: what the mask's PictureState holds at the frame."""
+    count = 0
+    for nal in parse_annexb_nals(before_frame):
+        if nal.nal_type == 5:
+            count = 0
+        if nal.nal_type in VCL_NAL_TYPES:
+            header = before_frame[nal.start + nal.start_code_len]
+            if (header >> 5) & 0x3:
+                count += 1
+    sps = next(iter(HS.parse_stream(params).sps.values()), None) if params else None
+    cap = max(1, sps.max_num_ref_frames) if sps is not None else count
+    return min(count, cap)
+
+
+def track_cond_ids(snapshot: tuple[int, int, int], target_mbs: int) -> tuple[int, int, int]:
+    """Conditioning ids (macroblocks left, element, bits) for one tracker snapshot."""
+    mbs_done, element, bits = snapshot
+    left = target_mbs - mbs_done
+    mbs_id = 1 if left < 0 else 2 + min(left, TRACK_MBS_VOCAB - 3)
+    return mbs_id, 1 + element, 1 + min(bits, TRACK_BITS_VOCAB - 2)
 
 
 def state_block_ids(fields: tuple[int, int, int, int]) -> list[int]:
@@ -1257,6 +1353,7 @@ class ByteStreamWindowDataset(Dataset):
         fim_suffix_context: bool = True,
         fim_length_cond: bool = False,
         fim_state_tokens: str = "off",
+        fim_track_state: bool = False,
     ) -> None:
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
@@ -1278,6 +1375,8 @@ class ByteStreamWindowDataset(Dataset):
                 raise ValueError("fim_state_tokens requires use_eos (token ids follow SEQ_EOS)")
             if fim_length_cond:
                 raise NotImplementedError("fim_state_tokens with fim_length_cond")
+        if fim_track_state and fim_state_tokens == "off":
+            raise ValueError("fim_track_state (S4) requires fim_state_tokens (S3 block)")
         if syntax_mask_dir is not None and not Path(syntax_mask_dir).is_dir():
             raise FileNotFoundError(f"syntax mask directory not found: {syntax_mask_dir}")
         if min_frames < 1:
@@ -1319,6 +1418,7 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_suffix_context = fim_suffix_context
         self.fim_length_cond = fim_length_cond
         self.fim_state_tokens = fim_state_tokens
+        self.fim_track_state = fim_track_state
         self._fixed_hole_cache: dict[
             int, tuple[tuple[int, int, int, int], ...]
         ] = {}
@@ -1901,6 +2001,10 @@ class ByteStreamWindowDataset(Dataset):
         )
         if self.fim_length_cond:
             offset_ids = torch.zeros_like(offset_ids)
+        ar_cond = (
+            torch.zeros((input_ids.numel(), len(TRACK_COND_VOCAB_SIZES)), dtype=torch.long)
+            if self.fim_track_state else None
+        )
         syntax_masks = None
         if self.syntax_mask_dir is not None:
             # labels = window (+ EOS): label k is window byte k; EOS is unconstrained.
@@ -1909,10 +2013,13 @@ class ByteStreamWindowDataset(Dataset):
             syntax_masks = self._syntax_label_masks(
                 sample, window.numel(), labels, label_offsets
             )
-        return self._pack_item(
+        item = self._pack_item(
             input_ids, labels, region_ids, offset_ids, sample, "ar",
             syntax_masks=syntax_masks,
         )
+        if ar_cond is not None:
+            item["cond_ids"] = ar_cond
+        return item
 
     def _build_fim_item(
         self,
@@ -2048,6 +2155,7 @@ class ByteStreamWindowDataset(Dataset):
             ignore_index=self.ignore_index,
         )
         state_meta: dict[str, int] = {}
+        cond_ids = None
         if self.fim_format == "spm" and self.fim_state_tokens != "off":
             state_at = frame_lo + 1 + orphan.numel()  # index of the STATE marker
             if int(input_ids[state_at]) != STATE_ID:
@@ -2055,13 +2163,18 @@ class ByteStreamWindowDataset(Dataset):
             if self.fim_state_tokens == "input":
                 # Positions STATE..ELEM predict the four field tokens: conditioning only.
                 labels[state_at : state_at + len(STATE_FIELD_RANGES)] = self.ignore_index
-            state_meta = {
+            if self.fim_track_state:
+                cond_ids, target_mbs = self._track_cond_ids(
+                    window, frame_lo, split, missing, input_ids.numel(), middle_in.numel()
+                )
+                state_meta["fim_track_target_mbs"] = target_mbs
+            state_meta.update({
                 "fim_state_at": state_at,
                 "fim_state_mb_x": state_fields[0],
                 "fim_state_mb_y": state_fields[1],
                 "fim_state_element": state_fields[2],
                 "fim_state_bits": state_fields[3],
-            }
+            })
         syntax_masks = None
         if self.syntax_mask_dir is not None:
             if self.fim_format == "spm":
@@ -2075,7 +2188,7 @@ class ByteStreamWindowDataset(Dataset):
                     middle_in.numel(), labels.numel(),
                 ),
             )
-        return self._pack_item(
+        item = self._pack_item(
             input_ids,
             labels,
             region_ids,
@@ -2095,6 +2208,37 @@ class ByteStreamWindowDataset(Dataset):
             ),
             fim_hole_id=hole_id if hole_id is not None else -1,
         )
+        if self.fim_track_state:
+            item["cond_ids"] = cond_ids
+        return item
+
+    def _track_cond_ids(
+        self,
+        window: Tensor,
+        frame_lo: int,
+        split: int,
+        missing: Tensor,
+        seq_len: int,
+        middle_len: int,
+    ) -> tuple[Tensor, int]:
+        """S4 conditioning ids along the true fill, and the join's macroblock count.
+
+        Layout tail: [..., prefix, middle_in]. The last prefix byte predicts fill
+        byte 0 and carries the state after the prefix (j = 0); middle_in[i]
+        predicts fill byte i+1 (or EOS) and carries the state after i+1 fill bytes.
+        """
+        data = bytes(window[:split].tolist())
+        tracker = StateTracker(data[:frame_lo], data[frame_lo:split])
+        snaps = [tracker.snapshot()]
+        for byte in missing.tolist():
+            tracker.advance(byte)
+            snaps.append(tracker.snapshot())
+        target_mbs = snaps[-1][0]
+        cond = torch.zeros((seq_len, len(TRACK_COND_VOCAB_SIZES)), dtype=torch.long)
+        start = seq_len - middle_len  # first middle_in position
+        for j in range(middle_len + 1):
+            cond[start - 1 + j] = torch.tensor(track_cond_ids(snaps[j], target_mbs))
+        return cond, target_mbs
 
     def _join_state_fields(
         self,
@@ -2274,6 +2418,15 @@ def collate_byte_samples(
         ),
         "offset_ids": pad_and_truncate(
             [sample["offset_ids"] for sample in samples], max_seq_length, 0
+        ),
+        **(
+            {
+                "cond_ids": pad_and_truncate(
+                    [sample["cond_ids"] for sample in samples], max_seq_length, 0
+                )
+            }
+            if all("cond_ids" in sample for sample in samples)
+            else {}
         ),
         **(
             {
@@ -2600,6 +2753,7 @@ class ByteDataModule(DataModule):
                     fim_suffix_context=self.config.fim_suffix_context,
                     fim_length_cond=self.config.fim_length_cond,
                     fim_state_tokens=self.config.fim_state_tokens,
+                    fim_track_state=self.config.fim_track_state,
                     nal_index=nal_index,
                     seed=self.config.seed,
                     syntax_mask_dir=self.config.syntax_mask_dir,
@@ -2766,6 +2920,7 @@ class ByteDataModule(DataModule):
             "fim_suffix_context": self.config.fim_suffix_context,
             "fim_length_cond": self.config.fim_length_cond,
             "fim_state_tokens": self.config.fim_state_tokens,
+            "fim_track_state": self.config.fim_track_state,
             "exclude_test_rows": self.config.exclude_test_rows,
             "fixed_fim_holes_per_window": (
                 self.config.fixed_fim_holes_per_window

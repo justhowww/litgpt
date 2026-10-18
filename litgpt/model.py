@@ -43,6 +43,12 @@ class GPT(nn.Module):
             self.transformer["offset_wte"] = nn.Embedding(
                 config.offset_vocab_size, config.n_embd
             )
+        if config.cond_vocab_sizes:
+            if config.byte_patch_size != 1:
+                raise ValueError("cond_vocab_sizes requires byte_patch_size == 1")
+            self.transformer["cond_wte"] = nn.ModuleList(
+                nn.Embedding(size, config.n_embd) for size in config.cond_vocab_sizes
+            )
         if config.byte_patch_size > 1:
             patch_size = config.byte_patch_size
             global_byte_dim = config.n_embd // patch_size
@@ -322,6 +328,7 @@ class GPT(nn.Module):
         region_ids: torch.Tensor | None = None,
         offset_ids: torch.Tensor | None = None,
         patch_targets: torch.Tensor | None = None,
+        cond_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -384,6 +391,7 @@ class GPT(nn.Module):
             input_pos_maxp1=input_pos_maxp1,
             region_ids=region_ids,
             offset_ids=offset_ids,
+            cond_ids=cond_ids,
         )
         T = idx.size(1)
         clamp_head = (
@@ -442,6 +450,7 @@ class GPT(nn.Module):
         input_pos_maxp1: int | None,
         region_ids: torch.Tensor | None,
         offset_ids: torch.Tensor | None,
+        cond_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Shared global Transformer path for training and cached generation."""
         patch_size = self.config.byte_patch_size
@@ -505,6 +514,15 @@ class GPT(nn.Module):
                 x = x + self.transformer.offset_wte(
                     offset_ids.clamp_max(self.config.offset_vocab_size - 1)
                 )
+            if self.config.cond_vocab_sizes:
+                if cond_ids is None:
+                    raise ValueError(
+                        "cond_ids must be provided when config.cond_vocab_sizes is set"
+                    )
+                for field, (table, size) in enumerate(
+                    zip(self.transformer.cond_wte, self.config.cond_vocab_sizes)
+                ):
+                    x = x + table(cond_ids[..., field].clamp(0, size - 1))
         if self.config.scale_embeddings:
             embedding_dim = (
                 self.config.n_embd // patch_size
