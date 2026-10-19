@@ -73,6 +73,8 @@ OPTIONAL_FIELDS = {
         "state_tokens": ("FIM_STATE_TOKENS", "off"),
         # true: S4 per-position parser-state conditioning (needs state_tokens).
         "track_state": ("FIM_TRACK_STATE", False),
+        # true: S5 join-macroblock fields (needs track_state).
+        "track_join_mb": ("FIM_TRACK_JOIN_MB", False),
     },
     # clip (legacy) or source: keep every clip of one source video in one split.
     "data": {
@@ -191,6 +193,8 @@ def load_config(path: Path) -> dict[str, str]:
         raise ValueError("fim.state_tokens requires spm, target middle, suffix context, no length_cond")
     if values["FIM_TRACK_STATE"] == "1" and values["FIM_STATE_TOKENS"] == "off":
         raise ValueError("fim.track_state requires fim.state_tokens")
+    if values["FIM_TRACK_JOIN_MB"] == "1" and values["FIM_TRACK_STATE"] != "1":
+        raise ValueError("fim.track_join_mb requires fim.track_state")
     if values["SLURM_GPUS"] not in {"1", "4"}:
         raise ValueError("slurm.gpus must be 1 or 4")
     if values["SLURM_GPUS"] == "4" and values["CLUSTER"] != "zaratan":

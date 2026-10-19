@@ -1,0 +1,69 @@
+schema_version: 1
+
+# S5 (join macroblock): S4 plus five per-position fields about the join
+# macroblock -- static: its mb_type, coded_block_pattern and the residual block
+# at the join (oracle, from the original stream); dynamic: the current residual
+# block and the elements left inside the join macroblock. Same data/model/test
+# set as S3/S4 on Vulcan, but 75k steps; permanent checkpoints every 25k steps
+# (step-00025000 matches S3/S4's step; note the cosine LR there is still high).
+#
+# Vulcan copy (1x RTX A6000, 48 GB); micro_batch 2 (x8 accumulation).
+run:
+  staged_corpus: /fs/nexus-projects/time-control-videogen/data-jpeglm
+  model_tag: byte-jpeglm-gen-s5-joinmb-65k-75k-12x768-bytes-ctx16k
+  out_dir: /fs/nexus-projects/time-control-videogen/data-jpeglm/runs/byte-jpeglm-gen-s5-joinmb-65k-75k-12x768-bytes-ctx16k
+
+model:
+  architecture: qwen3
+  n_layer: 12
+  n_embd: 768
+  n_head: 12
+  raw_context_bytes: 16384
+
+data:
+  max_rows: 69632
+  val_fraction: 0.06          # held-out sources, used only to pick the best checkpoint
+  split_group: source
+  # Pilot index of the first 70,400 usable rows (training rows + test rows 70000-70400).
+  nal_index: /fs/nexus-projects/time-control-videogen/data-jpeglm/nal_index_70k.sqlite
+  num_workers: 3
+  window_min_frames: 2
+
+fim:
+  p_fim: 1.0
+  format: spm
+  state_tokens: "predict"
+  track_state: true
+  track_join_mb: true
+  fixed_holes_per_window: 0   # new hole every access
+  span_loss_weight: 0
+  eos_aux_loss_weight: 0
+  min_gap: 64
+  max_gap: 600
+
+training:
+  steps: 75000
+  warmup_steps: 200
+  global_batch_size: 16
+  micro_batch_size: 2
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  eval_interval: 1000
+  save_interval: 25000         # step-00025000 / 50000 / 75000 checkpoints
+  save_best_val: true
+  activation_checkpointing: true
+  compile: true
+
+slurm:
+  cluster: vulcan
+  account: vulcan-metzler
+  mem: 48G
+  time: "72:00:00"
+
+eval:
+  ffmpeg_binary: /opt/local/stow/ffmpeg-7.1/bin/ffmpeg
+  ffprobe_binary: /opt/local/stow/ffmpeg-7.1/bin/ffprobe
+  stop_modes: learned_eos
+  checkpoint: best
+  test_rows: "70000 70400"
+  mask_modes: "off on"

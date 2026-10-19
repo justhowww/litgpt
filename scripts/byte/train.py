@@ -26,6 +26,7 @@ from litgpt.byte.data import (
     ByteDataModule,
     vocab_size_for_fim_format,
     TRACK_COND_VOCAB_SIZES,
+    TRACK_JOIN_MB_VOCAB_SIZES,
 )
 from litgpt.byte.reconstruction import ReconstructionEvalConfig
 from litgpt.byte.free_run_eval import FreeRunEvalConfig
@@ -143,6 +144,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Drop every training/validation row whose source video appears in usable "
             "manifest rows [START, END) (the fixed test set)."
+        ),
+    )
+    parser.add_argument(
+        "--fim-track-join-mb",
+        action="store_true",
+        help=(
+            "S5: add join-macroblock fields to --fim-track-state (target mb_type, "
+            "coded_block_pattern and block instance; current block; elements left "
+            "inside the join macroblock)."
         ),
     )
     parser.add_argument(
@@ -794,7 +804,11 @@ def main() -> None:
         megabyte_local_n_layer=args.megabyte_local_layers,
         megabyte_local_n_embd=args.megabyte_local_embd,
         megabyte_local_n_head=args.megabyte_local_heads,
-        cond_vocab_sizes=list(TRACK_COND_VOCAB_SIZES) if args.fim_track_state else None,
+        cond_vocab_sizes=(
+            list(TRACK_COND_VOCAB_SIZES)
+            + (list(TRACK_JOIN_MB_VOCAB_SIZES) if args.fim_track_join_mb else [])
+            if args.fim_track_state else None
+        ),
     )
     data_config = ByteDataConfig(
         byte_patch_size=args.byte_patch_size,
@@ -822,6 +836,7 @@ def main() -> None:
         fim_length_cond=args.fim_length_cond,
         fim_state_tokens=args.fim_state_tokens,
         fim_track_state=args.fim_track_state,
+        fim_track_join_mb=args.fim_track_join_mb,
         exclude_test_rows=tuple(args.exclude_test_rows) if args.exclude_test_rows else None,
         dataset_mode=args.dataset_mode,
         window_min_frames=args.window_min_frames,

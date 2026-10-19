@@ -103,6 +103,9 @@ fi
 if [[ "${FIM_TRACK_STATE:-0}" == "1" ]]; then
     fim_common+=(--fim-track-state)
 fi
+if [[ "${FIM_TRACK_JOIN_MB:-0}" == "1" ]]; then
+    fim_common+=(--fim-track-join-mb)
+fi
 run_fim_eval() {
     local base=$1; shift
     local mode name out

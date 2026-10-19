@@ -992,3 +992,56 @@ def test_model_cond_embeddings_require_and_use_cond_ids():
     assert not torch.allclose(base[:, -1], changed[:, -1])
     with pytest.raises(ValueError, match="cond_ids"):
         model(idx)
+
+
+def test_track_join_mb_fields_static_target_and_replay(tmp_path):
+    """S5: eight extra fields; the six target fields are the same at every fill
+    position; at the join the fill is "0 elements left" inside the join macroblock;
+    a byte-by-byte replay (what the evaluator does) gives the same ids."""
+    from litgpt.byte.data import (
+        StateTracker,
+        TRACK_COND_VOCAB_SIZES,
+        TRACK_JOIN_MB_VOCAB_SIZES,
+        join_mb_cond_ids,
+        track_cond_ids,
+    )
+
+    path, data = _x264_clip(tmp_path)
+    ds = ByteStreamWindowDataset(
+        [{"h264_path": str(path), "status": "ok"}],
+        max_seq_length=16384, min_frames=2, p_fim=1.0, fim_format="spm",
+        fim_loss_scope="full", use_eos=True, fim_min_gap=8, fim_max_gap=64,
+        frame_guard_bytes=0, window_unit="gop", resample_fim=True,
+        nal_index={str(path): parse_annexb_nals(data)},
+        fim_state_tokens="predict", fim_track_state=True, fim_track_join_mb=True,
+    )
+    sizes = TRACK_COND_VOCAB_SIZES + TRACK_JOIN_MB_VOCAB_SIZES
+    window = bytes(ds.ar_item(0)["labels"][:-1].tolist())
+    in_mb_joins = 0
+    for _ in range(20):
+        item = ds[0]
+        meta = _meta(item)
+        cond = item["cond_ids"]
+        assert cond.shape[1] == len(sizes)
+        lo, split, gap = meta["frame_lo"], meta["fim_split"], meta["fim_gap"]
+        start = item["input_ids"].numel() - gap
+        fill_rows = cond[start - 1 :]
+        for f, size in enumerate(sizes):
+            assert int(cond[:, f].max()) < size
+        for f in (3, 4, 5, 8, 9, 10):  # static: mb_type, cbp, block, tc, t1, nC
+            assert (fill_rows[:, f] == fill_rows[0, f]).all()
+        if int(fill_rows[-1, 0]) == 2:  # at the join macroblock
+            assert int(fill_rows[-1, 7]) == 3 + 8  # 0 elements left
+            in_mb_joins += 1
+        target = {key: meta[f"fim_track_join_{key}"]
+                  for key in ("mbs", "ordinal", "mb_type_id", "cbp_id", "block_id",
+                              "tc_id", "t1_id", "nc_id")}
+        tracker = StateTracker(window[:lo], window[lo:split])
+        replay = []
+        for j in range(gap + 1):
+            if j:
+                tracker.advance(window[split + j - 1])
+            replay.append(track_cond_ids(tracker.snapshot(), meta["fim_track_target_mbs"])
+                          + join_mb_cond_ids(tracker.detail(), target))
+        assert [tuple(r) for r in fill_rows.tolist()] == replay
+    assert in_mb_joins > 0

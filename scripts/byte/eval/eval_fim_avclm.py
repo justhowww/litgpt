@@ -72,6 +72,8 @@ from litgpt.byte.data import (  # noqa: E402
     TRACK_COND_VOCAB_SIZES,
     VCL_NAL_TYPES,
     StateTracker,
+    TRACK_JOIN_MB_VOCAB_SIZES,
+    join_mb_cond_ids,
     parameter_set_bytes,
     track_cond_ids,
     ByteStreamWindowDataset,
@@ -132,6 +134,8 @@ class WindowFimSample:
     teacher_cond_ids: Tensor | None = None
     track_params: bytes | None = None
     track_target_mbs: int | None = None
+    # S5: oracle join-macroblock target (join_mb_target keys); None when off.
+    track_join_target: dict | None = None
 
     @property
     def target_length(self) -> int:
@@ -365,6 +369,11 @@ def parse_args() -> argparse.Namespace:
         choices=("off", "input", "predict"),
         default="off",
         help="Join-state token block after the suffix (must match training).",
+    )
+    parser.add_argument(
+        "--fim-track-join-mb",
+        action="store_true",
+        help="S5 join-macroblock conditioning fields (must match training).",
     )
     parser.add_argument(
         "--fim-track-state",
@@ -1008,6 +1017,7 @@ def _load_eval_dataset(
         fim_length_cond=args.fim_length_cond,
         fim_state_tokens=args.fim_state_tokens,
         fim_track_state=args.fim_track_state,
+        fim_track_join_mb=args.fim_track_join_mb,
     )
 
 
@@ -1427,6 +1437,12 @@ def _materialize_fim_sample(
                 teacher_cond_ids=item["cond_ids"].clone(),
                 track_params=parameter_set_bytes(window_bytes[: int(meta["frame_lo"])]),
                 track_target_mbs=int(meta["fim_track_target_mbs"]),
+                track_join_target=(
+                    {key: int(meta[f"fim_track_join_{key}"])
+                     for key in ("mbs", "ordinal", "mb_type_id", "cbp_id", "block_id",
+                                 "tc_id", "t1_id", "nc_id")}
+                    if dataset.fim_track_join_mb else None
+                ),
             )
             if dataset.fim_track_state
             else {}
@@ -1620,6 +1636,15 @@ def gt_parser_reconnects(sample: WindowFimSample, *, slice_max_mbs: int | None) 
         if state.automaton_unknown:
             return False
     return HM.can_append_bytes(state, sample.join_suffix, require_complete=True)
+
+
+def _tracker_cond(sample: WindowFimSample, tracker: StateTracker) -> tuple[int, ...]:
+    """S4 (+ S5) conditioning ids for the tracker's current state."""
+    ids = track_cond_ids(tracker.snapshot(), int(sample.track_target_mbs))
+    if sample.track_join_target is not None:
+        target = dict(sample.track_join_target, mbs=int(sample.track_target_mbs))
+        ids = ids + join_mb_cond_ids(tracker.detail(), target)
+    return ids
 
 
 @torch.inference_mode()
@@ -1878,9 +1903,7 @@ def generate_span(
             sample.window_bytes[sample.frame_lo : sample.split],
         )
         prompt_cond = sample.prompt_cond_ids.clone()
-        prompt_cond[-1] = torch.tensor(
-            track_cond_ids(tracker.snapshot(), int(sample.track_target_mbs))
-        )
+        prompt_cond[-1] = torch.tensor(_tracker_cond(sample, tracker))
         prompt_cond = prompt_cond.to(device).unsqueeze(0)
 
     megabyte = None
@@ -2045,7 +2068,7 @@ def generate_span(
             if tracker is not None:
                 tracker.advance(token)
                 step_cond["cond_ids"] = torch.tensor(
-                    [[track_cond_ids(tracker.snapshot(), int(sample.track_target_mbs))]],
+                    [[_tracker_cond(sample, tracker)]],
                     device=device,
                     dtype=torch.long,
                 )
@@ -3722,8 +3745,12 @@ def main() -> None:
             device,
             dtype=torch.bfloat16 if args.model_dtype == "bf16" else None,
         )
-        has_cond = bool(getattr(_unwrap_model(model).config, "cond_vocab_sizes", None))
-        if has_cond != bool(args.fim_track_state):
+        cond_sizes = getattr(_unwrap_model(model).config, "cond_vocab_sizes", None) or []
+        expected = (
+            (3 + (len(TRACK_JOIN_MB_VOCAB_SIZES) if args.fim_track_join_mb else 0))
+            if args.fim_track_state else 0
+        )
+        if len(cond_sizes) != expected:
             raise ValueError(
                 f"{checkpoint_dir}: cond_vocab_sizes="
                 f"{getattr(_unwrap_model(model).config, 'cond_vocab_sizes', None)} but "

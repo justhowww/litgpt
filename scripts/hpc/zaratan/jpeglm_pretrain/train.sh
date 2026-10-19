@@ -74,6 +74,8 @@ FIM_STATE_TOKENS=${FIM_STATE_TOKENS:-off}
 EXCLUDE_TEST_ROWS=${EXCLUDE_TEST_ROWS:-}
 # 1 = S4 per-position parser-state conditioning (needs FIM_STATE_TOKENS != off).
 FIM_TRACK_STATE=${FIM_TRACK_STATE:-0}
+# 1 = S5 join-macroblock fields on top of S4 (needs FIM_TRACK_STATE=1).
+FIM_TRACK_JOIN_MB=${FIM_TRACK_JOIN_MB:-0}
 SYNTAX_MASK_DIR=${SYNTAX_MASK_DIR:-}
 SYNTAX_LOSS_WEIGHT=${SYNTAX_LOSS_WEIGHT:-0}
 FIM_FORMAT=${FIM_FORMAT:-psm}
@@ -266,6 +268,9 @@ fi
 cmd+=(--fim-state-tokens "${FIM_STATE_TOKENS}")
 if [[ "${FIM_TRACK_STATE}" == "1" ]]; then
     cmd+=(--fim-track-state)
+fi
+if [[ "${FIM_TRACK_JOIN_MB}" == "1" ]]; then
+    cmd+=(--fim-track-join-mb)
 fi
 if [[ -n "${EXCLUDE_TEST_ROWS}" ]]; then
     read -r exclude_start exclude_end <<< "${EXCLUDE_TEST_ROWS}"

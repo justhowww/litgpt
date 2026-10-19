@@ -617,6 +617,11 @@ class MbAutomaton:
         self._last_context_event = None
 
         self.mbs_done = 0
+        # Element ordinal inside the current macroblock (conditioning features
+        # only; excluded from automaton_signature): elements started so far, and
+        # the count when mbs_done last changed.
+        self.elements_started = 0
+        self.mb_elements_base = 0
         self.stage = "slice"  # "slice" | "trailing" | "done"
         self.seen_stop = False
 
@@ -778,6 +783,7 @@ class MbAutomaton:
 
     # -- element start + incremental decode ---------------------------------
     def _start(self, kind, tag, *, n=0, label="", xmax=0):
+        self.elements_started += 1
         self.ae_kind = kind
         self.ae_tag = tag
         self.ae_bits = ""
@@ -914,6 +920,7 @@ class MbAutomaton:
 
     def _finish_mb(self):
         self.mbs_done += 1
+        self.mb_elements_base = self.elements_started
         if self.mbs_done >= self.max_mbs:
             self._begin_trailing()
         elif self.is_p:
@@ -992,6 +999,7 @@ class MbAutomaton:
             addr = self.first_mb + self.mbs_done + k
             self._set_mb(addr % self.W, addr // self.W, 0, 0)
         self.mbs_done += skipped
+        self.mb_elements_base = self.elements_started
         if run == 0:
             self._begin_mb()
             return MORE
@@ -1403,6 +1411,8 @@ def automaton_signature(auto):
             "_grid_revision",
             "_context_event_serial",  # diagnostics only
             "_last_context_event",  # diagnostics only
+            "elements_started",  # conditioning features only
+            "mb_elements_base",
         }
         fields = {
             key: _freeze_signature_value(value)

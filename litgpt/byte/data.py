@@ -86,6 +86,34 @@ TRACK_MBS_VOCAB = 256  # 1 = past the join macroblock; 2 + d for d >= 0 left (ca
 TRACK_ELEM_VOCAB = 1 + len(TRACK_ELEMENTS)
 TRACK_BITS_VOCAB = 17  # 1 + bits (0..15, capped)
 TRACK_COND_VOCAB_SIZES = [TRACK_MBS_VOCAB, TRACK_ELEM_VOCAB, TRACK_BITS_VOCAB]
+# S5 (fim_track_join_mb) adds five fields about the join macroblock. Static (the
+# same at every fill position, from the original stream at the join): its
+# mb_type and coded_block_pattern (1 = not written by the fill: the join is before
+# the macroblock header), and the residual block instance at the join. Dynamic
+# (after each fill byte): the current residual block instance, and the elements
+# left inside the join macroblock (1 = before the join macroblock, 2 = past it,
+# 3 + (d + 8) for d elements left, d >= -8, capped).
+TRACK_BLOCK_NONE = 27  # not in residual data
+TRACK_MBTYPE_VOCAB = 34  # 2 + mb_type (0..31)
+TRACK_CBP_VOCAB = 50  # 2 + cbp (0..47)
+TRACK_BLOCK_VOCAB = 1 + TRACK_BLOCK_NONE + 1  # 1 + block id (0..27)
+TRACK_ELEMS_LEFT_VOCAB = 64
+# Static join-block coefficient state (1 = not applicable): total_coeff and
+# trailing ones of the block at the join (known once its coeff_token is read),
+# and the nC class that selects its coeff_token table (chroma DC, 0-1, 2-3,
+# 4-7, 8+), which comes from neighbour blocks.
+TRACK_TOTAL_COEFF_VOCAB = 19  # 2 + total_coeff (0..16)
+TRACK_TRAILING_ONES_VOCAB = 6  # 2 + trailing ones (0..3)
+TRACK_NC_VOCAB = 7  # 2 + nC class (0..4)
+TRACK_JOIN_MB_VOCAB_SIZES = [
+    TRACK_MBTYPE_VOCAB, TRACK_CBP_VOCAB, TRACK_BLOCK_VOCAB, TRACK_BLOCK_VOCAB,
+    TRACK_ELEMS_LEFT_VOCAB, TRACK_TOTAL_COEFF_VOCAB, TRACK_TRAILING_ONES_VOCAB,
+    TRACK_NC_VOCAB,
+]
+_HEADER_TAGS = ("mb_skip_run", "mb_type")
+_RESIDUAL_TAGS = (
+    "coeff_token", "signs", "level_prefix", "level_suffix", "total_zeros", "run_before",
+)
 
 REGION_REF = 0  # Previous VCL slice bytes used as reference/context.
 REGION_TARGET = 1  # Target-slice bytes in AR mode.
@@ -180,6 +208,9 @@ class ByteDataConfig:
     # S4: per-position parser-state conditioning along the fill (needs
     # fim_state_tokens != "off"). See TRACK_ELEMENTS.
     fim_track_state: bool = False
+    # S5: add the join-macroblock fields (TRACK_JOIN_MB_VOCAB_SIZES); needs
+    # fim_track_state.
+    fim_track_join_mb: bool = False
     # (start, end) usable manifest rows of the fixed test set. Training drops every
     # row whose source video appears there, so a run over the full corpus (or past
     # row `start`) stays source-disjoint from the test set. None: no exclusion.
@@ -594,6 +625,41 @@ class StateTracker:
     def advance(self, byte: int) -> None:
         self._hm.advance(self.state, byte)
 
+    def detail(self) -> dict[str, int]:
+        """S5 details: macroblocks done, element ordinal inside the macroblock,
+        residual block id, and (when the macroblock header is read) mb_type/cbp."""
+        mbs, _, _ = self.snapshot()
+        out = {"mbs": mbs, "ordinal": 0, "block": TRACK_BLOCK_NONE,
+               "mb_type": -1, "cbp": -1, "total_coeff": -1, "trailing_ones": -1,
+               "nc_class": -1}
+        auto = self.state.automaton
+        mb = getattr(auto, "_mb", None) if auto is not None else None
+        if mb is None or self.state.automaton_unknown or mb.stage != "slice":
+            return out
+        out["ordinal"] = mb.elements_started - mb.mb_elements_base
+        tag = getattr(mb, "ae_tag", None)
+        if tag in _RESIDUAL_TAGS:
+            phase = mb.res_phase
+            if phase == "luma_dc":
+                out["block"] = 0
+            elif phase == "luma":
+                out["block"] = 1 + mb.res_blk
+            elif phase == "chroma_dc":
+                out["block"] = 17 + mb.res_comp
+            elif phase == "chroma_ac":
+                out["block"] = 19 + 4 * mb.res_comp + mb.res_blk
+            nc = mb.rb_nc
+            out["nc_class"] = (
+                0 if nc < 0 else 1 if nc < 2 else 2 if nc < 4 else 3 if nc < 8 else 4
+            )
+            if tag != "coeff_token":  # known once this block's coeff_token is read
+                out["total_coeff"] = mb.rb_total_coeff
+                out["trailing_ones"] = mb.rb_trailing_ones
+        if tag not in _HEADER_TAGS:
+            out["mb_type"] = mb.mb_type
+            out["cbp"] = mb.cbp_luma + 16 * mb.cbp_chroma
+        return out
+
     def snapshot(self) -> tuple[int, int, int]:
         """(macroblocks done, element index in TRACK_ELEMENTS, bits into element)."""
         s = self.state
@@ -636,6 +702,36 @@ def track_cond_ids(snapshot: tuple[int, int, int], target_mbs: int) -> tuple[int
     left = target_mbs - mbs_done
     mbs_id = 1 if left < 0 else 2 + min(left, TRACK_MBS_VOCAB - 3)
     return mbs_id, 1 + element, 1 + min(bits, TRACK_BITS_VOCAB - 2)
+
+
+def join_mb_target(detail: dict[str, int]) -> dict[str, int]:
+    """S5 static target ids from the tracker detail at the join (original fill)."""
+    return {
+        "mbs": detail["mbs"],
+        "ordinal": detail["ordinal"],
+        "mb_type_id": 1 if detail["mb_type"] < 0 else 2 + min(detail["mb_type"], 31),
+        "cbp_id": 1 if detail["cbp"] < 0 else 2 + min(detail["cbp"], 47),
+        "block_id": 1 + detail["block"],
+        "tc_id": 1 if detail["total_coeff"] < 0 else 2 + min(detail["total_coeff"], 16),
+        "t1_id": 1 if detail["trailing_ones"] < 0 else 2 + min(detail["trailing_ones"], 3),
+        "nc_id": 1 if detail["nc_class"] < 0 else 2 + detail["nc_class"],
+    }
+
+
+def join_mb_cond_ids(detail: dict[str, int], target: dict[str, int]) -> tuple[int, ...]:
+    """S5 extra conditioning ids for one tracker state, given the join target."""
+    if detail["mbs"] < target["mbs"]:
+        left_id = 1
+    elif detail["mbs"] > target["mbs"]:
+        left_id = 2
+    else:
+        d = target["ordinal"] - detail["ordinal"]
+        left_id = 3 + min(max(d + 8, 0), TRACK_ELEMS_LEFT_VOCAB - 4)
+    return (
+        target["mb_type_id"], target["cbp_id"], target["block_id"],
+        1 + detail["block"], left_id,
+        target["tc_id"], target["t1_id"], target["nc_id"],
+    )
 
 
 def state_block_ids(fields: tuple[int, int, int, int]) -> list[int]:
@@ -1354,6 +1450,7 @@ class ByteStreamWindowDataset(Dataset):
         fim_length_cond: bool = False,
         fim_state_tokens: str = "off",
         fim_track_state: bool = False,
+        fim_track_join_mb: bool = False,
     ) -> None:
         if max_seq_length < 4:
             raise ValueError("max_seq_length must be at least 4")
@@ -1377,6 +1474,8 @@ class ByteStreamWindowDataset(Dataset):
                 raise NotImplementedError("fim_state_tokens with fim_length_cond")
         if fim_track_state and fim_state_tokens == "off":
             raise ValueError("fim_track_state (S4) requires fim_state_tokens (S3 block)")
+        if fim_track_join_mb and not fim_track_state:
+            raise ValueError("fim_track_join_mb (S5) requires fim_track_state (S4)")
         if syntax_mask_dir is not None and not Path(syntax_mask_dir).is_dir():
             raise FileNotFoundError(f"syntax mask directory not found: {syntax_mask_dir}")
         if min_frames < 1:
@@ -1419,6 +1518,7 @@ class ByteStreamWindowDataset(Dataset):
         self.fim_length_cond = fim_length_cond
         self.fim_state_tokens = fim_state_tokens
         self.fim_track_state = fim_track_state
+        self.fim_track_join_mb = fim_track_join_mb
         self._fixed_hole_cache: dict[
             int, tuple[tuple[int, int, int, int], ...]
         ] = {}
@@ -2002,7 +2102,11 @@ class ByteStreamWindowDataset(Dataset):
         if self.fim_length_cond:
             offset_ids = torch.zeros_like(offset_ids)
         ar_cond = (
-            torch.zeros((input_ids.numel(), len(TRACK_COND_VOCAB_SIZES)), dtype=torch.long)
+            torch.zeros(
+                (input_ids.numel(), len(TRACK_COND_VOCAB_SIZES)
+                 + (len(TRACK_JOIN_MB_VOCAB_SIZES) if self.fim_track_join_mb else 0)),
+                dtype=torch.long,
+            )
             if self.fim_track_state else None
         )
         syntax_masks = None
@@ -2168,6 +2272,9 @@ class ByteStreamWindowDataset(Dataset):
                     window, frame_lo, split, missing, input_ids.numel(), middle_in.numel()
                 )
                 state_meta["fim_track_target_mbs"] = target_mbs
+                if self.fim_track_join_mb:
+                    for key, value in self._last_join_mb_target.items():
+                        state_meta[f"fim_track_join_{key}"] = value
             state_meta.update({
                 "fim_state_at": state_at,
                 "fim_state_mb_x": state_fields[0],
@@ -2230,14 +2337,26 @@ class ByteStreamWindowDataset(Dataset):
         data = bytes(window[:split].tolist())
         tracker = StateTracker(data[:frame_lo], data[frame_lo:split])
         snaps = [tracker.snapshot()]
+        details = [tracker.detail()] if self.fim_track_join_mb else []
         for byte in missing.tolist():
             tracker.advance(byte)
             snaps.append(tracker.snapshot())
+            if self.fim_track_join_mb:
+                details.append(tracker.detail())
         target_mbs = snaps[-1][0]
-        cond = torch.zeros((seq_len, len(TRACK_COND_VOCAB_SIZES)), dtype=torch.long)
+        self._last_join_mb_target = (
+            join_mb_target(details[-1]) if self.fim_track_join_mb else None
+        )
+        width = len(TRACK_COND_VOCAB_SIZES) + (
+            len(TRACK_JOIN_MB_VOCAB_SIZES) if self.fim_track_join_mb else 0
+        )
+        cond = torch.zeros((seq_len, width), dtype=torch.long)
         start = seq_len - middle_len  # first middle_in position
         for j in range(middle_len + 1):
-            cond[start - 1 + j] = torch.tensor(track_cond_ids(snaps[j], target_mbs))
+            ids = track_cond_ids(snaps[j], target_mbs)
+            if self.fim_track_join_mb:
+                ids = ids + join_mb_cond_ids(details[j], self._last_join_mb_target)
+            cond[start - 1 + j] = torch.tensor(ids)
         return cond, target_mbs
 
     def _join_state_fields(
@@ -2754,6 +2873,7 @@ class ByteDataModule(DataModule):
                     fim_length_cond=self.config.fim_length_cond,
                     fim_state_tokens=self.config.fim_state_tokens,
                     fim_track_state=self.config.fim_track_state,
+                    fim_track_join_mb=self.config.fim_track_join_mb,
                     nal_index=nal_index,
                     seed=self.config.seed,
                     syntax_mask_dir=self.config.syntax_mask_dir,
@@ -2921,6 +3041,7 @@ class ByteDataModule(DataModule):
             "fim_length_cond": self.config.fim_length_cond,
             "fim_state_tokens": self.config.fim_state_tokens,
             "fim_track_state": self.config.fim_track_state,
+            "fim_track_join_mb": self.config.fim_track_join_mb,
             "exclude_test_rows": self.config.exclude_test_rows,
             "fixed_fim_holes_per_window": (
                 self.config.fixed_fim_holes_per_window
