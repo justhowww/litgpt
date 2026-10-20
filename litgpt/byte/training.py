@@ -1847,7 +1847,9 @@ def validate(
                 )
                 eos_count[name] += int(eos_mask.sum())
 
-    val_loss = torch.stack(losses).mean()
+    # Each rank validates its own shard; reduce so every rank sees the same number.
+    # The save-best-val branch in pretrain.py runs collectives and must not diverge.
+    val_loss = fabric.all_reduce(torch.stack(losses).mean(), reduce_op="mean")
     task_losses = {
         name: task_loss_sum[name] / task_tok_count[name]
         for name in task_regions
